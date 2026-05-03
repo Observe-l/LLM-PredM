@@ -208,5 +208,7 @@ __marimo__/
 dataset/
 old_src/
 .codex
+.agents
 models/
 artifacts/
+outputs/
