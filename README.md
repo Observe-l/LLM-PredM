@@ -109,7 +109,41 @@ Outputs:
 
 With `stride=5`, `--rolling_window 5` smooths roughly 25 cycles.
 
-### 3. Compute CARD Health Indicator
+### 3. Evaluate Forecasting Metrics
+
+This evaluates every rolling forecast round in `window_forecasts.csv` with two
+cycle-level metrics:
+
+- Forecast Error: z-score `y_true` and `y_pred` per FD/sensor, then compute MAE
+  and RMSE by sensor plus an `ALL` sensor aggregate.
+- Condition-matched Forecast State Drift: use the first 30 cycles of each unit
+  as healthy reference, match by the operating-condition keys from
+  `plot_operating_condition_clusters.py`, then compute MAE and RMSE between the
+  forecast state and the healthy condition-matched reference.
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.zero_shot_cmapss.forecasting_evaluation \
+  --data_dir dataset/CMAPSSData \
+  --forecast_dir outputs/roll_5 \
+  --output_dir outputs/roll_5/forecasting_evaluation \
+  --rolling_window 5 \
+  --plot_units FD001:1 FD002:1 FD003:1 FD004:1
+```
+
+By default, the script evaluates all covariate modes present in
+`window_forecasts.csv`. Use `--covariate_modes known_future` or
+`--covariate_modes past_only` to restrict the comparison.
+
+Outputs:
+
+- `forecast_error_round_metrics.csv`: per-unit, per-round MAE/RMSE by sensor and `ALL`.
+- `forecast_error_fd_level.csv`: FD-level median trend over units.
+- `condition_matched_drift_round_metrics.csv`: per-unit, per-round condition-matched drift.
+- `condition_matched_drift_fd_level.csv`: FD-level condition-matched drift trend.
+- `healthy_condition_reference.csv`: first-30-cycle healthy references by unit, condition, and sensor.
+- `*_fd_level.png` and `unit_plots/*.png`: cycle-axis metric plots.
+
+### 4. Compute CARD Health Indicator
 
 CARD uses forecast-trajectory features and condition-aware historical references.
 The script first trains a 6-cluster KMeans operating-regime classifier on
