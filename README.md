@@ -157,6 +157,75 @@ Outputs:
 - Time-series input: sensor observations are processed by a custom patch embedder and then reprogrammed into the LLM hidden space through attention over text prototypes.
 - Output head: the model does not decode through the original vocabulary head. Instead, it uses a custom `RUL regression head + maintenance action classification head`.
 
+## Maintenance SFT Project
+
+This repository also includes a separate maintenance-log supervised fine-tuning project under `src/llm_sft_maintenace`.
+
+### Maintenance SFT Preprocess
+
+```bash
+conda run -n llm python -m src.llm_sft_maintenace.preprocess \
+  --dataset_dir dataset \
+  --output_dir artifacts/maintenance_sft
+```
+
+This pipeline uses:
+
+- Training split: `dataset/synthetic_maintenance_log_train.csv`
+- Validation split: `dataset/synthetic_maintenance_log_validation.csv`
+- Test split: `dataset/synthetic_maintenance_log_test.csv`
+
+The maintenance SFT input is split into:
+
+- Text input: domain/task prompt plus `event_id`, `case_id`, `work_order_id`, `vehicle_id`, `system`, `subsystem`, `component`, and `maintenance_note`
+- Numeric input: `spec_profile`, `event_time_step`, `predicted_rul`, and `sensor_readings`
+
+The supervision targets are:
+
+- `action_taken`
+- `action_priority`
+
+### Maintenance SFT Train
+
+```bash
+conda run -n llm python -m src.llm_sft_maintenace.train \
+  --artifacts_dir artifacts/maintenance_sft \
+  --base_model_path models/Qwen3-4B \
+  --output_dir outputs/maintenance_sft_lora \
+  --load_in_4bit
+```
+
+The maintenance SFT model uses:
+
+- Qwen text embeddings for the textual fields
+- A numeric feature projector for structured numeric inputs
+- Two projection heads on top of the LLM hidden states:
+  - maintenance action classification
+  - action priority classification
+
+Validation is run after each epoch, and test evaluation is run after training.
+
+### Maintenance SFT Evaluate
+
+You can evaluate a saved checkpoint on the test split and run a no-prompt ablation with:
+
+```bash
+conda run -n llm python -m src.llm_sft_maintenace.evaluate \
+  --artifacts_dir artifacts/maintenance_sft \
+  --checkpoint_dir outputs/maintenance_sft_lora/best \
+  --split test \
+  --load_in_4bit \
+  --output_json outputs/maintenance_sft_lora/test_ablation.json
+```
+
+The evaluation script reports:
+
+- full-prompt test performance
+- no-prompt ablation performance
+- action accuracy
+- priority accuracy
+- joint accuracy
+
 ## Notes
 
 - `ollama qwen3.5:4b` can be used locally for deployment and inference, but its underlying format is `GGUF`, so it cannot be fine-tuned directly with `transformers + peft`.
