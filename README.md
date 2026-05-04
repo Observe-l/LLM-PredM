@@ -63,9 +63,8 @@ forecast blocks, and applies leakage-free context residual scaling:
   --output_dir outputs/stride_5_robust \
   --eval_split train \
   --device cuda \
-  --context_length 40 \
+  --context_length 0 \
   --prediction_length 5 \
-  --stride 5 \
   --normalization none \
   --target_transform context_robust \
   --covariate_modes past_only known_future \

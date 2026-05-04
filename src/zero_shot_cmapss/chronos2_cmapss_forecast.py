@@ -50,7 +50,15 @@ def parse_args() -> argparse.Namespace:
         default="train",
         help="C-MAPSS split used for zero-shot forecasting evaluation.",
     )
-    parser.add_argument("--context_length", type=int, default=40)
+    parser.add_argument(
+        "--context_length",
+        type=int,
+        default=0,
+        help=(
+            "Maximum historical context length. 0 means all available past context per engine: "
+            "cutoff cycle 10 uses 10 points, cutoff cycle 50 uses 50 points."
+        ),
+    )
     parser.add_argument("--prediction_length", type=int, default=10)
     parser.add_argument(
         "--normalization",
@@ -70,8 +78,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stride",
         type=int,
-        default=1,
-        help="Rolling backtest stride within each test engine sequence.",
+        default=None,
+        help="Rolling backtest stride within each test engine sequence. Defaults to prediction_length.",
     )
     parser.add_argument(
         "--max_windows_per_fd",
@@ -177,6 +185,10 @@ def iter_windows(
     prediction_length: int,
     stride: int,
 ) -> Iterable[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, np.ndarray]]]:
+    if context_length < 0:
+        raise ValueError("--context_length must be >= 0. Use 0 for all-past context.")
+    context_cap = None if context_length == 0 else int(context_length)
+    first_forecast_start = prediction_length
     for unit_id, unit_model in model_input_df.groupby("unit_id", sort=True):
         unit_model = unit_model.sort_values("cycle").reset_index(drop=True)
         unit_raw = (
@@ -186,13 +198,13 @@ def iter_windows(
         )
         n_rows = len(unit_model)
         last_start = n_rows - prediction_length
-        if last_start < context_length:
+        if last_start < first_forecast_start:
             continue
 
-        for forecast_start in range(context_length, last_start + 1, stride):
-            context = unit_model.loc[
-                forecast_start - context_length : forecast_start - 1, sensors
-            ].to_numpy(dtype=np.float32)
+        for forecast_start in range(first_forecast_start, last_start + 1, stride):
+            context_start = 0 if context_cap is None else max(0, forecast_start - context_cap)
+            context = unit_model.loc[context_start : forecast_start - 1, sensors].to_numpy(dtype=np.float32)
+            actual_context_length = int(len(context))
             truth = unit_raw.loc[
                 forecast_start : forecast_start + prediction_length - 1, sensors
             ].to_numpy(dtype=np.float32)
@@ -203,7 +215,7 @@ def iter_windows(
                 transform_center, transform_scale = compute_context_center_scale(context)
                 model_context = (context - transform_center[None, :]) / transform_scale[None, :]
             past_covariates = {
-                col: unit_raw.loc[forecast_start - context_length : forecast_start - 1, col].to_numpy(dtype=np.float32)
+                col: unit_raw.loc[context_start : forecast_start - 1, col].to_numpy(dtype=np.float32)
                 for col in SETTING_COLUMNS
             }
             future_covariates = {
@@ -219,6 +231,8 @@ def iter_windows(
                 "unit_id": int(unit_id),
                 "cutoff_cycle": int(unit_raw.loc[forecast_start - 1, "cycle"]),
                 "forecast_start_cycle": int(cycles[0]),
+                "context_start_cycle": int(unit_raw.loc[context_start, "cycle"]),
+                "context_length": actual_context_length,
             }
             chronos_input: Dict[str, Any] = {"target": model_context.T}
             if covariate_mode in {"past_only", "known_future"}:
@@ -273,7 +287,6 @@ def forecast_windows(
     stats: pd.DataFrame,
     prediction_length: int,
     batch_size: int,
-    context_length: int,
     cross_learning: bool,
     normalization: str,
     target_transform: str,
@@ -283,7 +296,8 @@ def forecast_windows(
     score_rows: List[Dict[str, float | int | str]] = []
     total_batches = math.ceil(len(windows) / batch_size)
     if windows:
-        n_variates, history_length = windows[0][1]["target"].shape
+        n_variates = windows[0][1]["target"].shape[0]
+        history_lengths = [item[1]["target"].shape[1] for item in windows]
         covariate_mode = str(windows[0][0]["covariate_mode"])
         covariate_text = "no operating-condition covariates"
         if covariate_mode == "past_only":
@@ -292,22 +306,28 @@ def forecast_windows(
             covariate_text = "past + known-future setting1-3 covariates"
         print(
             f"  Chronos input: multivariate windows with shape "
-            f"({n_variates} sensors, {history_length} time steps), {covariate_text}",
+            f"({n_variates} sensors, variable history {min(history_lengths)}-{max(history_lengths)} time steps), "
+            f"{covariate_text}",
             flush=True,
         )
 
     for batch_idx, start in enumerate(range(0, len(windows), batch_size), start=1):
         batch = windows[start : start + batch_size]
         inputs = [item[1] for item in batch]
+        batch_context_length = max(int(item[1]["target"].shape[1]) for item in batch)
         _, point_forecasts = pipeline.predict_quantiles(
             inputs,
             prediction_length=prediction_length,
             quantile_levels=[0.5],
             batch_size=batch_size,
-            context_length=context_length,
+            context_length=batch_context_length,
             cross_learning=cross_learning,
         )
-        print(f"  batch {batch_idx}/{total_batches}: {len(batch)} windows in this inference batch", flush=True)
+        print(
+            f"  batch {batch_idx}/{total_batches}: {len(batch)} windows, "
+            f"batch context length={batch_context_length}",
+            flush=True,
+        )
 
         for (meta, _chronos_input, truth, transform), pred_tensor in zip(batch, point_forecasts):
             pred_model_scale = pred_tensor.numpy().astype(np.float32)
@@ -513,6 +533,12 @@ def save_stats(stats_by_fd: Dict[str, pd.DataFrame], output_dir: Path) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.stride is None:
+        args.stride = args.prediction_length
+    if args.stride <= 0:
+        raise ValueError("--stride must be positive.")
+    if args.context_length < 0:
+        raise ValueError("--context_length must be >= 0. Use 0 for all-past context.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.device == "cuda" and not torch.cuda.is_available() and not args.allow_cpu:
@@ -568,7 +594,6 @@ def main() -> None:
                 stats=stats,
                 prediction_length=args.prediction_length,
                 batch_size=args.batch_size,
-                context_length=args.context_length,
                 cross_learning=args.cross_learning,
                 normalization=args.normalization,
                 target_transform=args.target_transform,
