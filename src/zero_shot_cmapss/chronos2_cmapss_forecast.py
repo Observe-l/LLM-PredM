@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
@@ -69,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target_transform",
         choices=["none", "context_robust"],
-        default="none",
+        default="context_robust",
         help=(
             "Leakage-free per-window target transform. context_robust forecasts "
             "(sensor - last_context_value) / context_MAD and restores with the same context statistics."
@@ -174,6 +175,26 @@ def compute_context_center_scale(context: np.ndarray) -> Tuple[np.ndarray, np.nd
     return center, scale
 
 
+def make_condition_keys(frame: pd.DataFrame) -> pd.Series:
+    canonical = pd.DataFrame(index=frame.index)
+    canonical["setting1"] = np.rint(frame["setting1"]).astype(int)
+    canonical["setting2"] = np.rint(frame["setting2"] * 100).astype(int)
+    canonical["setting3"] = np.rint(frame["setting3"]).astype(int)
+    return canonical.astype(str).agg("|".join, axis=1)
+
+
+def add_window_condition_labels(history_raw: pd.DataFrame, future_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
+    history = history_raw.copy()
+    future = future_raw.copy()
+    history["op_condition_key"] = make_condition_keys(history)
+    future["op_condition_key"] = make_condition_keys(future)
+    condition_order = sorted(pd.concat([history["op_condition_key"], future["op_condition_key"]]).unique())
+    condition_to_id = {condition_key: idx for idx, condition_key in enumerate(condition_order)}
+    history["op_condition"] = history["op_condition_key"].map(condition_to_id).astype(int)
+    future["op_condition"] = future["op_condition_key"].map(condition_to_id).astype(int)
+    return history, future, len(condition_to_id)
+
+
 def iter_windows(
     fd_name: str,
     eval_df: pd.DataFrame,
@@ -184,7 +205,7 @@ def iter_windows(
     context_length: int,
     prediction_length: int,
     stride: int,
-) -> Iterable[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, np.ndarray]]]:
+) -> Iterable[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, Any]]]:
     if context_length < 0:
         raise ValueError("--context_length must be >= 0. Use 0 for all-past context.")
     context_cap = None if context_length == 0 else int(context_length)
@@ -203,47 +224,72 @@ def iter_windows(
 
         for forecast_start in range(first_forecast_start, last_start + 1, stride):
             context_start = 0 if context_cap is None else max(0, forecast_start - context_cap)
-            context = unit_model.loc[context_start : forecast_start - 1, sensors].to_numpy(dtype=np.float32)
-            actual_context_length = int(len(context))
-            truth = unit_raw.loc[
-                forecast_start : forecast_start + prediction_length - 1, sensors
-            ].to_numpy(dtype=np.float32)
-            transform_center = np.zeros(len(sensors), dtype=np.float32)
-            transform_scale = np.ones(len(sensors), dtype=np.float32)
-            model_context = context
-            if target_transform == "context_robust":
-                transform_center, transform_scale = compute_context_center_scale(context)
-                model_context = (context - transform_center[None, :]) / transform_scale[None, :]
-            past_covariates = {
-                col: unit_raw.loc[context_start : forecast_start - 1, col].to_numpy(dtype=np.float32)
-                for col in SETTING_COLUMNS
-            }
-            future_covariates = {
-                col: unit_raw.loc[forecast_start : forecast_start + prediction_length - 1, col].to_numpy(dtype=np.float32)
-                for col in SETTING_COLUMNS
-            }
-            cycles = unit_raw.loc[
-                forecast_start : forecast_start + prediction_length - 1, "cycle"
-            ].to_numpy(dtype=np.int64)
-            meta = {
+            history_model = unit_model.loc[context_start : forecast_start - 1].copy()
+            history_raw = unit_raw.loc[context_start : forecast_start - 1].copy()
+            future_raw = unit_raw.loc[forecast_start : forecast_start + prediction_length - 1].copy()
+            history_labeled, future_labeled, n_conditions = add_window_condition_labels(history_raw, future_raw)
+            cycles = future_labeled["cycle"].to_numpy(dtype=np.int64)
+            base_meta = {
                 "covariate_mode": covariate_mode,
                 "fd": fd_name,
                 "unit_id": int(unit_id),
                 "cutoff_cycle": int(unit_raw.loc[forecast_start - 1, "cycle"]),
                 "forecast_start_cycle": int(cycles[0]),
                 "context_start_cycle": int(unit_raw.loc[context_start, "cycle"]),
-                "context_length": actual_context_length,
+                "context_length": int(len(history_raw)),
+                "total_prediction_length": int(prediction_length),
+                "n_operating_conditions": int(n_conditions),
             }
-            chronos_input: Dict[str, Any] = {"target": model_context.T}
-            if covariate_mode in {"past_only", "known_future"}:
-                chronos_input["past_covariates"] = past_covariates
-            if covariate_mode == "known_future":
-                chronos_input["future_covariates"] = future_covariates
-            transform = {
-                "center": transform_center,
-                "scale": transform_scale,
-            }
-            yield meta, chronos_input, truth.T, transform
+
+            for op_condition, future_group in future_labeled.groupby("op_condition", sort=True):
+                op_condition = int(op_condition)
+                history_mask = history_labeled["op_condition"] == op_condition
+                group_history_model = history_model.loc[history_mask.to_numpy()].copy()
+                group_history_raw = history_labeled.loc[history_mask].copy()
+                used_full_context_fallback = False
+                if group_history_model.empty:
+                    group_history_model = history_model
+                    group_history_raw = history_labeled
+                    used_full_context_fallback = True
+
+                context = group_history_model.loc[:, sensors].to_numpy(dtype=np.float32)
+                truth = future_group.loc[:, sensors].to_numpy(dtype=np.float32)
+                transform_center = np.zeros(len(sensors), dtype=np.float32)
+                transform_scale = np.ones(len(sensors), dtype=np.float32)
+                model_context = context
+                if target_transform == "context_robust":
+                    transform_center, transform_scale = compute_context_center_scale(context)
+                    model_context = (context - transform_center[None, :]) / transform_scale[None, :]
+
+                past_covariates = {
+                    col: group_history_raw.loc[:, col].to_numpy(dtype=np.float32)
+                    for col in SETTING_COLUMNS
+                }
+                future_covariates = {
+                    col: future_group.loc[:, col].to_numpy(dtype=np.float32)
+                    for col in SETTING_COLUMNS
+                }
+                group_prediction_length = int(len(future_group))
+                meta = {
+                    **base_meta,
+                    "op_condition": op_condition,
+                    "op_condition_key": str(future_group["op_condition_key"].iloc[0]),
+                    "group_context_length": int(len(group_history_model)),
+                    "group_prediction_length": group_prediction_length,
+                    "used_full_context_fallback": int(used_full_context_fallback),
+                }
+                chronos_input: Dict[str, Any] = {"target": model_context.T}
+                if covariate_mode in {"past_only", "known_future"}:
+                    chronos_input["past_covariates"] = past_covariates
+                if covariate_mode == "known_future":
+                    chronos_input["future_covariates"] = future_covariates
+                transform = {
+                    "center": transform_center,
+                    "scale": transform_scale,
+                    "future_cycles": future_group["cycle"].to_numpy(dtype=np.int64),
+                    "future_horizons": future_group.index.to_numpy(dtype=np.int64) - forecast_start + 1,
+                }
+                yield meta, chronos_input, truth.T, transform
 
 
 def inverse_normalize(
@@ -282,7 +328,7 @@ def load_pipeline(model_id: str, device: str, torch_dtype: str, local_files_only
 
 def forecast_windows(
     pipeline,
-    windows: List[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, np.ndarray]]],
+    windows: List[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, Any]]],
     sensors: Sequence[str],
     stats: pd.DataFrame,
     prediction_length: int,
@@ -293,11 +339,10 @@ def forecast_windows(
     anomaly_eps: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rows: List[Dict[str, float | int | str]] = []
-    score_rows: List[Dict[str, float | int | str]] = []
-    total_batches = math.ceil(len(windows) / batch_size)
     if windows:
         n_variates = windows[0][1]["target"].shape[0]
         history_lengths = [item[1]["target"].shape[1] for item in windows]
+        group_prediction_lengths = [int(item[0]["group_prediction_length"]) for item in windows]
         covariate_mode = str(windows[0][0]["covariate_mode"])
         covariate_text = "no operating-condition covariates"
         if covariate_mode == "past_only":
@@ -307,67 +352,145 @@ def forecast_windows(
         print(
             f"  Chronos input: multivariate windows with shape "
             f"({n_variates} sensors, variable history {min(history_lengths)}-{max(history_lengths)} time steps), "
-            f"{covariate_text}",
+            f"grouped future length {min(group_prediction_lengths)}-{max(group_prediction_lengths)}, {covariate_text}",
             flush=True,
         )
 
-    for batch_idx, start in enumerate(range(0, len(windows), batch_size), start=1):
-        batch = windows[start : start + batch_size]
-        inputs = [item[1] for item in batch]
-        batch_context_length = max(int(item[1]["target"].shape[1]) for item in batch)
-        _, point_forecasts = pipeline.predict_quantiles(
-            inputs,
-            prediction_length=prediction_length,
-            quantile_levels=[0.5],
-            batch_size=batch_size,
-            context_length=batch_context_length,
-            cross_learning=cross_learning,
-        )
-        print(
-            f"  batch {batch_idx}/{total_batches}: {len(batch)} windows, "
-            f"batch context length={batch_context_length}",
-            flush=True,
-        )
+    tasks_by_prediction_length: Dict[int, List[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, Any]]]] = defaultdict(list)
+    for task in windows:
+        tasks_by_prediction_length[int(task[0]["group_prediction_length"])].append(task)
 
-        for (meta, _chronos_input, truth, transform), pred_tensor in zip(batch, point_forecasts):
-            pred_model_scale = pred_tensor.numpy().astype(np.float32)
-            if target_transform == "context_robust":
-                center = transform["center"].astype(np.float32)[:, None]
-                scale = transform["scale"].astype(np.float32)[:, None]
-                pred = pred_model_scale * scale + center
-            elif normalization == "zscore":
-                pred = inverse_normalize(pred_model_scale, sensors, stats)
-            else:
-                pred = pred_model_scale
-            mad = stats.loc[sensors, "mad"].to_numpy(dtype=np.float32)[:, None]
-            # S_t = mean_{sensor,horizon} |x_{t+h,j} - median_forecast_{t+h,j}| / (MAD_j + eps).
-            normalized_abs_error = np.abs(truth - pred) / (mad + float(anomaly_eps))
+    total_batches = sum(math.ceil(len(tasks) / batch_size) for tasks in tasks_by_prediction_length.values())
+    batch_idx = 0
+    for group_prediction_length, tasks in sorted(tasks_by_prediction_length.items()):
+        for start in range(0, len(tasks), batch_size):
+            batch_idx += 1
+            batch = tasks[start : start + batch_size]
+            inputs = [item[1] for item in batch]
+            batch_context_length = max(int(item[1]["target"].shape[1]) for item in batch)
+            _, point_forecasts = pipeline.predict_quantiles(
+                inputs,
+                prediction_length=group_prediction_length,
+                quantile_levels=[0.5],
+                batch_size=batch_size,
+                context_length=batch_context_length,
+                cross_learning=cross_learning,
+            )
+            print(
+                f"  batch {batch_idx}/{total_batches}: {len(batch)} grouped tasks, "
+                f"group prediction length={group_prediction_length}, batch context length={batch_context_length}",
+                flush=True,
+            )
+
+            for (meta, _chronos_input, truth, transform), pred_tensor in zip(batch, point_forecasts):
+                pred_model_scale = pred_tensor.numpy().astype(np.float32)
+                if target_transform == "context_robust":
+                    center = transform["center"].astype(np.float32)[:, None]
+                    scale = transform["scale"].astype(np.float32)[:, None]
+                    pred = pred_model_scale * scale + center
+                elif normalization == "zscore":
+                    pred = inverse_normalize(pred_model_scale, sensors, stats)
+                else:
+                    pred = pred_model_scale
+                mad = stats.loc[sensors, "mad"].to_numpy(dtype=np.float32)[:, None]
+                normalized_abs_error = np.abs(truth - pred) / (mad + float(anomaly_eps))
+                future_cycles = transform["future_cycles"].astype(np.int64)
+                future_horizons = transform["future_horizons"].astype(np.int64)
+                for sensor_idx, sensor in enumerate(sensors):
+                    for group_horizon_idx in range(group_prediction_length):
+                        horizon = int(future_horizons[group_horizon_idx])
+                        cycle = int(future_cycles[group_horizon_idx])
+                        row_meta = dict(meta)
+                        row_meta.pop("group_prediction_length", None)
+                        rows.append(
+                            {
+                                **row_meta,
+                                "sensor": sensor,
+                                "horizon": horizon,
+                                "cycle": cycle,
+                                "group_horizon": group_horizon_idx + 1,
+                                "group_prediction_length": group_prediction_length,
+                                "prediction_length": int(prediction_length),
+                                "y_true": float(truth[sensor_idx, group_horizon_idx]),
+                                "y_pred": float(pred[sensor_idx, group_horizon_idx]),
+                                "y_pred_model_scale": float(pred_model_scale[sensor_idx, group_horizon_idx]),
+                                "target_transform": target_transform,
+                                "normalized_abs_error": float(normalized_abs_error[sensor_idx, group_horizon_idx]),
+                            }
+                        )
+
+    predictions = pd.DataFrame(rows)
+    if not predictions.empty:
+        predictions = predictions.sort_values(
+            ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "sensor", "horizon", "op_condition"]
+        ).reset_index(drop=True)
+    score_rows: List[Dict[str, float | int | str]] = []
+    if not predictions.empty:
+        score_cols = [
+            "covariate_mode",
+            "fd",
+            "unit_id",
+            "cutoff_cycle",
+            "forecast_start_cycle",
+            "context_start_cycle",
+            "context_length",
+            "total_prediction_length",
+            "n_operating_conditions",
+        ]
+        for key, group in predictions.groupby(score_cols, sort=True):
             score_rows.append(
                 {
-                    **meta,
-                    "anomaly_score": float(np.mean(normalized_abs_error)),
-                    "mean_abs_error": float(np.mean(np.abs(truth - pred))),
-                    "prediction_length": int(prediction_length),
+                    **dict(zip(score_cols, key)),
+                    "prediction_length": int(group["prediction_length"].iloc[0]),
+                    "anomaly_score": float(group["normalized_abs_error"].mean()),
+                    "mean_abs_error": float(np.mean(np.abs(group["y_true"] - group["y_pred"]))),
                     "num_sensors": int(len(sensors)),
+                    "num_condition_tasks": int(group["op_condition"].nunique()),
+                    "used_full_context_fallback_tasks": int(
+                        group[["op_condition", "used_full_context_fallback"]]
+                        .drop_duplicates()["used_full_context_fallback"]
+                        .sum()
+                    ),
                 }
             )
-            for sensor_idx, sensor in enumerate(sensors):
-                for horizon_idx in range(prediction_length):
-                    rows.append(
-                        {
-                            **meta,
-                            "sensor": sensor,
-                            "horizon": horizon_idx + 1,
-                            "cycle": int(meta["forecast_start_cycle"]) + horizon_idx,
-                            "y_true": float(truth[sensor_idx, horizon_idx]),
-                            "y_pred": float(pred[sensor_idx, horizon_idx]),
-                            "y_pred_model_scale": float(pred_model_scale[sensor_idx, horizon_idx]),
-                            "target_transform": target_transform,
-                            "normalized_abs_error": float(normalized_abs_error[sensor_idx, horizon_idx]),
-                        }
-                    )
 
-    return pd.DataFrame(rows), pd.DataFrame(score_rows)
+    return predictions, pd.DataFrame(score_rows)
+
+
+def limit_tasks_by_rolling_windows(
+    tasks: List[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, Any]]],
+    max_windows: int,
+) -> List[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, Any]]]:
+    if max_windows <= 0:
+        return tasks
+    selected_keys = []
+    selected_key_set = set()
+    for meta, *_ in tasks:
+        key = (
+            meta["covariate_mode"],
+            meta["fd"],
+            meta["unit_id"],
+            meta["cutoff_cycle"],
+            meta["forecast_start_cycle"],
+        )
+        if key not in selected_key_set:
+            selected_keys.append(key)
+            selected_key_set.add(key)
+        if len(selected_keys) >= max_windows:
+            break
+    keep_keys = set(selected_keys)
+    return [
+        task
+        for task in tasks
+        if (
+            task[0]["covariate_mode"],
+            task[0]["fd"],
+            task[0]["unit_id"],
+            task[0]["cutoff_cycle"],
+            task[0]["forecast_start_cycle"],
+        )
+        in keep_keys
+    ]
 
 
 def summarize_metrics(predictions: pd.DataFrame) -> pd.DataFrame:
@@ -581,12 +704,26 @@ def main() -> None:
                 )
             )
             if args.max_windows_per_fd > 0:
-                windows = windows[: args.max_windows_per_fd]
+                windows = limit_tasks_by_rolling_windows(windows, args.max_windows_per_fd)
             if not windows:
                 print("  no eligible windows, skipped", flush=True)
                 continue
 
-            print(f"  forecasting {len(windows)} rolling windows", flush=True)
+            num_rolling_windows = len(
+                {
+                    (
+                        task[0]["fd"],
+                        task[0]["unit_id"],
+                        task[0]["cutoff_cycle"],
+                        task[0]["forecast_start_cycle"],
+                    )
+                    for task in windows
+                }
+            )
+            print(
+                f"  forecasting {num_rolling_windows} rolling windows as {len(windows)} condition-grouped tasks",
+                flush=True,
+            )
             fd_predictions, fd_anomaly_scores = forecast_windows(
                 pipeline=pipeline,
                 windows=windows,
@@ -623,7 +760,12 @@ def main() -> None:
     window_metrics.to_csv(args.output_dir / "window_metrics.csv", index=False)
     save_stats(stats_by_fd, args.output_dir)
     with open(args.output_dir / "run_config.json", "w", encoding="utf-8") as f:
-        json.dump(vars(args) | {"selected_sensors": SELECTED_SENSORS}, f, indent=2, default=str)
+        json.dump(
+            vars(args) | {"selected_sensors": SELECTED_SENSORS, "condition_group_forecasting": True},
+            f,
+            indent=2,
+            default=str,
+        )
     plot_examples(curve_predictions, args.output_dir, args.plot_examples, args.plot_units)
 
     print("\nOverall metrics by FD:", flush=True)

@@ -3,13 +3,22 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
-from .plot_operating_condition_clusters import DEFAULT_SENSORS, FD_NAMES, load_cmapss_file, make_condition_keys
+try:
+    from .plot_operating_condition_clusters import DEFAULT_SENSORS, FD_NAMES, load_cmapss_file
+except ImportError:
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from src.zero_shot_cmapss.plot_operating_condition_clusters import (
+        DEFAULT_SENSORS,
+        FD_NAMES,
+        load_cmapss_file,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--healthy_cycles",
         type=int,
-        default=30,
+        default=50,
         help="First N cycles per unit used as healthy reference for condition-matched drift.",
     )
     parser.add_argument(
@@ -46,13 +55,18 @@ def parse_args() -> argparse.Namespace:
         "--plot_units",
         nargs="*",
         default=None,
-        help="Optional unit-level plots, e.g. FD001:4 FD004:3. If omitted, plots first units per FD.",
+        help="Optional unit-level plots, e.g. FD001:4 FD004:3. If omitted, plots first --plot_examples units per FD.",
     )
     parser.add_argument("--plot_examples", type=int, default=3)
     return parser.parse_args()
 
 
-def parse_plot_units(items: Sequence[str] | None, forecasts: pd.DataFrame, fds: Sequence[str]) -> List[Tuple[str, int]]:
+def parse_plot_units(
+    items: Sequence[str] | None,
+    forecasts: pd.DataFrame,
+    fds: Sequence[str],
+    examples_per_fd: int,
+) -> List[Tuple[str, int]]:
     if items:
         parsed = []
         for item in items:
@@ -69,7 +83,7 @@ def parse_plot_units(items: Sequence[str] | None, forecasts: pd.DataFrame, fds: 
         .drop_duplicates()
         .sort_values(["fd", "unit_id"])
         .groupby("fd", as_index=False)
-        .head(1)
+        .head(examples_per_fd)
     )
     return [(str(row.fd), int(row.unit_id)) for row in keys.itertuples(index=False)]
 
@@ -81,24 +95,64 @@ def load_eval_frames(data_dir: Path, eval_split: str) -> Dict[str, pd.DataFrame]
     return frames
 
 
-def compute_sensor_stats(frames: Dict[str, pd.DataFrame], sensors: Sequence[str]) -> pd.DataFrame:
+def compute_past_sensor_stats(
+    frames: Dict[str, pd.DataFrame],
+    forecasts: pd.DataFrame,
+    sensors: Sequence[str],
+) -> pd.DataFrame:
     rows = []
-    for fd_name, frame in frames.items():
+    window_keys = (
+        forecasts[["fd", "unit_id", "context_start_cycle", "cutoff_cycle"]]
+        .drop_duplicates()
+        .sort_values(["fd", "unit_id", "cutoff_cycle"])
+    )
+    for key in window_keys.itertuples(index=False):
+        fd_name = str(key.fd)
+        unit_id = int(key.unit_id)
+        context_start_cycle = int(key.context_start_cycle)
+        cutoff_cycle = int(key.cutoff_cycle)
+        frame = frames[fd_name]
+        past = frame[
+            (frame["unit_id"] == unit_id)
+            & (frame["cycle"] >= context_start_cycle)
+            & (frame["cycle"] <= cutoff_cycle)
+        ]
+        if past.empty:
+            raise ValueError(
+                f"No past rows for {fd_name} unit {unit_id}, "
+                f"context_start_cycle={context_start_cycle}, cutoff_cycle={cutoff_cycle}."
+            )
         for sensor in sensors:
-            mean = float(frame[sensor].mean())
-            std = float(frame[sensor].std(ddof=0))
+            mean = float(past[sensor].mean())
+            std = float(past[sensor].std(ddof=0))
             if not np.isfinite(std) or std <= 1e-8:
                 std = 1.0
-            rows.append({"fd": fd_name, "sensor": sensor, "mean": mean, "std": std})
+            rows.append(
+                {
+                    "fd": fd_name,
+                    "unit_id": unit_id,
+                    "context_start_cycle": context_start_cycle,
+                    "cutoff_cycle": cutoff_cycle,
+                    "sensor": sensor,
+                    "past_mean": mean,
+                    "past_std": std,
+                    "past_n": int(len(past)),
+                }
+            )
     return pd.DataFrame(rows)
 
 
-def add_zscore_columns(forecasts: pd.DataFrame, stats: pd.DataFrame) -> pd.DataFrame:
-    keyed = forecasts.merge(stats, on=["fd", "sensor"], how="left", validate="many_to_one")
-    if keyed["mean"].isna().any() or keyed["std"].isna().any():
-        raise ValueError("Missing z-score stats for some forecast rows.")
-    keyed["y_true_z"] = (keyed["y_true"] - keyed["mean"]) / keyed["std"]
-    keyed["y_pred_z"] = (keyed["y_pred"] - keyed["mean"]) / keyed["std"]
+def add_zscore_columns(forecasts: pd.DataFrame, past_stats: pd.DataFrame) -> pd.DataFrame:
+    keyed = forecasts.merge(
+        past_stats,
+        on=["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"],
+        how="left",
+        validate="many_to_one",
+    )
+    if keyed["past_mean"].isna().any() or keyed["past_std"].isna().any():
+        raise ValueError("Missing leakage-free past z-score stats for some forecast rows.")
+    keyed["y_true_z"] = (keyed["y_true"] - keyed["past_mean"]) / keyed["past_std"]
+    keyed["y_pred_z"] = (keyed["y_pred"] - keyed["past_mean"]) / keyed["past_std"]
     keyed["z_error"] = keyed["y_pred_z"] - keyed["y_true_z"]
     keyed["z_abs_error"] = keyed["z_error"].abs()
     keyed["z_sq_error"] = keyed["z_error"] ** 2
@@ -106,7 +160,7 @@ def add_zscore_columns(forecasts: pd.DataFrame, stats: pd.DataFrame) -> pd.DataF
 
 
 def summarize_forecast_error(forecasts: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    window_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle"]
+    window_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle"]
     sensor_cols = [*window_cols, "sensor"]
     sensor_round = (
         forecasts.groupby(sensor_cols, sort=True)
@@ -130,72 +184,46 @@ def summarize_forecast_error(forecasts: pd.DataFrame) -> Tuple[pd.DataFrame, pd.
     return sensor_round, overall_round[[*sensor_cols, "mae", "rmse", "n"]]
 
 
-def label_eval_conditions(frames: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    labeled: Dict[str, pd.DataFrame] = {}
-    for fd_name, frame in frames.items():
-        frame = frame.copy()
-        frame["op_condition_key"] = make_condition_keys(frame)
-        labeled[fd_name] = frame
-    return labeled
-
-
-def build_cycle_condition_lookup(labeled_frames: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    rows = []
-    for fd_name, frame in labeled_frames.items():
-        rows.append(frame[["unit_id", "cycle", "op_condition_key"]].assign(fd=fd_name))
-    return pd.concat(rows, ignore_index=True)
-
-
-def build_healthy_reference(
-    labeled_frames: Dict[str, pd.DataFrame],
-    stats: pd.DataFrame,
-    sensors: Sequence[str],
-    healthy_cycles: int,
-) -> pd.DataFrame:
-    stat_lookup = stats.set_index(["fd", "sensor"])
-    rows = []
-    for fd_name, frame in labeled_frames.items():
-        healthy = frame[frame["cycle"] <= healthy_cycles].copy()
-        for sensor in sensors:
-            mean = float(stat_lookup.loc[(fd_name, sensor), "mean"])
-            std = float(stat_lookup.loc[(fd_name, sensor), "std"])
-            healthy[f"{sensor}_z"] = (healthy[sensor] - mean) / std
-            grouped = (
-                healthy.groupby(["unit_id", "op_condition_key"], sort=True)[f"{sensor}_z"]
-                .agg(ref_mean_z="mean", ref_std_z="std", ref_n="size")
-                .reset_index()
-            )
-            grouped["fd"] = fd_name
-            grouped["sensor"] = sensor
-            rows.append(grouped)
-    reference = pd.concat(rows, ignore_index=True)
-    reference["ref_std_z"] = reference["ref_std_z"].replace(0.0, np.nan).fillna(1.0)
+def build_healthy_reference(forecasts: pd.DataFrame, healthy_cycles: int) -> pd.DataFrame:
+    if "op_condition_key" not in forecasts.columns:
+        raise ValueError("window_forecasts.csv must contain op_condition_key; rerun clustered forecasting first.")
+    healthy = forecasts[forecasts["cycle"] <= healthy_cycles].copy()
+    if healthy.empty:
+        raise ValueError(f"No forecast rows found for cycle <= --healthy_cycles ({healthy_cycles}).")
+    healthy = healthy.drop_duplicates(["fd", "unit_id", "cycle", "sensor", "op_condition_key"])
+    reference = (
+        healthy.groupby(["fd", "unit_id", "op_condition_key", "sensor"], sort=True)
+        .agg(
+            ref_mean_raw=("y_true", "mean"),
+            ref_std_raw=("y_true", lambda s: float(np.std(s.to_numpy(dtype=np.float32), ddof=0))),
+            ref_n=("y_true", "size"),
+        )
+        .reset_index()
+    )
     return reference
 
 
 def summarize_condition_matched_drift(
     forecasts: pd.DataFrame,
-    condition_lookup: pd.DataFrame,
     healthy_reference: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    keyed = forecasts.merge(
-        condition_lookup,
-        on=["fd", "unit_id", "cycle"],
-        how="left",
-        validate="many_to_one",
-    )
+    if "op_condition_key" not in forecasts.columns:
+        raise ValueError("window_forecasts.csv must contain op_condition_key; evaluation no longer reclassifies conditions.")
+    keyed = forecasts.copy()
     keyed = keyed.merge(
-        healthy_reference[["fd", "unit_id", "op_condition_key", "sensor", "ref_mean_z", "ref_n"]],
+        healthy_reference[["fd", "unit_id", "op_condition_key", "sensor", "ref_mean_raw", "ref_std_raw", "ref_n"]],
         on=["fd", "unit_id", "op_condition_key", "sensor"],
         how="left",
         validate="many_to_one",
     )
+    keyed["ref_mean_z"] = (keyed["ref_mean_raw"] - keyed["past_mean"]) / keyed["past_std"]
+    keyed["ref_std_z"] = keyed["ref_std_raw"] / keyed["past_std"]
     keyed["drift_error"] = keyed["y_pred_z"] - keyed["ref_mean_z"]
     keyed["drift_abs_error"] = keyed["drift_error"].abs()
     keyed["drift_sq_error"] = keyed["drift_error"] ** 2
 
     available = keyed[keyed["ref_mean_z"].notna()].copy()
-    window_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle"]
+    window_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle"]
     sensor_cols = [*window_cols, "sensor"]
     sensor_round = (
         available.groupby(sensor_cols, sort=True)
@@ -204,6 +232,7 @@ def summarize_condition_matched_drift(
             rmse=("drift_sq_error", lambda s: float(np.sqrt(np.mean(s)))),
             n=("drift_error", "size"),
             ref_n_min=("ref_n", "min"),
+            ref_std_z_median=("ref_std_z", "median"),
         )
         .reset_index()
     )
@@ -214,17 +243,54 @@ def summarize_condition_matched_drift(
             rmse=("drift_sq_error", lambda s: float(np.sqrt(np.mean(s)))),
             n=("drift_error", "size"),
             ref_n_min=("ref_n", "min"),
+            ref_std_z_median=("ref_std_z", "median"),
         )
         .reset_index()
     )
     overall_round["sensor"] = "ALL"
-    return keyed, sensor_round, overall_round[[*sensor_cols, "mae", "rmse", "n", "ref_n_min"]]
+    return keyed, sensor_round, overall_round[[*sensor_cols, "mae", "rmse", "n", "ref_n_min", "ref_std_z_median"]]
+
+
+def summarize_reference_coverage(keyed: pd.DataFrame) -> pd.DataFrame:
+    rows = [
+        {
+            "fd": "ALL",
+            "covariate_mode": "ALL",
+            "sensor": "ALL",
+            "coverage": float(keyed["ref_mean_z"].notna().mean()),
+            "rows": int(len(keyed)),
+            "missing_rows": int(keyed["ref_mean_z"].isna().sum()),
+        }
+    ]
+    for (fd_name, mode), group in keyed.groupby(["fd", "covariate_mode"], sort=True):
+        rows.append(
+            {
+                "fd": fd_name,
+                "covariate_mode": mode,
+                "sensor": "ALL",
+                "coverage": float(group["ref_mean_z"].notna().mean()),
+                "rows": int(len(group)),
+                "missing_rows": int(group["ref_mean_z"].isna().sum()),
+            }
+        )
+    for (fd_name, mode, sensor), group in keyed.groupby(["fd", "covariate_mode", "sensor"], sort=True):
+        rows.append(
+            {
+                "fd": fd_name,
+                "covariate_mode": mode,
+                "sensor": sensor,
+                "coverage": float(group["ref_mean_z"].notna().mean()),
+                "rows": int(len(group)),
+                "missing_rows": int(group["ref_mean_z"].isna().sum()),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def smooth_round_metrics(frame: pd.DataFrame, rolling_window: int) -> pd.DataFrame:
     smoothed = []
     for _, group in frame.groupby(["covariate_mode", "fd", "unit_id", "sensor"], sort=True):
-        group = group.sort_values("forecast_start_cycle").copy()
+        group = group.sort_values(["cycle", "forecast_start_cycle"]).copy()
         group["mae_roll_mean"] = group["mae"].rolling(rolling_window, min_periods=1).mean()
         group["rmse_roll_mean"] = group["rmse"].rolling(rolling_window, min_periods=1).mean()
         smoothed.append(group)
@@ -234,14 +300,15 @@ def smooth_round_metrics(frame: pd.DataFrame, rolling_window: int) -> pd.DataFra
 def aggregate_fd_level(round_metrics: pd.DataFrame, rolling_window: int) -> pd.DataFrame:
     rows = []
     for (mode, fd_name, cycle, sensor), group in round_metrics.groupby(
-        ["covariate_mode", "fd", "forecast_start_cycle", "sensor"],
+        ["covariate_mode", "fd", "cycle", "sensor"],
         sort=True,
     ):
         rows.append(
             {
                 "covariate_mode": mode,
                 "fd": fd_name,
-                "forecast_start_cycle": int(cycle),
+                "cycle": int(cycle),
+                "forecast_start_cycle": int(group["forecast_start_cycle"].min()),
                 "sensor": sensor,
                 "mae": float(group["mae"].median()),
                 "rmse": float(group["rmse"].median()),
@@ -265,15 +332,18 @@ def plot_fd_level(metric_frame: pd.DataFrame, metric_name: str, output_dir: Path
     for ax, fd_name in zip(axes_flat, FD_NAMES):
         fd_df = plot_data[plot_data["fd"] == fd_name]
         for mode, mode_df in fd_df.groupby("covariate_mode", sort=True):
-            mode_df = mode_df.sort_values("forecast_start_cycle")
+            mode_df = mode_df.sort_values(["cycle", "forecast_start_cycle"])
             color = colors.get(str(mode))
-            ax.plot(mode_df["forecast_start_cycle"], mode_df["mae_roll_mean"], color=color, label=f"{mode} MAE")
-            ax.plot(mode_df["forecast_start_cycle"], mode_df["rmse_roll_mean"], color=color, linestyle="--", label=f"{mode} RMSE")
+            ax.plot(mode_df["cycle"], mode_df["mae_roll_mean"], color=color, label=f"{mode} MAE rolling")
+            ax.plot(mode_df["cycle"], mode_df["rmse"], color=color, alpha=0.25, linewidth=0.9, label=f"{mode} RMSE raw")
+            ax.plot(mode_df["cycle"], mode_df["rmse_roll_mean"], color=color, linestyle="--", label=f"{mode} RMSE rolling")
         ax.set_title(fd_name)
-        ax.set_xlabel("forecast start cycle")
+        ax.set_xlabel("target cycle")
         ax.set_ylabel(metric_name)
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, fontsize=8)
     fig.suptitle(f"{metric_name}: rolling MAE/RMSE over forecast rounds")
     fig.tight_layout()
     fig.savefig(output_dir / f"{metric_name.lower().replace(' ', '_')}_fd_level.png", dpi=160)
@@ -296,12 +366,13 @@ def plot_unit_level(metric_frame: pd.DataFrame, metric_name: str, output_dir: Pa
             continue
         fig, ax = plt.subplots(figsize=(12, 5))
         for mode, mode_df in unit_df.groupby("covariate_mode", sort=True):
-            mode_df = mode_df.sort_values("forecast_start_cycle")
+            mode_df = mode_df.sort_values(["cycle", "forecast_start_cycle"])
             color = colors.get(str(mode))
-            ax.plot(mode_df["forecast_start_cycle"], mode_df["mae_roll_mean"], color=color, label=f"{mode} MAE")
-            ax.plot(mode_df["forecast_start_cycle"], mode_df["rmse_roll_mean"], color=color, linestyle="--", label=f"{mode} RMSE")
+            ax.plot(mode_df["cycle"], mode_df["mae_roll_mean"], color=color, label=f"{mode} MAE rolling")
+            ax.plot(mode_df["cycle"], mode_df["rmse"], color=color, alpha=0.25, linewidth=0.9, label=f"{mode} RMSE raw")
+            ax.plot(mode_df["cycle"], mode_df["rmse_roll_mean"], color=color, linestyle="--", label=f"{mode} RMSE rolling")
         ax.set_title(f"{metric_name}: {fd_name} unit {unit_id}")
-        ax.set_xlabel("forecast start cycle")
+        ax.set_xlabel("target cycle")
         ax.set_ylabel(metric_name)
         ax.grid(True, alpha=0.3)
         ax.legend()
@@ -321,7 +392,19 @@ def main() -> None:
     eval_split = str(run_config.get("eval_split", "train"))
     print(f"Loading {args.forecast_dir / 'window_forecasts.csv'}...", flush=True)
     forecasts = pd.read_csv(args.forecast_dir / "window_forecasts.csv")
-    required = {"covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle", "sensor", "y_true", "y_pred"}
+    required = {
+        "covariate_mode",
+        "fd",
+        "unit_id",
+        "cutoff_cycle",
+        "forecast_start_cycle",
+        "context_start_cycle",
+        "cycle",
+        "sensor",
+        "y_true",
+        "y_pred",
+        "op_condition_key",
+    }
     missing = required - set(forecasts.columns)
     if missing:
         raise ValueError(f"Missing required columns in window_forecasts.csv: {sorted(missing)}")
@@ -331,11 +414,23 @@ def main() -> None:
         & mode_filter
         & forecasts["sensor"].isin(args.sensors)
     ].copy()
+    reference_source = forecasts.copy()
+    before_eval_rows = int(len(forecasts))
+    forecasts = forecasts[forecasts["cycle"] > args.healthy_cycles].copy()
+    print(
+        f"Evaluating forecast rows after healthy reference cycles only: "
+        f"cycle > {args.healthy_cycles}; kept {len(forecasts):,}/{before_eval_rows:,} rows.",
+        flush=True,
+    )
+    if forecasts.empty:
+        raise ValueError(
+            f"No forecast rows remain after filtering to cycle > --healthy_cycles ({args.healthy_cycles})."
+        )
 
     eval_frames = load_eval_frames(args.data_dir, eval_split)
-    stats = compute_sensor_stats(eval_frames, args.sensors)
-    stats.to_csv(output_dir / "zscore_stats.csv", index=False)
-    forecasts = add_zscore_columns(forecasts, stats)
+    past_stats = compute_past_sensor_stats(eval_frames, forecasts, args.sensors)
+    past_stats.to_csv(output_dir / "past_zscore_stats.csv", index=False)
+    forecasts = add_zscore_columns(forecasts, past_stats)
 
     print("Computing z-score forecasting error metrics...", flush=True)
     fe_sensor, fe_overall = summarize_forecast_error(forecasts)
@@ -346,14 +441,18 @@ def main() -> None:
     fe_fd_level.to_csv(output_dir / "forecast_error_fd_level.csv", index=False)
 
     print("Computing condition-matched forecast state drift metrics...", flush=True)
-    labeled_frames = label_eval_conditions(eval_frames)
-    condition_lookup = build_cycle_condition_lookup(labeled_frames)
-    healthy_reference = build_healthy_reference(labeled_frames, stats, args.sensors, args.healthy_cycles)
+    healthy_reference = build_healthy_reference(reference_source, args.healthy_cycles)
     healthy_reference.to_csv(output_dir / "healthy_condition_reference.csv", index=False)
     drift_rows, drift_sensor, drift_overall = summarize_condition_matched_drift(
         forecasts=forecasts,
-        condition_lookup=condition_lookup,
         healthy_reference=healthy_reference,
+    )
+    reference_coverage = summarize_reference_coverage(drift_rows)
+    reference_coverage.to_csv(output_dir / "reference_coverage.csv", index=False)
+    print(
+        "Reference coverage by FD/mode:\n"
+        + reference_coverage[reference_coverage["sensor"] == "ALL"].to_string(index=False),
+        flush=True,
     )
     drift_round = pd.concat([drift_overall, drift_sensor], ignore_index=True)
     drift_round = smooth_round_metrics(drift_round, args.rolling_window)
@@ -362,7 +461,7 @@ def main() -> None:
     drift_round.to_csv(output_dir / "condition_matched_drift_round_metrics.csv", index=False)
     drift_fd_level.to_csv(output_dir / "condition_matched_drift_fd_level.csv", index=False)
 
-    units = parse_plot_units(args.plot_units, forecasts, args.fds)
+    units = parse_plot_units(args.plot_units, forecasts, args.fds, args.plot_examples)
     plot_fd_level(fe_fd_level, "Forecast Error", output_dir)
     plot_fd_level(drift_fd_level, "Condition Matched Drift", output_dir)
     plot_unit_level(fe_round, "Forecast Error", output_dir, units)

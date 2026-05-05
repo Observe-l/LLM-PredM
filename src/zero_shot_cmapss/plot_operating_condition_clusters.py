@@ -148,12 +148,10 @@ def label_window_conditions(
     labeled = timeline.loc[:, ["unit_id", "cycle", *SETTING_COLUMNS, *SENSOR_COLUMNS]].copy()
     features = chronos_style_operating_features(timeline, history)
     history_keys = make_condition_keys(history)
-    condition_order = sorted(history_keys.unique())
+    timeline_keys = make_condition_keys(labeled)
+    condition_order = sorted(pd.concat([history_keys, timeline_keys]).unique())
     condition_to_id = {condition_key: idx for idx, condition_key in enumerate(condition_order)}
-    labeled["op_condition_key"] = make_condition_keys(labeled)
-    unseen_keys = sorted(set(labeled["op_condition_key"]) - set(condition_to_id))
-    for condition_key in unseen_keys:
-        condition_to_id[condition_key] = len(condition_to_id)
+    labeled["op_condition_key"] = timeline_keys
     labeled["op_condition"] = labeled["op_condition_key"].map(condition_to_id).astype(int)
     labeled["window_part"] = np.where(labeled["cycle"] <= cutoff_cycle, "history", "forecast_horizon")
     labeled["cutoff_cycle"] = int(cutoff_cycle)
@@ -229,6 +227,13 @@ def build_labeled_window(
             *[f"{col}_chronos_scaled" for col in SETTING_COLUMNS],
         ],
     ]
+    label_cols = [
+        "op_condition",
+        "op_condition_key",
+        "n_operating_conditions",
+        *[f"{col}_chronos_scaled" for col in SETTING_COLUMNS],
+    ]
+    window = window.drop(columns=[col for col in label_cols if col in window.columns])
     labeled_forecasts = window.merge(horizon_labels, on="cycle", how="left", validate="many_to_one")
     return clustered_timeline, labeled_forecasts
 
