@@ -11,23 +11,9 @@ import numpy as np
 import pandas as pd
 
 try:
-    from .forecasting_evaluation import (
-        add_zscore_columns,
-        build_healthy_reference,
-        compute_past_sensor_stats,
-        load_eval_frames,
-        summarize_condition_matched_drift,
-    )
     from .plot_operating_condition_clusters import DEFAULT_SENSORS, FD_NAMES
 except ImportError:
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from src.zero_shot_cmapss.forecasting_evaluation import (
-        add_zscore_columns,
-        build_healthy_reference,
-        compute_past_sensor_stats,
-        load_eval_frames,
-        summarize_condition_matched_drift,
-    )
     from src.zero_shot_cmapss.plot_operating_condition_clusters import DEFAULT_SENSORS, FD_NAMES
 
 
@@ -64,6 +50,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-6,
         help="Small positive epsilon used in log-ratio LHI = log((RMSE + eps) / (B + eps)).",
+    )
+    parser.add_argument(
+        "--drift_epsilon",
+        type=float,
+        default=1e-6,
+        help="Small positive epsilon used in D = abs(y_pred - healthy_mean) / (healthy_std + eps).",
+    )
+    parser.add_argument(
+        "--min_healthy_reference_n",
+        type=int,
+        default=3,
+        help="Minimum healthy samples required for a condition-matched mean/std reference.",
     )
     parser.add_argument(
         "--lhi_rolling_window",
@@ -136,21 +134,91 @@ def load_known_future_forecasts(args: argparse.Namespace) -> Tuple[pd.DataFrame,
     return forecasts, str(run_config.get("eval_split", "train"))
 
 
+def build_condition_healthy_reference(forecasts: pd.DataFrame, healthy_cycles: int) -> pd.DataFrame:
+    healthy = forecasts[forecasts["cycle"] <= healthy_cycles].copy()
+    if healthy.empty:
+        raise ValueError(f"No forecast rows found for cycle <= --healthy_cycles ({healthy_cycles}).")
+    healthy = healthy.drop_duplicates(["fd", "unit_id", "cycle", "sensor", "op_condition_key"])
+    reference = (
+        healthy.groupby(["fd", "unit_id", "op_condition_key", "sensor"], sort=True)
+        .agg(
+            healthy_mean_raw=("y_true", "mean"),
+            healthy_std_raw=("y_true", lambda s: float(np.std(s.to_numpy(dtype=float), ddof=0))),
+            healthy_n=("y_true", "size"),
+        )
+        .reset_index()
+    )
+    return reference
+
+
+def summarize_condition_matched_healthy_std_drift(
+    forecasts: pd.DataFrame,
+    healthy_reference: pd.DataFrame,
+    epsilon: float,
+    min_healthy_reference_n: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if epsilon <= 0:
+        raise ValueError("--drift_epsilon must be positive.")
+    if min_healthy_reference_n < 2:
+        raise ValueError("--min_healthy_reference_n must be >= 2 for a meaningful healthy std.")
+    keyed = forecasts.merge(
+        healthy_reference,
+        on=["fd", "unit_id", "op_condition_key", "sensor"],
+        how="left",
+        validate="many_to_one",
+    )
+    keyed["drift"] = (keyed["y_pred"] - keyed["healthy_mean_raw"]).abs() / (
+        keyed["healthy_std_raw"] + epsilon
+    )
+    keyed["drift_sq"] = keyed["drift"] ** 2
+
+    available = keyed[
+        keyed["healthy_mean_raw"].notna()
+        & (keyed["healthy_n"] >= min_healthy_reference_n)
+        & (keyed["healthy_std_raw"] > epsilon)
+    ].copy()
+    window_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle"]
+    sensor_cols = [*window_cols, "sensor"]
+    sensor_round = (
+        available.groupby(sensor_cols, sort=True)
+        .agg(
+            mae=("drift", "mean"),
+            rmse=("drift_sq", lambda s: float(np.sqrt(np.mean(s)))),
+            n=("drift", "size"),
+            healthy_n_min=("healthy_n", "min"),
+            healthy_std_median=("healthy_std_raw", "median"),
+        )
+        .reset_index()
+    )
+    overall_round = (
+        available.groupby(window_cols, sort=True)
+        .agg(
+            mae=("drift", "mean"),
+            rmse=("drift_sq", lambda s: float(np.sqrt(np.mean(s)))),
+            n=("drift", "size"),
+            healthy_n_min=("healthy_n", "min"),
+            healthy_std_median=("healthy_std_raw", "median"),
+        )
+        .reset_index()
+    )
+    overall_round["sensor"] = "ALL"
+    return keyed, sensor_round, overall_round[[*sensor_cols, "mae", "rmse", "n", "healthy_n_min", "healthy_std_median"]]
+
+
 def build_known_future_rmse(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    forecasts, eval_split = load_known_future_forecasts(args)
+    forecasts, _ = load_known_future_forecasts(args)
     reference_source = forecasts.copy()
 
     forecasts = forecasts[forecasts["cycle"] > args.start_cycle].copy()
     if forecasts.empty:
         raise ValueError(f"No forecast rows remain after filtering to cycle > --start_cycle ({args.start_cycle}).")
 
-    eval_frames = load_eval_frames(args.data_dir, eval_split)
-    past_stats = compute_past_sensor_stats(eval_frames, forecasts, args.sensors)
-    forecasts = add_zscore_columns(forecasts, past_stats)
-    healthy_reference = build_healthy_reference(reference_source, args.healthy_cycles)
-    drift_rows, drift_sensor, drift_overall = summarize_condition_matched_drift(
+    healthy_reference = build_condition_healthy_reference(reference_source, args.healthy_cycles)
+    drift_rows, drift_sensor, drift_overall = summarize_condition_matched_healthy_std_drift(
         forecasts=forecasts,
         healthy_reference=healthy_reference,
+        epsilon=args.drift_epsilon,
+        min_healthy_reference_n=args.min_healthy_reference_n,
     )
     metrics = pd.concat([drift_overall, drift_sensor], ignore_index=True)
     metrics = metrics[
@@ -212,9 +280,14 @@ def add_log_ratio_lhi(metrics: pd.DataFrame, healthy_cycles: int, epsilon: float
         healthy = group[group["cycle"] <= healthy_cycles]
         if healthy.empty:
             baseline = float(group["rmse"].median())
+            baseline_source = "all_median_fallback"
         else:
-            baseline = float(healthy["rmse"].median())
+            latest_healthy_cutoff = healthy["cutoff_cycle"].max()
+            latest_healthy = healthy[healthy["cutoff_cycle"] == latest_healthy_cutoff]
+            baseline = float(latest_healthy["rmse"].median())
+            baseline_source = f"latest_healthy_cutoff_{int(latest_healthy_cutoff)}"
         group["lhi_baseline_rmse"] = baseline
+        group["lhi_baseline_source"] = baseline_source
         group["log_ratio_lhi"] = np.log((group["rmse"] + epsilon) / (baseline + epsilon))
         group["log_ratio_lhi_roll_mean"] = np.nan
         monitor_mask = group["cycle"] > healthy_cycles
@@ -247,6 +320,7 @@ def summarize_units(metrics: pd.DataFrame, healthy_cycles: int) -> pd.DataFrame:
                 "last_theta_0_99": last_theta99,
                 "healthy_window_rmse_median": float(healthy["rmse"].median()) if not healthy.empty else np.nan,
                 "lhi_baseline_rmse": float(group["lhi_baseline_rmse"].iloc[0]) if "lhi_baseline_rmse" in group else np.nan,
+                "lhi_baseline_source": str(group["lhi_baseline_source"].iloc[0]) if "lhi_baseline_source" in group else "",
                 "last_log_ratio_lhi": float(summary_source["log_ratio_lhi"].iloc[-1]) if "log_ratio_lhi" in summary_source and not summary_source.empty else np.nan,
                 "max_log_ratio_lhi": float(summary_source["log_ratio_lhi"].max()) if "log_ratio_lhi" in summary_source and not summary_source.empty else np.nan,
                 "monitor_log_ratio_lhi_median": float(monitor_lhi.median()) if not monitor_lhi.empty else np.nan,
@@ -296,33 +370,6 @@ def summarize_fd(metrics: pd.DataFrame, healthy_cycles: int) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
-
-
-def compare_with_evaluation(metrics: pd.DataFrame, forecast_dir: Path, healthy_cycles: int) -> pd.DataFrame:
-    eval_path = forecast_dir / "evaluate" / "condition_matched_drift_round_metrics.csv"
-    if not eval_path.exists():
-        return pd.DataFrame()
-    eval_metrics = pd.read_csv(eval_path)
-    eval_metrics = eval_metrics[
-        (eval_metrics["covariate_mode"] == "known_future")
-        & (eval_metrics["sensor"] == "ALL")
-    ].copy()
-    if "cycle" not in eval_metrics.columns:
-        return pd.DataFrame()
-    eval_metrics = eval_metrics[["fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle", "rmse"]].copy()
-    current = metrics[
-        metrics["cycle"] > healthy_cycles
-    ][["fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle", "rmse"]].copy()
-    merged = current.merge(
-        eval_metrics,
-        on=["fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle"],
-        how="inner",
-        suffixes=("_maintenance", "_evaluation"),
-    )
-    if merged.empty:
-        return merged
-    merged["rmse_abs_diff"] = (merged["rmse_maintenance"] - merged["rmse_evaluation"]).abs()
-    return merged
 
 
 def plot_threshold_examples(metrics: pd.DataFrame, units: Sequence[Tuple[str, int]], output_dir: Path, healthy_cycles: int) -> None:
@@ -507,7 +554,7 @@ def main() -> None:
     output_dir = args.output_dir or (args.forecast_dir / "maintenance_decision")
     output_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(output_dir / ".mplconfig"))
-    for legacy_name in ("known_future_rmse_with_thresholds.csv",):
+    for legacy_name in ("known_future_rmse_with_thresholds.csv", "rmse_compare_with_evaluation.csv"):
         legacy_path = output_dir / legacy_name
         if legacy_path.exists():
             legacy_path.unlink()
@@ -522,7 +569,6 @@ def main() -> None:
     metrics = add_log_ratio_lhi(metrics, args.healthy_cycles, args.lhi_epsilon, args.lhi_rolling_window)
     unit_summary = summarize_units(metrics, args.healthy_cycles)
     fd_summary = summarize_fd(metrics, args.healthy_cycles)
-    rmse_comparison = compare_with_evaluation(metrics, args.forecast_dir, args.healthy_cycles)
 
     metrics.to_csv(output_dir / "known_future_rmse_with_dynamic_thresholds.csv", index=False)
     metrics.to_csv(output_dir / "known_future_log_ratio_lhi.csv", index=False)
@@ -534,8 +580,6 @@ def main() -> None:
     healthy_reference.to_csv(output_dir / "healthy_condition_reference.csv", index=False)
     unit_summary.to_csv(output_dir / "engine_maintenance_signal_summary.csv", index=False)
     fd_summary.to_csv(output_dir / "fd_maintenance_signal_summary.csv", index=False)
-    if not rmse_comparison.empty:
-        rmse_comparison.to_csv(output_dir / "rmse_compare_with_evaluation.csv", index=False)
 
     units = parse_plot_units(args.plot_units, metrics, args.plot_examples)
     plot_threshold_examples(metrics, units, output_dir, args.healthy_cycles)
@@ -558,12 +602,6 @@ def main() -> None:
         .to_string(index=False),
         flush=True,
     )
-    if not rmse_comparison.empty:
-        print(
-            "RMSE comparison with forecasting_evaluation after healthy_cycles:\n"
-            + rmse_comparison["rmse_abs_diff"].describe().to_string(),
-            flush=True,
-        )
     print(f"Saved maintenance decision analysis outputs to: {output_dir}", flush=True)
 
 

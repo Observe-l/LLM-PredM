@@ -62,12 +62,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prediction_length", type=int, default=10)
     parser.add_argument(
-        "--normalization",
-        choices=["none", "zscore"],
-        default="none",
-        help="External preprocessing applied before Chronos-2. Default is none. zscore is only kept for ablation/reproduction.",
-    )
-    parser.add_argument(
         "--target_transform",
         choices=["none", "context_robust"],
         default="context_robust",
@@ -122,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plot_examples",
         type=int,
-        default=3,
+        default=4,
         help="Number of full-unit plots to create per FD when --plot_units is not set. Use 0 to skip plots.",
     )
     parser.add_argument(
@@ -144,25 +138,12 @@ def load_cmapss_file(path: Path) -> pd.DataFrame:
 
 
 def compute_train_stats(train_df: pd.DataFrame, sensors: Sequence[str]) -> pd.DataFrame:
-    stats = train_df.loc[:, sensors].agg(["mean", "std"]).T
-    stats["std"] = stats["std"].replace(0.0, np.nan).fillna(1.0)
+    stats = pd.DataFrame(index=sensors)
     medians = train_df.loc[:, sensors].median()
     mad = (train_df.loc[:, sensors] - medians).abs().median()
     stats["median"] = medians
     stats["mad"] = mad.replace(0.0, np.nan).fillna(1.0)
     return stats
-
-
-def normalize_frame(df: pd.DataFrame, sensors: Sequence[str], stats: pd.DataFrame) -> pd.DataFrame:
-    normalized = df.copy()
-    means = stats.loc[sensors, "mean"]
-    stds = stats.loc[sensors, "std"]
-    sensor_values = normalized.loc[:, sensors].astype(np.float32)
-    normalized_values = (sensor_values - means) / stds
-    for sensor in sensors:
-        normalized[sensor] = normalized_values[sensor].astype(np.float32)
-    normalized.loc[:, sensors] = normalized.loc[:, sensors].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    return normalized
 
 
 def compute_context_center_scale(context: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -292,16 +273,6 @@ def iter_windows(
                 yield meta, chronos_input, truth.T, transform
 
 
-def inverse_normalize(
-    values: np.ndarray,
-    sensors: Sequence[str],
-    stats: pd.DataFrame,
-) -> np.ndarray:
-    means = stats.loc[sensors, "mean"].to_numpy(dtype=np.float32)[:, None]
-    stds = stats.loc[sensors, "std"].to_numpy(dtype=np.float32)[:, None]
-    return values * stds + means
-
-
 def get_torch_dtype(name: str) -> torch.dtype:
     return {
         "float32": torch.float32,
@@ -334,7 +305,6 @@ def forecast_windows(
     prediction_length: int,
     batch_size: int,
     cross_learning: bool,
-    normalization: str,
     target_transform: str,
     anomaly_eps: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -388,8 +358,6 @@ def forecast_windows(
                     center = transform["center"].astype(np.float32)[:, None]
                     scale = transform["scale"].astype(np.float32)[:, None]
                     pred = pred_model_scale * scale + center
-                elif normalization == "zscore":
-                    pred = inverse_normalize(pred_model_scale, sensors, stats)
                 else:
                     pred = pred_model_scale
                 mad = stats.loc[sensors, "mad"].to_numpy(dtype=np.float32)[:, None]
@@ -650,7 +618,7 @@ def save_stats(stats_by_fd: Dict[str, pd.DataFrame], output_dir: Path) -> None:
         }
         for fd, stats in stats_by_fd.items()
     }
-    with open(output_dir / "normalization_stats.json", "w", encoding="utf-8") as f:
+    with open(output_dir / "sensor_error_stats.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
 
@@ -683,10 +651,7 @@ def main() -> None:
         eval_df = train_df if args.eval_split == "train" else test_df
         stats = compute_train_stats(train_df, SELECTED_SENSORS)
         stats_by_fd[fd_name] = stats
-        if args.normalization == "zscore":
-            model_input_df = normalize_frame(eval_df, SELECTED_SENSORS, stats)
-        else:
-            model_input_df = eval_df
+        model_input_df = eval_df
 
         for covariate_mode in args.covariate_modes:
             print(f"  covariate mode: {covariate_mode}", flush=True)
@@ -732,7 +697,6 @@ def main() -> None:
                 prediction_length=args.prediction_length,
                 batch_size=args.batch_size,
                 cross_learning=args.cross_learning,
-                normalization=args.normalization,
                 target_transform=args.target_transform,
                 anomaly_eps=args.anomaly_eps,
             )

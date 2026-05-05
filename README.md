@@ -65,7 +65,6 @@ forecast blocks, and applies leakage-free context residual scaling:
   --device cuda \
   --context_length 0 \
   --prediction_length 5 \
-  --normalization none \
   --target_transform context_robust \
   --covariate_modes past_only known_future \
   --local_files_only
@@ -75,7 +74,6 @@ Useful options:
 
 - `--eval_split train|test`: choose C-MAPSS split for zero-shot evaluation.
 - `--target_transform context_robust`: forecast `(sensor - last_context_value) / context_MAD`, then restore to sensor scale using the same context statistics. This avoids future leakage and helps FD001/FD003 slow-trend forecasting.
-- `--normalization none`: recommended default. `zscore` is kept only for ablation/reproduction.
 - `--plot_units FD001:4 FD004:3`: generate full-unit forecast plots for specific units.
 
 Main outputs:
@@ -114,9 +112,10 @@ With `stride=5`, `--rolling_window 5` smooths roughly 25 cycles.
 This evaluates every rolling forecast round in `window_forecasts.csv` with two
 cycle-level metrics:
 
-- Forecast Error: z-score `y_true` and `y_pred` per FD/sensor, then compute MAE
-  and RMSE by sensor plus an `ALL` sensor aggregate.
-- Condition-matched Forecast State Drift: use the first 30 cycles of each unit
+- Forecast Error: min-max normalize `y_true` and `y_pred` with each window's
+  past context range, then compute MAE and RMSE by sensor plus an `ALL` sensor
+  aggregate.
+- Condition-matched Forecast State Drift: use the first 50 cycles of each unit
   as healthy reference, match by the operating-condition keys from
   `plot_operating_condition_clusters.py`, then compute MAE and RMSE between the
   forecast state and the healthy condition-matched reference.
@@ -140,10 +139,86 @@ Outputs:
 - `forecast_error_fd_level.csv`: FD-level median trend over units.
 - `condition_matched_drift_round_metrics.csv`: per-unit, per-round condition-matched drift.
 - `condition_matched_drift_fd_level.csv`: FD-level condition-matched drift trend.
-- `healthy_condition_reference.csv`: first-30-cycle healthy references by unit, condition, and sensor.
+- `healthy_condition_reference.csv`: healthy references by unit, condition, and sensor.
 - `*_fd_level.png` and `unit_plots/*.png`: cycle-axis metric plots.
 
-### 4. Compute CARD Health Indicator
+### 4. Compute Log-Ratio LHI
+
+This computes a lightweight log-ratio health indicator from condition-matched
+min-max drift. Min-max ranges are computed from each forecast window's past
+context, matching `forecasting_evaluation.py` and avoiding future leakage.
+Condition means are computed inside each engine only, using
+`cycle <= --healthy_cycles`. The LHI baseline is calibrated from the initial
+forecast drift immediately after the healthy reference interval.
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.zero_shot_cmapss.lhi_indicator \
+  --forecast_dir outputs/cluster_20 \
+  --output_dir outputs/cluster_20/lhi \
+  --healthy_cycles 50 \
+  --rolling_window 5 \
+  --plot_units FD001:1 FD002:4 FD004:3
+```
+
+For each forecast window and sensor:
+
+```text
+y_pred_norm = (y_pred - min_past_context) / (max_past_context - min_past_context)
+```
+
+For each unit, sensor, and operating condition, the raw healthy mean is computed
+from `cycle <= --healthy_cycles`, then transformed with the same forecast-window
+past min-max range:
+
+```text
+mean_healthy_norm = (mean_healthy_raw - min_past_context) / (max_past_context - min_past_context)
+```
+
+The forecast drift is:
+
+```text
+D_RMSE = sqrt(mean_s (y_pred_norm(t,s) - mean_healthy_norm(condition(t),s))^2)
+```
+
+The red drift baseline in the plots is calibrated per unit and covariate mode:
+
+```text
+B_RMSE = mean(D_RMSE) over the first forecast block after --healthy_cycles
+```
+
+By default this means the first forecast block after `--healthy_cycles`. Use
+`--baseline_cycles N` to average over the first `N` monitor target cycles
+instead.
+
+Then:
+
+```text
+LHI = log((D_RMSE + eps) / (B_RMSE + eps))
+```
+
+Outputs:
+
+- `lhi_scores.csv`: per forecast cycle `D_MAE`, `D_RMSE`, `LHI_MAE`, and `LHI_RMSE`.
+- `lhi_baselines.csv`: unit-specific `B_MAE` and `B_RMSE`.
+- `baseline_forecast_points.csv`: forecast drift rows used to average `B`.
+- `past_minmax_ranges.csv`: forecast-window past-context min-max ranges and usable flags.
+- `unit_drift/*_drift.png`: drift curves with red `B_RMSE` baseline.
+- `unit_lhi/*_lhi.png`: log-ratio LHI curves.
+
+Batch plot any unit interval from existing `lhi_scores.csv`:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.zero_shot_cmapss.plot_lhi_units \
+  --lhi_dir outputs/cluster_20/lhi \
+  --fd FD001 \
+  --unit_start 1 \
+  --unit_end 20
+```
+
+This writes one combined drift/LHI figure per unit. Use `--metric mae` to plot
+MAE-based drift and LHI instead of RMSE.
+
+### 5. Compute CARD Health Indicator
 
 CARD uses forecast-trajectory features and condition-aware historical references.
 The script first trains a 6-cluster KMeans operating-regime classifier on

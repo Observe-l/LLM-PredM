@@ -24,7 +24,7 @@ except ImportError:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate Chronos-2 C-MAPSS forecasts with z-score forecast error "
+            "Evaluate Chronos-2 C-MAPSS forecasts with min-max forecast error "
             "and condition-matched forecast state drift."
         )
     )
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional unit-level plots, e.g. FD001:4 FD004:3. If omitted, plots first --plot_examples units per FD.",
     )
-    parser.add_argument("--plot_examples", type=int, default=3)
+    parser.add_argument("--plot_examples", type=int, default=4)
     return parser.parse_args()
 
 
@@ -95,7 +95,7 @@ def load_eval_frames(data_dir: Path, eval_split: str) -> Dict[str, pd.DataFrame]
     return frames
 
 
-def compute_past_sensor_stats(
+def compute_past_sensor_ranges(
     frames: Dict[str, pd.DataFrame],
     forecasts: pd.DataFrame,
     sensors: Sequence[str],
@@ -123,10 +123,11 @@ def compute_past_sensor_stats(
                 f"context_start_cycle={context_start_cycle}, cutoff_cycle={cutoff_cycle}."
             )
         for sensor in sensors:
-            mean = float(past[sensor].mean())
-            std = float(past[sensor].std(ddof=0))
-            if not np.isfinite(std) or std <= 1e-8:
-                std = 1.0
+            minimum = float(past[sensor].min())
+            maximum = float(past[sensor].max())
+            value_range = maximum - minimum
+            if not np.isfinite(value_range) or value_range <= 1e-8:
+                value_range = 1.0
             rows.append(
                 {
                     "fd": fd_name,
@@ -134,28 +135,29 @@ def compute_past_sensor_stats(
                     "context_start_cycle": context_start_cycle,
                     "cutoff_cycle": cutoff_cycle,
                     "sensor": sensor,
-                    "past_mean": mean,
-                    "past_std": std,
+                    "past_min": minimum,
+                    "past_max": maximum,
+                    "past_range": value_range,
                     "past_n": int(len(past)),
                 }
             )
     return pd.DataFrame(rows)
 
 
-def add_zscore_columns(forecasts: pd.DataFrame, past_stats: pd.DataFrame) -> pd.DataFrame:
+def add_minmax_columns(forecasts: pd.DataFrame, past_ranges: pd.DataFrame) -> pd.DataFrame:
     keyed = forecasts.merge(
-        past_stats,
+        past_ranges,
         on=["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"],
         how="left",
         validate="many_to_one",
     )
-    if keyed["past_mean"].isna().any() or keyed["past_std"].isna().any():
-        raise ValueError("Missing leakage-free past z-score stats for some forecast rows.")
-    keyed["y_true_z"] = (keyed["y_true"] - keyed["past_mean"]) / keyed["past_std"]
-    keyed["y_pred_z"] = (keyed["y_pred"] - keyed["past_mean"]) / keyed["past_std"]
-    keyed["z_error"] = keyed["y_pred_z"] - keyed["y_true_z"]
-    keyed["z_abs_error"] = keyed["z_error"].abs()
-    keyed["z_sq_error"] = keyed["z_error"] ** 2
+    if keyed["past_min"].isna().any() or keyed["past_range"].isna().any():
+        raise ValueError("Missing leakage-free past min-max stats for some forecast rows.")
+    keyed["y_true_minmax"] = (keyed["y_true"] - keyed["past_min"]) / keyed["past_range"]
+    keyed["y_pred_minmax"] = (keyed["y_pred"] - keyed["past_min"]) / keyed["past_range"]
+    keyed["minmax_error"] = keyed["y_pred_minmax"] - keyed["y_true_minmax"]
+    keyed["minmax_abs_error"] = keyed["minmax_error"].abs()
+    keyed["minmax_sq_error"] = keyed["minmax_error"] ** 2
     return keyed
 
 
@@ -165,18 +167,18 @@ def summarize_forecast_error(forecasts: pd.DataFrame) -> Tuple[pd.DataFrame, pd.
     sensor_round = (
         forecasts.groupby(sensor_cols, sort=True)
         .agg(
-            mae=("z_abs_error", "mean"),
-            rmse=("z_sq_error", lambda s: float(np.sqrt(np.mean(s)))),
-            n=("z_error", "size"),
+            mae=("minmax_abs_error", "mean"),
+            rmse=("minmax_sq_error", lambda s: float(np.sqrt(np.mean(s)))),
+            n=("minmax_error", "size"),
         )
         .reset_index()
     )
     overall_round = (
         forecasts.groupby(window_cols, sort=True)
         .agg(
-            mae=("z_abs_error", "mean"),
-            rmse=("z_sq_error", lambda s: float(np.sqrt(np.mean(s)))),
-            n=("z_error", "size"),
+            mae=("minmax_abs_error", "mean"),
+            rmse=("minmax_sq_error", lambda s: float(np.sqrt(np.mean(s)))),
+            n=("minmax_error", "size"),
         )
         .reset_index()
     )
@@ -216,13 +218,13 @@ def summarize_condition_matched_drift(
         how="left",
         validate="many_to_one",
     )
-    keyed["ref_mean_z"] = (keyed["ref_mean_raw"] - keyed["past_mean"]) / keyed["past_std"]
-    keyed["ref_std_z"] = keyed["ref_std_raw"] / keyed["past_std"]
-    keyed["drift_error"] = keyed["y_pred_z"] - keyed["ref_mean_z"]
+    keyed["ref_mean_minmax"] = (keyed["ref_mean_raw"] - keyed["past_min"]) / keyed["past_range"]
+    keyed["ref_std_minmax"] = keyed["ref_std_raw"] / keyed["past_range"]
+    keyed["drift_error"] = keyed["y_pred_minmax"] - keyed["ref_mean_minmax"]
     keyed["drift_abs_error"] = keyed["drift_error"].abs()
     keyed["drift_sq_error"] = keyed["drift_error"] ** 2
 
-    available = keyed[keyed["ref_mean_z"].notna()].copy()
+    available = keyed[keyed["ref_mean_minmax"].notna()].copy()
     window_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle"]
     sensor_cols = [*window_cols, "sensor"]
     sensor_round = (
@@ -232,7 +234,7 @@ def summarize_condition_matched_drift(
             rmse=("drift_sq_error", lambda s: float(np.sqrt(np.mean(s)))),
             n=("drift_error", "size"),
             ref_n_min=("ref_n", "min"),
-            ref_std_z_median=("ref_std_z", "median"),
+            ref_std_minmax_median=("ref_std_minmax", "median"),
         )
         .reset_index()
     )
@@ -243,12 +245,12 @@ def summarize_condition_matched_drift(
             rmse=("drift_sq_error", lambda s: float(np.sqrt(np.mean(s)))),
             n=("drift_error", "size"),
             ref_n_min=("ref_n", "min"),
-            ref_std_z_median=("ref_std_z", "median"),
+            ref_std_minmax_median=("ref_std_minmax", "median"),
         )
         .reset_index()
     )
     overall_round["sensor"] = "ALL"
-    return keyed, sensor_round, overall_round[[*sensor_cols, "mae", "rmse", "n", "ref_n_min", "ref_std_z_median"]]
+    return keyed, sensor_round, overall_round[[*sensor_cols, "mae", "rmse", "n", "ref_n_min", "ref_std_minmax_median"]]
 
 
 def summarize_reference_coverage(keyed: pd.DataFrame) -> pd.DataFrame:
@@ -257,9 +259,9 @@ def summarize_reference_coverage(keyed: pd.DataFrame) -> pd.DataFrame:
             "fd": "ALL",
             "covariate_mode": "ALL",
             "sensor": "ALL",
-            "coverage": float(keyed["ref_mean_z"].notna().mean()),
+            "coverage": float(keyed["ref_mean_minmax"].notna().mean()),
             "rows": int(len(keyed)),
-            "missing_rows": int(keyed["ref_mean_z"].isna().sum()),
+            "missing_rows": int(keyed["ref_mean_minmax"].isna().sum()),
         }
     ]
     for (fd_name, mode), group in keyed.groupby(["fd", "covariate_mode"], sort=True):
@@ -268,9 +270,9 @@ def summarize_reference_coverage(keyed: pd.DataFrame) -> pd.DataFrame:
                 "fd": fd_name,
                 "covariate_mode": mode,
                 "sensor": "ALL",
-                "coverage": float(group["ref_mean_z"].notna().mean()),
+                "coverage": float(group["ref_mean_minmax"].notna().mean()),
                 "rows": int(len(group)),
-                "missing_rows": int(group["ref_mean_z"].isna().sum()),
+                "missing_rows": int(group["ref_mean_minmax"].isna().sum()),
             }
         )
     for (fd_name, mode, sensor), group in keyed.groupby(["fd", "covariate_mode", "sensor"], sort=True):
@@ -279,9 +281,9 @@ def summarize_reference_coverage(keyed: pd.DataFrame) -> pd.DataFrame:
                 "fd": fd_name,
                 "covariate_mode": mode,
                 "sensor": sensor,
-                "coverage": float(group["ref_mean_z"].notna().mean()),
+                "coverage": float(group["ref_mean_minmax"].notna().mean()),
                 "rows": int(len(group)),
-                "missing_rows": int(group["ref_mean_z"].isna().sum()),
+                "missing_rows": int(group["ref_mean_minmax"].isna().sum()),
             }
         )
     return pd.DataFrame(rows)
@@ -428,11 +430,11 @@ def main() -> None:
         )
 
     eval_frames = load_eval_frames(args.data_dir, eval_split)
-    past_stats = compute_past_sensor_stats(eval_frames, forecasts, args.sensors)
-    past_stats.to_csv(output_dir / "past_zscore_stats.csv", index=False)
-    forecasts = add_zscore_columns(forecasts, past_stats)
+    past_ranges = compute_past_sensor_ranges(eval_frames, forecasts, args.sensors)
+    past_ranges.to_csv(output_dir / "past_minmax_stats.csv", index=False)
+    forecasts = add_minmax_columns(forecasts, past_ranges)
 
-    print("Computing z-score forecasting error metrics...", flush=True)
+    print("Computing min-max forecasting error metrics...", flush=True)
     fe_sensor, fe_overall = summarize_forecast_error(forecasts)
     fe_round = pd.concat([fe_overall, fe_sensor], ignore_index=True)
     fe_round = smooth_round_metrics(fe_round, args.rolling_window)
