@@ -1,0 +1,93 @@
+head,relation,tail,weight,source,notes
+S2,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S3,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S4,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S7,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S8,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S9,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S11,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S12,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S13,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S14,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S15,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S17,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S20,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S21,node_type,Sensor,1.0,manual,selected degradation-sensitive C-MAPSS sensor
+S2,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S3,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S4,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S7,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S8,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S9,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S11,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S12,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S13,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S14,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S15,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S17,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S20,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S21,selected_for_forecast,true,1.0,DKAMFormer,one of 14 selected degradation-sensitive sensors
+S2,measures,T24_total_temperature_at_LPC_outlet,1.0,CMAPSS_standard,total temperature at LPC outlet
+S3,measures,T30_total_temperature_at_HPC_outlet,1.0,CMAPSS_standard,total temperature at HPC outlet
+S4,measures,T50_total_temperature_at_LPT_outlet,1.0,CMAPSS_standard,total temperature at LPT outlet
+S7,measures,P30_total_pressure_at_HPC_outlet,1.0,DKAMFormer,total pressure at HPC outlet
+S8,measures,Nf_physical_fan_speed,1.0,DKAMFormer,physical fan speed
+S9,measures,Nc_physical_core_speed,1.0,CMAPSS_standard,physical core speed
+S11,measures,Ps30_static_pressure_at_HPC_outlet,1.0,DKAMFormer,static pressure at HPC outlet
+S12,measures,phi_fuel_flow_ratio_to_Ps30,1.0,CMAPSS_standard,fuel flow ratio to Ps30
+S13,measures,NRf_corrected_fan_speed,1.0,CMAPSS_standard,corrected fan speed
+S14,measures,NRc_corrected_core_speed,1.0,CMAPSS_standard,corrected core speed
+S15,measures,BPR_bypass_ratio,1.0,CMAPSS_standard,bypass ratio
+S17,measures,htBleed_bleed_enthalpy,1.0,DKAMFormer,bleed enthalpy
+S20,measures,W31_HPT_coolant_bleed,1.0,CMAPSS_standard,HPT coolant bleed
+S21,measures,W32_LPT_coolant_bleed,1.0,CMAPSS_standard,LPT coolant bleed
+T24_total_temperature_at_LPC_outlet,node_type,PhysicalQuantity,1.0,manual,temperature quantity
+T30_total_temperature_at_HPC_outlet,node_type,PhysicalQuantity,1.0,manual,temperature quantity
+T50_total_temperature_at_LPT_outlet,node_type,PhysicalQuantity,1.0,manual,temperature quantity
+P30_total_pressure_at_HPC_outlet,node_type,PhysicalQuantity,1.0,manual,pressure quantity
+Nf_physical_fan_speed,node_type,PhysicalQuantity,1.0,manual,speed quantity
+Nc_physical_core_speed,node_type,PhysicalQuantity,1.0,manual,speed quantity
+Ps30_static_pressure_at_HPC_outlet,node_type,PhysicalQuantity,1.0,manual,pressure quantity
+phi_fuel_flow_ratio_to_Ps30,node_type,PhysicalQuantity,1.0,manual,ratio quantity
+NRf_corrected_fan_speed,node_type,PhysicalQuantity,1.0,manual,speed quantity
+NRc_corrected_core_speed,node_type,PhysicalQuantity,1.0,manual,speed quantity
+BPR_bypass_ratio,node_type,PhysicalQuantity,1.0,manual,ratio quantity
+htBleed_bleed_enthalpy,node_type,PhysicalQuantity,1.0,manual,bleed or enthalpy quantity
+W31_HPT_coolant_bleed,node_type,PhysicalQuantity,1.0,manual,flow quantity
+W32_LPT_coolant_bleed,node_type,PhysicalQuantity,1.0,manual,flow quantity
+T24_total_temperature_at_LPC_outlet,quantity_type,temperature_related_parameter,1.0,manual,physical quantity type
+T30_total_temperature_at_HPC_outlet,quantity_type,temperature_related_parameter,1.0,manual,physical quantity type
+T50_total_temperature_at_LPT_outlet,quantity_type,temperature_related_parameter,1.0,manual,physical quantity type
+P30_total_pressure_at_HPC_outlet,quantity_type,pressure_related_parameter,1.0,manual,physical quantity type
+Nf_physical_fan_speed,quantity_type,speed_related_parameter,1.0,manual,physical quantity type
+Nc_physical_core_speed,quantity_type,speed_related_parameter,1.0,manual,physical quantity type
+Ps30_static_pressure_at_HPC_outlet,quantity_type,pressure_related_parameter,1.0,manual,physical quantity type
+phi_fuel_flow_ratio_to_Ps30,quantity_type,ratio_related_parameter,1.0,manual,physical quantity type
+NRf_corrected_fan_speed,quantity_type,speed_related_parameter,1.0,manual,physical quantity type
+NRc_corrected_core_speed,quantity_type,speed_related_parameter,1.0,manual,physical quantity type
+BPR_bypass_ratio,quantity_type,ratio_related_parameter,1.0,manual,physical quantity type
+htBleed_bleed_enthalpy,quantity_type,bleed_or_enthalpy_related_parameter,1.0,manual,physical quantity type
+W31_HPT_coolant_bleed,quantity_type,flow_related_parameter,1.0,manual,physical quantity type
+W32_LPT_coolant_bleed,quantity_type,flow_related_parameter,1.0,manual,physical quantity type
+T24_total_temperature_at_LPC_outlet,associated_with,LPC,0.7,CMAPSS_standard,LPC outlet temperature
+T30_total_temperature_at_HPC_outlet,associated_with,HPC,0.95,CMAPSS_standard,HPC outlet temperature
+T50_total_temperature_at_LPT_outlet,associated_with,LPT,0.9,CMAPSS_standard,LPT outlet temperature
+P30_total_pressure_at_HPC_outlet,associated_with,HPC,1.0,DKAMFormer,HPC outlet pressure
+Nf_physical_fan_speed,associated_with,FAN,0.85,DKAMFormer,fan speed
+Nf_physical_fan_speed,associated_with,LowPressureRotor,0.8,DKAMFormer,low-pressure spool signal
+Nc_physical_core_speed,associated_with,HPC,0.75,CMAPSS_standard,core speed as HPC-side evidence
+Nc_physical_core_speed,associated_with,HighPressureRotor,0.8,CMAPSS_standard,high-pressure spool signal
+Ps30_static_pressure_at_HPC_outlet,associated_with,HPC,1.0,DKAMFormer,HPC outlet static pressure
+phi_fuel_flow_ratio_to_Ps30,associated_with,CombustionChamber,0.65,CMAPSS_standard,fuel flow ratio is combustion-side explanatory evidence
+NRf_corrected_fan_speed,associated_with,FAN,0.85,CMAPSS_standard,corrected fan speed
+NRf_corrected_fan_speed,associated_with,LowPressureRotor,0.75,CMAPSS_standard,low-pressure spool signal
+NRc_corrected_core_speed,associated_with,HPC,0.75,CMAPSS_standard,corrected core speed as HPC-side evidence
+NRc_corrected_core_speed,associated_with,HighPressureRotor,0.85,CMAPSS_standard,high-pressure spool signal
+BPR_bypass_ratio,associated_with,BypassDuct,0.9,CMAPSS_standard,bypass duct flow evidence
+BPR_bypass_ratio,associated_with,FAN,0.55,manual,weak fan-side evidence
+htBleed_bleed_enthalpy,associated_with,HPC,0.55,DKAMFormer,bleed evidence can relate to compressor/turbine cooling path
+htBleed_bleed_enthalpy,associated_with,HPT,0.45,manual,bleed evidence can be turbine-side explanatory signal
+W31_HPT_coolant_bleed,associated_with,HPT,0.75,CMAPSS_standard,HPT coolant bleed
+W31_HPT_coolant_bleed,associated_with,HPC,0.45,manual,HPC outlet air can feed turbine cooling
+W32_LPT_coolant_bleed,associated_with,LPT,0.75,CMAPSS_standard,LPT coolant bleed
+W32_LPT_coolant_bleed,associated_with,HPC,0.45,manual,HPC outlet air can feed turbine cooling

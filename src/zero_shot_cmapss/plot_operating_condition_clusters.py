@@ -247,7 +247,7 @@ def add_condition_runs(frame: pd.DataFrame, condition_col: str = "op_condition")
 def plot_sensor_window(
     timeline: pd.DataFrame,
     forecasts: pd.DataFrame,
-    curve_forecasts: pd.DataFrame,
+    window_forecasts: pd.DataFrame,
     sensor: str,
     covariate_mode: str,
     fd_name: str,
@@ -267,14 +267,17 @@ def plot_sensor_window(
     if n_conditions == 1:
         axes = [axes]
 
-    history_forecasts = curve_forecasts[
-        (curve_forecasts["covariate_mode"] == covariate_mode)
-        & (curve_forecasts["fd"] == fd_name)
-        & (curve_forecasts["unit_id"] == unit_id)
-        & (curve_forecasts["sensor"] == sensor)
-        & (curve_forecasts["cycle"] <= cutoff_cycle)
+    history_forecasts = window_forecasts[
+        (window_forecasts["covariate_mode"] == covariate_mode)
+        & (window_forecasts["fd"] == fd_name)
+        & (window_forecasts["unit_id"] == unit_id)
+        & (window_forecasts["sensor"] == sensor)
+        & (window_forecasts["forecast_start_cycle"] <= cutoff_cycle)
+        & (window_forecasts["cycle"] <= cutoff_cycle)
+        & (window_forecasts["horizon"] == 1)
     ][["cycle", "y_pred"]].copy()
     history_labels = timeline[timeline["window_part"] == "history"][["cycle", "op_condition"]]
+    history_forecasts = history_forecasts.drop_duplicates(["cycle"], keep="last")
     history_forecasts = history_forecasts.merge(history_labels, on="cycle", how="inner", validate="one_to_one")
 
     colors = plt.cm.tab10(np.linspace(0, 1, max(10, n_conditions)))
@@ -392,25 +395,15 @@ def main() -> None:
     eval_split = str(run_config.get("eval_split", "train"))
 
     window_forecasts = pd.read_csv(args.forecast_dir / "window_forecasts.csv")
-    curve_forecasts = pd.read_csv(args.forecast_dir / "forecasts.csv")
     required = {"covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle", "sensor", "y_true", "y_pred"}
     missing = required - set(window_forecasts.columns)
     if missing:
         raise ValueError(f"Missing required columns in window_forecasts.csv: {sorted(missing)}")
-    curve_required = {"covariate_mode", "fd", "unit_id", "cycle", "sensor", "y_pred"}
-    curve_missing = curve_required - set(curve_forecasts.columns)
-    if curve_missing:
-        raise ValueError(f"Missing required columns in forecasts.csv: {sorted(curve_missing)}")
 
     window_forecasts = window_forecasts[
         window_forecasts["fd"].isin(args.fds)
         & window_forecasts["covariate_mode"].isin(args.covariate_modes)
         & window_forecasts["sensor"].isin(args.sensors)
-    ].copy()
-    curve_forecasts = curve_forecasts[
-        curve_forecasts["fd"].isin(args.fds)
-        & curve_forecasts["covariate_mode"].isin(args.covariate_modes)
-        & curve_forecasts["sensor"].isin(args.sensors)
     ].copy()
     eval_frames = load_eval_frames(args.data_dir, eval_split)
     units = parse_plot_units(args.plot_units, window_forecasts, args.fds)
@@ -447,7 +440,7 @@ def main() -> None:
                     plot_sensor_window(
                         timeline=timeline,
                         forecasts=labeled_forecasts,
-                        curve_forecasts=curve_forecasts,
+                        window_forecasts=window_forecasts,
                         sensor=sensor,
                         covariate_mode=covariate_mode,
                         fd_name=fd_name,

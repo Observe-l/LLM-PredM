@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -11,20 +10,26 @@ import numpy as np
 import pandas as pd
 
 try:
-    from .plot_operating_condition_clusters import DEFAULT_SENSORS, FD_NAMES
+    from .plot_operating_condition_clusters import DEFAULT_SENSORS, FD_NAMES, load_cmapss_file, make_condition_keys
 except ImportError:
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from src.zero_shot_cmapss.plot_operating_condition_clusters import DEFAULT_SENSORS, FD_NAMES
+    from src.zero_shot_cmapss.plot_operating_condition_clusters import DEFAULT_SENSORS, FD_NAMES, load_cmapss_file, make_condition_keys
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze known-future condition-matched drift as a maintenance decision signal."
+        description="Analyze condition-matched drift as a maintenance decision signal."
     )
     parser.add_argument("--data_dir", type=Path, default=Path("dataset/CMAPSSData"))
     parser.add_argument("--forecast_dir", type=Path, default=Path("outputs/cluster_roll_10"))
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--fds", nargs="+", default=list(FD_NAMES), choices=list(FD_NAMES))
+    parser.add_argument(
+        "--covariate_mode",
+        choices=["cluster_covariate", "future_covariate", "no_covariate", "known_future"],
+        default="cluster_covariate",
+        help="Forecast experiment mode used for the decision signal. known_future is accepted as a legacy alias.",
+    )
     parser.add_argument("--sensors", nargs="+", default=DEFAULT_SENSORS)
     parser.add_argument(
         "--healthy_cycles",
@@ -69,39 +74,11 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Rolling window over target cycles used to smooth log-ratio LHI plots and summaries.",
     )
-    parser.add_argument("--plot_examples", type=int, default=4)
-    parser.add_argument(
-        "--plot_units",
-        nargs="*",
-        default=None,
-        help="Optional unit-level plots, e.g. FD001:4 FD004:3. If omitted, plots first units per FD.",
-    )
+    parser.add_argument("--chunksize", type=int, default=1_000_000)
     return parser.parse_args()
 
 
-def parse_plot_units(items: Sequence[str] | None, metrics: pd.DataFrame, examples_per_fd: int) -> List[Tuple[str, int]]:
-    if items:
-        parsed = []
-        for item in items:
-            if ":" not in item:
-                raise ValueError(f"--plot_units entries must look like FD004:3, got {item!r}")
-            fd_name, unit_text = item.split(":", 1)
-            if fd_name not in FD_NAMES:
-                raise ValueError(f"Unknown FD in --plot_units: {fd_name!r}")
-            parsed.append((fd_name, int(unit_text)))
-        return parsed
-
-    keys = (
-        metrics[["fd", "unit_id"]]
-        .drop_duplicates()
-        .sort_values(["fd", "unit_id"])
-        .groupby("fd", as_index=False)
-        .head(examples_per_fd)
-    )
-    return [(str(row.fd), int(row.unit_id)) for row in keys.itertuples(index=False)]
-
-
-def load_known_future_forecasts(args: argparse.Namespace) -> Tuple[pd.DataFrame, str]:
+def load_decision_forecasts(args: argparse.Namespace) -> Tuple[pd.DataFrame, str]:
     path = args.forecast_dir / "window_forecasts.csv"
     forecasts = pd.read_csv(path)
     required = {
@@ -121,13 +98,14 @@ def load_known_future_forecasts(args: argparse.Namespace) -> Tuple[pd.DataFrame,
     if missing:
         raise ValueError(f"Missing required columns in {path}: {sorted(missing)}")
 
+    mode = "cluster_covariate" if args.covariate_mode == "known_future" else args.covariate_mode
     forecasts = forecasts[
-        (forecasts["covariate_mode"] == "known_future")
+        (forecasts["covariate_mode"] == mode)
         & forecasts["fd"].isin(args.fds)
         & forecasts["sensor"].isin(args.sensors)
     ].copy()
     if forecasts.empty:
-        raise ValueError(f"No known_future forecast rows found in {path}.")
+        raise ValueError(f"No {mode} forecast rows found in {path}.")
 
     run_config_path = args.forecast_dir / "run_config.json"
     run_config = json.loads(run_config_path.read_text()) if run_config_path.exists() else {}
@@ -149,6 +127,48 @@ def build_condition_healthy_reference(forecasts: pd.DataFrame, healthy_cycles: i
         .reset_index()
     )
     return reference
+
+
+def load_eval_frames(data_dir: Path, eval_split: str, fds: Sequence[str]) -> dict[str, pd.DataFrame]:
+    frames = {}
+    for fd_name in fds:
+        frame = load_cmapss_file(data_dir / fd_name / f"{eval_split}_{fd_name}.txt")
+        frame = frame.copy()
+        frame["op_condition_key"] = make_condition_keys(frame)
+        frames[fd_name] = frame
+    return frames
+
+
+def build_condition_healthy_reference_from_frames(
+    frames: dict[str, pd.DataFrame],
+    sensors: Sequence[str],
+    healthy_cycles: int,
+) -> pd.DataFrame:
+    rows = []
+    for fd_name, frame in frames.items():
+        healthy = frame[frame["cycle"] <= healthy_cycles].copy()
+        if healthy.empty:
+            continue
+        melted = healthy.melt(
+            id_vars=["unit_id", "cycle", "op_condition_key"],
+            value_vars=list(sensors),
+            var_name="sensor",
+            value_name="y_true",
+        )
+        melted["fd"] = fd_name
+        rows.append(melted)
+    if not rows:
+        raise ValueError(f"No healthy rows found for cycle <= --healthy_cycles ({healthy_cycles}).")
+    healthy_actuals = pd.concat(rows, ignore_index=True)
+    return (
+        healthy_actuals.groupby(["fd", "unit_id", "op_condition_key", "sensor"], sort=True)
+        .agg(
+            healthy_mean_raw=("y_true", "mean"),
+            healthy_std_raw=("y_true", lambda s: float(np.std(s.to_numpy(dtype=float), ddof=0))),
+            healthy_n=("y_true", "size"),
+        )
+        .reset_index()
+    )
 
 
 def summarize_condition_matched_healthy_std_drift(
@@ -205,13 +225,13 @@ def summarize_condition_matched_healthy_std_drift(
     return keyed, sensor_round, overall_round[[*sensor_cols, "mae", "rmse", "n", "healthy_n_min", "healthy_std_median"]]
 
 
-def build_known_future_rmse(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    forecasts, _ = load_known_future_forecasts(args)
+def build_decision_rmse(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    forecasts, _ = load_decision_forecasts(args)
     reference_source = forecasts.copy()
 
-    forecasts = forecasts[forecasts["cycle"] > args.start_cycle].copy()
+    forecasts = forecasts[forecasts["cycle"] >= args.start_cycle].copy()
     if forecasts.empty:
-        raise ValueError(f"No forecast rows remain after filtering to cycle > --start_cycle ({args.start_cycle}).")
+        raise ValueError(f"No forecast rows remain after filtering to cycle >= --start_cycle ({args.start_cycle}).")
 
     healthy_reference = build_condition_healthy_reference(reference_source, args.healthy_cycles)
     drift_rows, drift_sensor, drift_overall = summarize_condition_matched_healthy_std_drift(
@@ -222,11 +242,117 @@ def build_known_future_rmse(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.
     )
     metrics = pd.concat([drift_overall, drift_sensor], ignore_index=True)
     metrics = metrics[
-        (metrics["covariate_mode"] == "known_future")
+        (metrics["covariate_mode"] == ("cluster_covariate" if args.covariate_mode == "known_future" else args.covariate_mode))
         & (metrics["sensor"] == "ALL")
     ].copy()
     metrics = metrics.sort_values(["fd", "unit_id", "cycle", "forecast_start_cycle"]).reset_index(drop=True)
     return metrics, drift_rows, healthy_reference
+
+
+def iter_decision_forecast_chunks(args: argparse.Namespace):
+    path = args.forecast_dir / "window_forecasts.csv"
+    required = [
+        "covariate_mode",
+        "fd",
+        "unit_id",
+        "cutoff_cycle",
+        "forecast_start_cycle",
+        "cycle",
+        "sensor",
+        "y_pred",
+        "op_condition_key",
+    ]
+    mode = "cluster_covariate" if args.covariate_mode == "known_future" else args.covariate_mode
+    for chunk in pd.read_csv(path, usecols=required, chunksize=args.chunksize):
+        chunk = chunk[
+            (chunk["covariate_mode"] == mode)
+            & chunk["fd"].isin(args.fds)
+            & chunk["sensor"].isin(args.sensors)
+            & (chunk["cycle"] >= args.start_cycle)
+        ].copy()
+        if not chunk.empty:
+            yield chunk
+
+
+def summarize_decision_drift_streaming(
+    args: argparse.Namespace,
+    healthy_reference: pd.DataFrame,
+    output_dir: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    drift_path = output_dir / "decision_condition_matched_drift_rows.csv"
+    if drift_path.exists():
+        drift_path.unlink()
+    partials = []
+    for chunk_idx, chunk in enumerate(iter_decision_forecast_chunks(args), start=1):
+        keyed = chunk.merge(
+            healthy_reference,
+            on=["fd", "unit_id", "op_condition_key", "sensor"],
+            how="left",
+            validate="many_to_one",
+        )
+        keyed["drift"] = (keyed["y_pred"] - keyed["healthy_mean_raw"]).abs() / (
+            keyed["healthy_std_raw"] + args.drift_epsilon
+        )
+        keyed["drift_sq"] = keyed["drift"] ** 2
+        available = keyed[
+            keyed["healthy_mean_raw"].notna()
+            & (keyed["healthy_n"] >= args.min_healthy_reference_n)
+            & (keyed["healthy_std_raw"] > args.drift_epsilon)
+        ].copy()
+        keyed.to_csv(drift_path, index=False, mode="a", header=not drift_path.exists())
+        if not available.empty:
+            group_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle", "sensor"]
+            partials.append(
+                available.groupby(group_cols, sort=True)
+                .agg(
+                    drift_sum=("drift", "sum"),
+                    drift_sq_sum=("drift_sq", "sum"),
+                    n=("drift", "size"),
+                    healthy_n_min=("healthy_n", "min"),
+                    healthy_std_median=("healthy_std_raw", "median"),
+                )
+                .reset_index()
+            )
+        print(f"  decision chunk {chunk_idx}: rows={len(chunk):,}", flush=True)
+    if not partials:
+        raise ValueError("No decision drift rows were produced.")
+    partial = pd.concat(partials, ignore_index=True)
+    group_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle", "sensor"]
+    sensor_round = (
+        partial.groupby(group_cols, sort=True)
+        .agg(
+            drift_sum=("drift_sum", "sum"),
+            drift_sq_sum=("drift_sq_sum", "sum"),
+            n=("n", "sum"),
+            healthy_n_min=("healthy_n_min", "min"),
+            healthy_std_median=("healthy_std_median", "median"),
+        )
+        .reset_index()
+    )
+    sensor_round["mae"] = sensor_round["drift_sum"] / sensor_round["n"]
+    sensor_round["rmse"] = np.sqrt(sensor_round["drift_sq_sum"] / sensor_round["n"])
+    window_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle"]
+    overall = (
+        sensor_round.groupby(window_cols, sort=True)
+        .agg(
+            drift_sum=("drift_sum", "sum"),
+            drift_sq_sum=("drift_sq_sum", "sum"),
+            n=("n", "sum"),
+            healthy_n_min=("healthy_n_min", "min"),
+            healthy_std_median=("healthy_std_median", "median"),
+        )
+        .reset_index()
+    )
+    overall["mae"] = overall["drift_sum"] / overall["n"]
+    overall["rmse"] = np.sqrt(overall["drift_sq_sum"] / overall["n"])
+    overall["sensor"] = "ALL"
+    metrics = overall[[*window_cols, "sensor", "mae", "rmse", "n", "healthy_n_min", "healthy_std_median"]].copy()
+    mode = "cluster_covariate" if args.covariate_mode == "known_future" else args.covariate_mode
+    metrics = metrics[metrics["covariate_mode"] == mode].sort_values(
+        ["fd", "unit_id", "cycle", "forecast_start_cycle"]
+    ).reset_index(drop=True)
+    drift_sensor = sensor_round[[*group_cols, "mae", "rmse", "n", "healthy_n_min", "healthy_std_median"]].copy()
+    return metrics, drift_sensor
 
 
 def add_dynamic_thresholds_and_slopes(
@@ -240,20 +366,19 @@ def add_dynamic_thresholds_and_slopes(
     rows = []
     for _, group in metrics.groupby(["fd", "unit_id"], sort=True):
         group = group.sort_values(["cycle", "forecast_start_cycle"]).copy()
-        theta95 = []
-        theta99 = []
-        history_count = []
-        for row in group.itertuples(index=False):
-            history = group[group["cycle"] <= int(row.cutoff_cycle)]["rmse"].to_numpy(dtype=float)
-            history_count.append(len(history))
-            if len(history) >= min_history_windows:
-                theta95.append(float(np.quantile(history, 0.95)))
-                theta99.append(float(np.quantile(history, 0.99)))
-            else:
-                theta95.append(np.nan)
-                theta99.append(np.nan)
+        cycles = group["cycle"].to_numpy(dtype=np.int64)
+        cutoffs = group["cutoff_cycle"].to_numpy(dtype=np.int64)
+        rmse = group["rmse"].to_numpy(dtype=float)
+        history_pos = np.searchsorted(cycles, cutoffs, side="right")
+        expanding_q95 = pd.Series(rmse).expanding(min_periods=min_history_windows).quantile(0.95).to_numpy()
+        expanding_q99 = pd.Series(rmse).expanding(min_periods=min_history_windows).quantile(0.99).to_numpy()
+        theta95 = np.full(len(group), np.nan, dtype=float)
+        theta99 = np.full(len(group), np.nan, dtype=float)
+        valid = history_pos >= min_history_windows
+        theta95[valid] = expanding_q95[history_pos[valid] - 1]
+        theta99[valid] = expanding_q99[history_pos[valid] - 1]
 
-        group["history_count"] = history_count
+        group["history_count"] = history_pos
         group["healthy_reference_window"] = group["cycle"] <= healthy_cycles
         group["theta_0_95"] = theta95
         group["theta_0_99"] = theta99
@@ -386,7 +511,8 @@ def plot_threshold_examples(metrics: pd.DataFrame, units: Sequence[Tuple[str, in
         if unit_df.empty:
             continue
         fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(unit_df["cycle"], unit_df["rmse"], color="#1f2937", linewidth=1.8, label="known_future RMSE")
+        mode = str(unit_df["covariate_mode"].iloc[0]) if "covariate_mode" in unit_df else "decision"
+        ax.plot(unit_df["cycle"], unit_df["rmse"], color="#1f2937", linewidth=1.8, label=f"{mode} RMSE")
         ax.scatter(unit_df["cycle"], unit_df["rmse"], color="#d97706", s=12, alpha=0.75, label="target RMSE")
         ax.plot(unit_df["cycle"], unit_df["theta_0_95"], color="#dc2626", linestyle="--", linewidth=1.3, label=r"$\theta_{0.95}$")
         ax.plot(unit_df["cycle"], unit_df["theta_0_99"], color="#7f1d1d", linestyle=":", linewidth=1.5, label=r"$\theta_{0.99}$")
@@ -553,13 +679,22 @@ def main() -> None:
     args = parse_args()
     output_dir = args.output_dir or (args.forecast_dir / "maintenance_decision")
     output_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(output_dir / ".mplconfig"))
+    mode = "cluster_covariate" if args.covariate_mode == "known_future" else args.covariate_mode
     for legacy_name in ("known_future_rmse_with_thresholds.csv", "rmse_compare_with_evaluation.csv"):
         legacy_path = output_dir / legacy_name
         if legacy_path.exists():
             legacy_path.unlink()
 
-    metrics, drift_rows, healthy_reference = build_known_future_rmse(args)
+    run_config_path = args.forecast_dir / "run_config.json"
+    run_config = json.loads(run_config_path.read_text()) if run_config_path.exists() else {}
+    eval_split = str(run_config.get("eval_split", "train"))
+    frames = load_eval_frames(args.data_dir, eval_split, args.fds)
+    healthy_reference = build_condition_healthy_reference_from_frames(frames, args.sensors, args.healthy_cycles)
+    metrics, drift_sensor = summarize_decision_drift_streaming(
+        args=args,
+        healthy_reference=healthy_reference,
+        output_dir=output_dir,
+    )
     metrics = add_dynamic_thresholds_and_slopes(
         metrics=metrics,
         min_history_windows=args.history_windows,
@@ -570,23 +705,17 @@ def main() -> None:
     unit_summary = summarize_units(metrics, args.healthy_cycles)
     fd_summary = summarize_fd(metrics, args.healthy_cycles)
 
-    metrics.to_csv(output_dir / "known_future_rmse_with_dynamic_thresholds.csv", index=False)
-    metrics.to_csv(output_dir / "known_future_log_ratio_lhi.csv", index=False)
+    metrics.to_csv(output_dir / f"{mode}_rmse_with_dynamic_thresholds.csv", index=False)
+    metrics.to_csv(output_dir / f"{mode}_log_ratio_lhi.csv", index=False)
+    metrics.to_csv(output_dir / "decision_log_ratio_lhi.csv", index=False)
     metrics[metrics["cycle"] > args.healthy_cycles].to_csv(
-        output_dir / "known_future_log_ratio_lhi_monitoring.csv",
+        output_dir / f"{mode}_log_ratio_lhi_monitoring.csv",
         index=False,
     )
-    drift_rows.to_csv(output_dir / "known_future_condition_matched_drift_rows.csv", index=False)
+    drift_sensor.to_csv(output_dir / f"{mode}_condition_matched_drift_sensor_metrics.csv", index=False)
     healthy_reference.to_csv(output_dir / "healthy_condition_reference.csv", index=False)
     unit_summary.to_csv(output_dir / "engine_maintenance_signal_summary.csv", index=False)
     fd_summary.to_csv(output_dir / "fd_maintenance_signal_summary.csv", index=False)
-
-    units = parse_plot_units(args.plot_units, metrics, args.plot_examples)
-    plot_threshold_examples(metrics, units, output_dir, args.healthy_cycles)
-    plot_slope_examples(metrics, units, output_dir, args.healthy_cycles)
-    plot_lhi_examples(metrics, units, output_dir, args.healthy_cycles)
-    plot_fd_overview(fd_summary, output_dir)
-    plot_engine_scatter(unit_summary, output_dir)
 
     print("Engine-level signal summary by FD:", flush=True)
     print(

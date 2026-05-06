@@ -45,8 +45,12 @@ setting1, setting2, setting3
 
 Covariate modes:
 
-- `past_only`: operating conditions are observed only in the context window.
-- `known_future`: operating conditions are also known over the forecast horizon.
+- `cluster_covariate`: first split each forecast window by operating-condition
+  cluster, then pass setting1-3 as past and future covariates. This is the
+  default experiment mode and replaces the old `known_future` name.
+- `future_covariate`: do not split by operating-condition cluster; pass raw
+  multivariate sensor history plus setting1-3 as past and future covariates.
+- `no_covariate`: pass only the multivariate sensor history.
 
 The first Chronos run downloads `amazon/chronos-2` into the Hugging Face cache.
 The forecasting script disables Hugging Face Xet by default because partial Xet
@@ -54,47 +58,70 @@ downloads can stall with range-resume errors on some networks.
 
 ### 1. Run Zero-Shot Forecasting
 
-This command evaluates on `train_FDxxx.txt`, uses stride-5 non-overlapping
-forecast blocks, and applies leakage-free context residual scaling:
+This command evaluates on `train_FDxxx.txt` and creates one local database
+row-set for every eligible forecast-start cycle:
 
 ```bash
 /home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.zero_shot_cmapss.chronos2_cmapss_forecast \
   --data_dir dataset/CMAPSSData \
-  --output_dir outputs/stride_5_robust \
+  --output_dir outputs/stride_1_h20 \
   --eval_split train \
   --device cuda \
   --context_length 0 \
-  --prediction_length 5 \
-  --target_transform context_robust \
-  --covariate_modes past_only known_future \
+  --prediction_length 20 \
+  --forecast_start_cycle 20 \
+  --stride 1 \
+  --target_transform context_minmax \
+  --covariate_modes cluster_covariate \
   --local_files_only
 ```
+
+The generation script does not plot. With `--stride 1`, every eligible
+forecast-start cycle gets a full `--prediction_length` horizon. For an engine
+with 150 cycles, forecast starts are cycles 20-150. Horizon steps beyond the
+observed sequence are saved with `y_true` empty, so LHI/decision signals can
+still use the forecast state. MAE/MSE/RMSE metrics are computed separately using
+only full-ground-truth, non-overlapping starts, equivalent to metric stride
+`prediction_length`.
 
 Useful options:
 
 - `--eval_split train|test`: choose C-MAPSS split for zero-shot evaluation.
-- `--target_transform context_robust`: forecast `(sensor - last_context_value) / context_MAD`, then restore to sensor scale using the same context statistics. This avoids future leakage and helps FD001/FD003 slow-trend forecasting.
-- `--plot_units FD001:4 FD004:3`: generate full-unit forecast plots for specific units.
+- `--target_transform context_minmax|none`: default `context_minmax` scales each sensor with the current forecast window's past-context min/max, then restores predictions to raw scale. Use `none` for a raw-scale ablation.
+- `--forecast_start_cycle 20`: first forecast-start cycle.
+- `--forecast_end_cycle N`: optional latest forecast-start cycle; by default the script uses the final observed cycle.
 
 Main outputs:
 
-- `metrics.csv`: full-curve MAE, MSE, and RMSE by FD, covariate mode, and sensor.
-- `forecasts.csv`: full forecast curves after aggregating overlapping horizon predictions by cycle.
-- `window_forecasts.csv`: raw rolling-window predictions for every horizon step.
+- `metrics.csv`: MAE, MSE, and RMSE by FD, covariate mode, and sensor, computed from `metric_window_forecasts.csv`.
+- `window_forecasts.csv`: raw rolling-window predictions for every forecast start and every horizon step. No aggregation is applied.
+- `metric_window_forecasts.csv`: full-ground-truth, non-overlapping windows used for MAE/MSE/RMSE.
 - `window_metrics.csv`: raw window-level MAE, MSE, and RMSE.
 - `anomaly_scores.csv`: window-level normalized forecasting-error score.
 - `sensor_anomaly_scores.csv`: sensor-level normalized forecasting-error score.
-- `plots/`: grouped-by-sensor full-unit forecast plots.
 - `run_config.json`: exact experiment configuration.
+
+Plot any unit interval from the generated forecast database:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.zero_shot_cmapss.plot_forecast_units \
+  --forecast_dir outputs/stride_1_h20 \
+  --fd FD001 \
+  --unit_start 1 \
+  --unit_end 20
+```
+
+The plotting script reads `prediction_length` from `run_config.json` and plots
+forecast starts at that stride, so the displayed horizons do not overlap.
 
 ### 2. Plot Rolling Anomaly Trends
 
-This post-processes `anomaly_scores.csv` and plots rolling mean/median trends over
-forecast start cycle.
+This older helper post-processes `anomaly_scores.csv` and plots rolling
+mean/median trends over forecast start cycle when available.
 
 ```bash
 /home/lwh/anaconda3/bin/conda run -n default python -m src.zero_shot_cmapss.plot_anomaly_scores \
-  --input_csv outputs/stride_5_robust/anomaly_scores.csv \
+  --input_csv outputs/stride_1_h20/anomaly_scores.csv \
   --rolling_window 5 \
   --plot_units FD001:4 FD004:3
 ```
@@ -125,22 +152,33 @@ cycle-level metrics:
   --data_dir dataset/CMAPSSData \
   --forecast_dir outputs/roll_5 \
   --output_dir outputs/roll_5/forecasting_evaluation \
-  --rolling_window 5 \
-  --plot_units FD001:1 FD002:1 FD003:1 FD004:1
+  --rolling_window 5
 ```
 
 By default, the script evaluates all covariate modes present in
-`window_forecasts.csv`. Use `--covariate_modes known_future` or
-`--covariate_modes past_only` to restrict the comparison.
+`window_forecasts.csv`. Use `--covariate_modes cluster_covariate`,
+`--covariate_modes future_covariate`, or `--covariate_modes no_covariate` to
+restrict the comparison.
 
 Outputs:
 
 - `forecast_error_round_metrics.csv`: per-unit, per-round MAE/RMSE by sensor and `ALL`.
+- `forecast_error_metric_rows.csv`: rows used for Forecast Error after filtering to full-ground-truth, non-overlapping starts.
 - `forecast_error_fd_level.csv`: FD-level median trend over units.
 - `condition_matched_drift_round_metrics.csv`: per-unit, per-round condition-matched drift.
 - `condition_matched_drift_fd_level.csv`: FD-level condition-matched drift trend.
 - `healthy_condition_reference.csv`: healthy references by unit, condition, and sensor.
-- `*_fd_level.png` and `unit_plots/*.png`: cycle-axis metric plots.
+
+Plot any unit interval from the generated evaluation metrics:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.zero_shot_cmapss.plot_forecasting_evaluation \
+  --evaluation_dir outputs/roll_5/forecasting_evaluation \
+  --fd FD001 \
+  --unit_start 1 \
+  --unit_end 20 \
+  --plot_fd_level
+```
 
 ### 4. Compute Log-Ratio LHI
 
@@ -157,7 +195,7 @@ forecast drift immediately after the healthy reference interval.
   --output_dir outputs/cluster_20/lhi \
   --healthy_cycles 50 \
   --rolling_window 5 \
-  --plot_units FD001:1 FD002:4 FD004:3
+  --top_k_sensors 5
 ```
 
 For each forecast window and sensor:
@@ -188,7 +226,8 @@ B_RMSE = mean(D_RMSE) over the first forecast block after --healthy_cycles
 
 By default this means the first forecast block after `--healthy_cycles`. Use
 `--baseline_cycles N` to average over the first `N` monitor target cycles
-instead.
+instead. `--top_k_sensors` controls how many sensor-level drift contributors are
+reported for each LHI point.
 
 Then:
 
@@ -198,12 +237,13 @@ LHI = log((D_RMSE + eps) / (B_RMSE + eps))
 
 Outputs:
 
-- `lhi_scores.csv`: per forecast cycle `D_MAE`, `D_RMSE`, `LHI_MAE`, and `LHI_RMSE`.
+- `lhi_scores.csv`: per forecast cycle `D_MAE`, `D_RMSE`, `LHI_MAE`, `LHI_RMSE`,
+  `top_drift_sensors`, and top sensor drift values.
+- `top_drift_sensors.csv`: long-format ranked sensor contributors for each forecast cycle.
+- `sensor_lhi_components.csv`: all sensor-level drift components before top-k filtering.
 - `lhi_baselines.csv`: unit-specific `B_MAE` and `B_RMSE`.
 - `baseline_forecast_points.csv`: forecast drift rows used to average `B`.
 - `past_minmax_ranges.csv`: forecast-window past-context min-max ranges and usable flags.
-- `unit_drift/*_drift.png`: drift curves with red `B_RMSE` baseline.
-- `unit_lhi/*_lhi.png`: log-ratio LHI curves.
 
 Batch plot any unit interval from existing `lhi_scores.csv`:
 
@@ -218,7 +258,33 @@ Batch plot any unit interval from existing `lhi_scores.csv`:
 This writes one combined drift/LHI figure per unit. Use `--metric mae` to plot
 MAE-based drift and LHI instead of RMSE.
 
-### 5. Compute CARD Health Indicator
+### 5. Maintenance Decision Signals
+
+This computes condition-matched drift decision signals, dynamic
+thresholds, slopes, and log-ratio LHI tables. The generation script writes CSV
+data only.
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.zero_shot_cmapss.maintenance_decision_analysis \
+  --forecast_dir outputs/stride_1_h20 \
+  --output_dir outputs/stride_1_h20/maintenance_decision \
+  --covariate_mode cluster_covariate \
+  --healthy_cycles 50 \
+  --start_cycle 20
+```
+
+Plot any unit interval from the generated decision tables:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.zero_shot_cmapss.plot_maintenance_decision \
+  --decision_dir outputs/stride_1_h20/maintenance_decision \
+  --fd FD001 \
+  --unit_start 1 \
+  --unit_end 20 \
+  --plot_fd_level
+```
+
+### 6. Compute CARD Health Indicator
 
 CARD uses forecast-trajectory features and condition-aware historical references.
 The script first trains a 6-cluster KMeans operating-regime classifier on

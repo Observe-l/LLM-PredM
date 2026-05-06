@@ -1,0 +1,173 @@
+head,relation,tail,weight,source,notes
+FAN,node_type,Component,1.0,manual,engine structure node
+LPC,node_type,Component,1.0,manual,engine structure node
+HPC,node_type,Component,1.0,manual,engine structure node
+CombustionChamber,node_type,Component,1.0,manual,engine structure node
+HPT,node_type,Component,1.0,manual,engine structure node
+LPT,node_type,Component,1.0,manual,engine structure node
+LowPressureRotor,node_type,Component,1.0,manual,engine structure node
+HighPressureRotor,node_type,Component,1.0,manual,engine structure node
+BypassDuct,node_type,Component,1.0,manual,engine structure node
+OverallEngine,node_type,Component,1.0,manual,engine structure node
+FAN,physicConnect,LowPressureRotor,1.0,DKAMFormer,FAN/LPC/LPT are physically connected to low-pressure rotor
+LPC,physicConnect,LowPressureRotor,1.0,DKAMFormer,FAN/LPC/LPT are physically connected to low-pressure rotor
+LPT,physicConnect,LowPressureRotor,1.0,DKAMFormer,FAN/LPC/LPT are physically connected to low-pressure rotor
+HPC,physicConnect,HighPressureRotor,1.0,DKAMFormer,HPC/HPT are physically connected to high-pressure rotor
+HPT,physicConnect,HighPressureRotor,1.0,DKAMFormer,HPC/HPT are physically connected to high-pressure rotor
+FAN,airFlowto,LPC,0.8,DKAMFormer,front-end airflow path
+LPC,airFlowto,HPC,1.0,DKAMFormer,main airflow path
+HPC,airFlowto,CombustionChamber,1.0,DKAMFormer,main airflow path
+CombustionChamber,airFlowto,HPT,1.0,DKAMFormer,main airflow path
+HPT,airFlowto,LPT,1.0,DKAMFormer,main airflow path
+HPC,airFlowto,HPT,0.8,DKAMFormer,HPC outlet high-pressure gas can feed turbine cooling
+HPC,airFlowto,LPT,0.8,DKAMFormer,HPC outlet high-pressure gas can feed turbine cooling
+FAN,supports_hypothesis,Fan_related_degradation,0.85,manual,Fan component supports fan-related hypothesis
+HPC,supports_hypothesis,HPC_related_degradation,0.95,manual,HPC component supports HPC-related hypothesis
+LPT,supports_hypothesis,uncertain_component_degradation,0.7,manual,turbine-side evidence increases uncertainty because no turbine action exists
+HPT,supports_hypothesis,uncertain_component_degradation,0.7,manual,turbine-side evidence increases uncertainty because no turbine action exists
+CombustionChamber,supports_hypothesis,uncertain_component_degradation,0.4,manual,CC is explanatory only in current action taxonomy
+Gfan,characterizes,FAN,1.0,DKAMFormer,FAN flow working characteristic
+eta_fan,characterizes,FAN,1.0,DKAMFormer,FAN efficiency working characteristic
+Glpc,characterizes,LPC,1.0,DKAMFormer,LPC flow working characteristic
+eta_lpc,characterizes,LPC,1.0,DKAMFormer,LPC efficiency working characteristic
+Ghpc,characterizes,HPC,1.0,DKAMFormer,HPC flow working characteristic
+eta_hpc,characterizes,HPC,1.0,DKAMFormer,HPC efficiency working characteristic
+sigma_CC,characterizes,CombustionChamber,1.0,DKAMFormer,combustion chamber pressure recovery coefficient
+xi_CC,characterizes,CombustionChamber,1.0,DKAMFormer,combustion completion coefficient
+Ghpt,characterizes,HPT,1.0,DKAMFormer,HPT flow working characteristic
+eta_hpt,characterizes,HPT,1.0,DKAMFormer,HPT efficiency working characteristic
+Glpt,characterizes,LPT,1.0,DKAMFormer,LPT flow working characteristic
+eta_lpt,characterizes,LPT,1.0,DKAMFormer,LPT efficiency working characteristic
+N1,characterizes,LowPressureRotor,1.0,DKAMFormer,low-pressure rotor speed characteristic
+N2,characterizes,HighPressureRotor,1.0,DKAMFormer,high-pressure rotor speed characteristic
+Gduct,characterizes,BypassDuct,1.0,DKAMFormer,bypass duct flow characteristic
+N1,supports_working_characteristic,Gfan,1.0,DKAMFormer,FAN characteristic input
+P13,supports_working_characteristic,Gfan,1.0,DKAMFormer,FAN characteristic input
+P2,supports_working_characteristic,Gfan,1.0,DKAMFormer,FAN characteristic input
+T2,supports_working_characteristic,Gfan,1.0,DKAMFormer,FAN characteristic input
+T13,supports_working_characteristic,Gfan,1.0,DKAMFormer,FAN characteristic input
+N1,supports_working_characteristic,eta_fan,1.0,DKAMFormer,FAN efficiency input
+P13,supports_working_characteristic,eta_fan,1.0,DKAMFormer,FAN efficiency input
+P2,supports_working_characteristic,eta_fan,1.0,DKAMFormer,FAN efficiency input
+T2,supports_working_characteristic,eta_fan,1.0,DKAMFormer,FAN efficiency input
+T13,supports_working_characteristic,eta_fan,1.0,DKAMFormer,FAN efficiency input
+N1,supports_working_characteristic,Glpc,1.0,DKAMFormer,LPC characteristic input
+P25,supports_working_characteristic,Glpc,1.0,DKAMFormer,LPC characteristic input
+P13,supports_working_characteristic,Glpc,1.0,DKAMFormer,LPC characteristic input
+T13,supports_working_characteristic,Glpc,1.0,DKAMFormer,LPC characteristic input
+T25,supports_working_characteristic,Glpc,1.0,DKAMFormer,LPC characteristic input
+N1,supports_working_characteristic,eta_lpc,1.0,DKAMFormer,LPC efficiency input
+P25,supports_working_characteristic,eta_lpc,1.0,DKAMFormer,LPC efficiency input
+P13,supports_working_characteristic,eta_lpc,1.0,DKAMFormer,LPC efficiency input
+T13,supports_working_characteristic,eta_lpc,1.0,DKAMFormer,LPC efficiency input
+T25,supports_working_characteristic,eta_lpc,1.0,DKAMFormer,LPC efficiency input
+N2,supports_working_characteristic,Ghpc,1.0,DKAMFormer,HPC characteristic input
+P3,supports_working_characteristic,Ghpc,1.0,DKAMFormer,HPC characteristic input
+P25,supports_working_characteristic,Ghpc,1.0,DKAMFormer,HPC characteristic input
+T25,supports_working_characteristic,Ghpc,1.0,DKAMFormer,HPC characteristic input
+T3,supports_working_characteristic,Ghpc,1.0,DKAMFormer,HPC characteristic input
+N2,supports_working_characteristic,eta_hpc,1.0,DKAMFormer,HPC efficiency input
+P3,supports_working_characteristic,eta_hpc,1.0,DKAMFormer,HPC efficiency input
+P25,supports_working_characteristic,eta_hpc,1.0,DKAMFormer,HPC efficiency input
+T25,supports_working_characteristic,eta_hpc,1.0,DKAMFormer,HPC efficiency input
+T3,supports_working_characteristic,eta_hpc,1.0,DKAMFormer,HPC efficiency input
+P40,supports_working_characteristic,sigma_CC,1.0,DKAMFormer,CC pressure recovery input
+P3,supports_working_characteristic,sigma_CC,1.0,DKAMFormer,CC pressure recovery input
+Ps3,supports_working_characteristic,xi_CC,1.0,DKAMFormer,combustion completion input
+T3,supports_working_characteristic,xi_CC,1.0,DKAMFormer,combustion completion input
+WFF,supports_working_characteristic,xi_CC,1.0,DKAMFormer,combustion completion input
+N2,supports_working_characteristic,Ghpt,1.0,DKAMFormer,HPT characteristic input
+P49,supports_working_characteristic,Ghpt,1.0,DKAMFormer,HPT characteristic input
+P40,supports_working_characteristic,Ghpt,1.0,DKAMFormer,HPT characteristic input
+T40,supports_working_characteristic,Ghpt,1.0,DKAMFormer,HPT characteristic input
+T49,supports_working_characteristic,Ghpt,1.0,DKAMFormer,HPT characteristic input
+W29,supports_working_characteristic,Ghpt,1.0,DKAMFormer,HPT characteristic input
+h,supports_working_characteristic,Ghpt,1.0,DKAMFormer,HPT characteristic input
+N2,supports_working_characteristic,eta_hpt,1.0,DKAMFormer,HPT efficiency input
+P49,supports_working_characteristic,eta_hpt,1.0,DKAMFormer,HPT efficiency input
+P40,supports_working_characteristic,eta_hpt,1.0,DKAMFormer,HPT efficiency input
+T40,supports_working_characteristic,eta_hpt,1.0,DKAMFormer,HPT efficiency input
+T49,supports_working_characteristic,eta_hpt,1.0,DKAMFormer,HPT efficiency input
+W29,supports_working_characteristic,eta_hpt,1.0,DKAMFormer,HPT efficiency input
+h,supports_working_characteristic,eta_hpt,1.0,DKAMFormer,HPT efficiency input
+N1,supports_working_characteristic,Glpt,1.0,DKAMFormer,LPT characteristic input
+P5,supports_working_characteristic,Glpt,1.0,DKAMFormer,LPT characteristic input
+P49,supports_working_characteristic,Glpt,1.0,DKAMFormer,LPT characteristic input
+T49,supports_working_characteristic,Glpt,1.0,DKAMFormer,LPT characteristic input
+T5,supports_working_characteristic,Glpt,1.0,DKAMFormer,LPT characteristic input
+W28,supports_working_characteristic,Glpt,1.0,DKAMFormer,LPT characteristic input
+P2,supports_working_characteristic,Glpt,1.0,DKAMFormer,LPT characteristic input
+epr,supports_working_characteristic,Glpt,1.0,DKAMFormer,LPT characteristic input
+N1,supports_working_characteristic,eta_lpt,1.0,DKAMFormer,LPT efficiency input
+P5,supports_working_characteristic,eta_lpt,1.0,DKAMFormer,LPT efficiency input
+P49,supports_working_characteristic,eta_lpt,1.0,DKAMFormer,LPT efficiency input
+T49,supports_working_characteristic,eta_lpt,1.0,DKAMFormer,LPT efficiency input
+T5,supports_working_characteristic,eta_lpt,1.0,DKAMFormer,LPT efficiency input
+W28,supports_working_characteristic,eta_lpt,1.0,DKAMFormer,LPT efficiency input
+P2,supports_working_characteristic,eta_lpt,1.0,DKAMFormer,LPT efficiency input
+epr,supports_working_characteristic,eta_lpt,1.0,DKAMFormer,LPT efficiency input
+Nf,supports_working_characteristic,N1,1.0,DKAMFormer,low-pressure rotor input
+Nfdmd,supports_working_characteristic,N1,1.0,DKAMFormer,low-pressure rotor input
+NfRdm,supports_working_characteristic,N1,1.0,DKAMFormer,low-pressure rotor input
+NRc,supports_working_characteristic,N2,1.0,DKAMFormer,high-pressure rotor input
+B,supports_working_characteristic,Gduct,1.0,DKAMFormer,bypass duct input
+P13,supports_working_characteristic,Gduct,1.0,DKAMFormer,bypass duct input
+T2,influences,T13,1.0,DKAMFormer,FAN outlet relation
+eta_fan,influences,T13,1.0,DKAMFormer,FAN outlet relation
+P2,influences,P13,1.0,DKAMFormer,FAN outlet relation
+T13,influences,T25,1.0,DKAMFormer,LPC outlet relation
+eta_lpc,influences,T25,1.0,DKAMFormer,LPC outlet relation
+P13,influences,P25,1.0,DKAMFormer,LPC outlet relation
+T25,influences,T3,1.0,DKAMFormer,HPC outlet relation
+eta_hpc,influences,T3,1.0,DKAMFormer,HPC outlet relation
+P25,influences,P3,1.0,DKAMFormer,HPC outlet relation
+Ps3,influences,T40,1.0,DKAMFormer,CC outlet relation
+phi,influences,T40,1.0,DKAMFormer,CC outlet relation
+T3,influences,T40,1.0,DKAMFormer,CC outlet relation
+Ghpt,influences,T40,1.0,DKAMFormer,CC outlet relation
+Ghpc,influences,T40,1.0,DKAMFormer,CC outlet relation
+P30,influences,T40,1.0,DKAMFormer,CC outlet relation
+fuel_air_ratio,influences,T40,1.0,DKAMFormer,CC outlet relation
+P30,influences,P40,1.0,DKAMFormer,CC outlet pressure relation
+T40,influences,T49,1.0,DKAMFormer,HPT outlet relation
+T3,influences,T49,1.0,DKAMFormer,HPT outlet relation
+T25,influences,T49,1.0,DKAMFormer,HPT outlet relation
+Ghpc,influences,T49,1.0,DKAMFormer,HPT outlet relation
+Ghpt,influences,T49,1.0,DKAMFormer,HPT outlet relation
+T49,influences,P49,1.0,DKAMFormer,HPT pressure relation
+T40,influences,P49,1.0,DKAMFormer,HPT pressure relation
+P40,influences,P49,1.0,DKAMFormer,HPT pressure relation
+T49,influences,T5,1.0,DKAMFormer,LPT outlet relation
+T25,influences,T5,1.0,DKAMFormer,LPT outlet relation
+T13,influences,T5,1.0,DKAMFormer,LPT outlet relation
+T2,influences,T5,1.0,DKAMFormer,LPT outlet relation
+Glpc,influences,T5,1.0,DKAMFormer,LPT outlet relation
+Gfan,influences,T5,1.0,DKAMFormer,LPT outlet relation
+Glpt,influences,T5,1.0,DKAMFormer,LPT outlet relation
+T49,influences,P5,1.0,DKAMFormer,LPT pressure relation
+T5,influences,P5,1.0,DKAMFormer,LPT pressure relation
+P49,influences,P5,1.0,DKAMFormer,LPT pressure relation
+S7,supports_hypothesis,HPC_related_degradation,0.9,manual,HPC outlet total pressure evidence
+S11,supports_hypothesis,HPC_related_degradation,0.9,manual,HPC outlet static pressure evidence
+S3,supports_hypothesis,HPC_related_degradation,0.8,manual,HPC outlet temperature evidence
+S9,supports_hypothesis,HPC_related_degradation,0.7,manual,core speed evidence
+S14,supports_hypothesis,HPC_related_degradation,0.7,manual,corrected core speed evidence
+S8,supports_hypothesis,Fan_related_degradation,0.75,manual,fan speed evidence
+S13,supports_hypothesis,Fan_related_degradation,0.75,manual,corrected fan speed evidence
+S15,supports_hypothesis,Fan_related_degradation,0.55,manual,bypass ratio weak fan-side evidence
+S4,supports_hypothesis,uncertain_component_degradation,0.7,manual,LPT outlet temperature evidence should trigger monitoring unless combined with strong HPC/Fan evidence
+S12,supports_hypothesis,uncertain_component_degradation,0.5,manual,fuel-flow-related evidence should trigger monitoring unless combined with strong HPC/Fan evidence
+S20,supports_hypothesis,uncertain_component_degradation,0.6,manual,HPT coolant bleed evidence should trigger monitoring unless combined with strong HPC/Fan evidence
+S21,supports_hypothesis,uncertain_component_degradation,0.6,manual,LPT coolant bleed evidence should trigger monitoring unless combined with strong HPC/Fan evidence
+Pattern_S7_S11_persistent_high_drift,node_type,ForecastPattern,1.0,manual,persistent HPC pressure pattern
+Pattern_S7_S11_S3_high_drift,node_type,ForecastPattern,1.0,manual,HPC pressure plus temperature pattern
+Pattern_S8_S13_persistent_high_drift,node_type,ForecastPattern,1.0,manual,persistent fan speed pattern
+Pattern_S4_S20_S21_high_drift,node_type,ForecastPattern,1.0,manual,turbine-side uncertainty pattern
+Pattern_high_score_without_persistent_top_sensor_pattern,node_type,ForecastPattern,1.0,manual,high score but unstable component evidence
+Pattern_score_increasing_sensor_evidence_conflict,node_type,ForecastPattern,1.0,manual,increasing score with conflicting component evidence
+Pattern_S7_S11_persistent_high_drift,supports_hypothesis,HPC_related_degradation,0.95,manual,strong HPC pattern
+Pattern_S7_S11_S3_high_drift,supports_hypothesis,HPC_related_degradation,0.9,manual,strong HPC pattern
+Pattern_S8_S13_persistent_high_drift,supports_hypothesis,Fan_related_degradation,0.8,manual,conservative fan pattern
+Pattern_S4_S20_S21_high_drift,supports_hypothesis,uncertain_component_degradation,0.75,manual,no turbine maintenance action in current taxonomy
+Pattern_high_score_without_persistent_top_sensor_pattern,supports_hypothesis,uncertain_component_degradation,0.8,manual,prefer monitoring over maintenance
+Pattern_score_increasing_sensor_evidence_conflict,supports_hypothesis,uncertain_component_degradation,0.85,manual,prefer monitoring when evidence conflicts

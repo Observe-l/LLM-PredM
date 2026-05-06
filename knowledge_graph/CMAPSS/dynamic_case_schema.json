@@ -1,0 +1,214 @@
+{
+  "description": "Dynamic KG schema for one zero-shot C-MAPSS maintenance inference case.",
+  "node_types": {
+    "ForecastCase": {
+      "required_fields": [
+        "case_id",
+        "dataset_subset",
+        "unit_id",
+        "cutoff_cycle",
+        "forecast_horizon"
+      ],
+      "relations": {
+        "belongs_to_dataset": "DatasetSubset",
+        "has_forecast_summary": "ForecastSummary",
+        "has_action_hypothesis": "ActionHypothesis"
+      },
+      "id_pattern": "ForecastCase_<FD>_Engine<unit_id>_Cycle<cutoff_cycle>"
+    },
+    "ForecastSummary": {
+      "required_fields": [
+        "summary_id",
+        "current_score",
+        "peak_score",
+        "peak_score_cycle",
+        "score_trend",
+        "first_warning_crossing_cycle",
+        "first_critical_crossing_cycle",
+        "persistent_high_risk_duration",
+        "first_persistent_pattern_cycle",
+        "dominant_component_hypothesis",
+        "dominant_top_sensors",
+        "top_sensor_at_peak_cycle",
+        "final_cycle_score"
+      ],
+      "relations": {
+        "belongs_to_case": "ForecastCase",
+        "has_dominant_sensor_pattern": "ForecastPattern",
+        "has_forecast_observation": "ForecastObservation"
+      }
+    },
+    "ForecastObservation": {
+      "required_fields": [
+        "observation_id",
+        "sensor_id",
+        "contribution_rank",
+        "contribution_value",
+        "cycle_scope"
+      ],
+      "relations": {
+        "belongs_to_case": "ForecastCase",
+        "observed_on": "Sensor",
+        "supports": "DegradationHypothesis"
+      },
+      "notes": "Top sensors are evidence, not fault labels."
+    },
+    "RiskHypothesis": {
+      "required_fields": [
+        "risk_id",
+        "risk_level",
+        "supporting_threshold_hypothesis",
+        "supporting_summary_fields"
+      ],
+      "allowed_risk_levels": [
+        "low",
+        "warning",
+        "critical",
+        "uncertain"
+      ],
+      "relations": {
+        "belongs_to_case": "ForecastCase",
+        "supported_by": "ForecastSummary",
+        "uses_threshold_hypothesis": "ThresholdHypothesis"
+      }
+    },
+    "ActionHypothesis": {
+      "required_fields": [
+        "action_id",
+        "action_type",
+        "action_time",
+        "reason",
+        "confidence",
+        "retrieved_paths"
+      ],
+      "allowed_action_types": [
+        "continue_normal_operation",
+        "schedule_monitoring",
+        "schedule_fan_maintenance",
+        "schedule_HPC_maintenance"
+      ],
+      "relations": {
+        "belongs_to_case": "ForecastCase",
+        "has_action_type": "MaintenanceActionType",
+        "supported_by": [
+          "RiskHypothesis",
+          "DegradationHypothesis",
+          "ForecastObservation",
+          "ReflectionRule"
+        ]
+      },
+      "validation_rules": [
+        "continue_normal_operation must have null action_time",
+        "schedule_monitoring must have non-null action_time within forecast_horizon",
+        "schedule_fan_maintenance must have non-null action_time within forecast_horizon",
+        "schedule_HPC_maintenance must have non-null action_time within forecast_horizon",
+        "schedule_fan_maintenance requires DatasetSubset allows_hypothesis Fan_related_degradation",
+        "schedule_HPC_maintenance requires DatasetSubset allows_hypothesis HPC_related_degradation",
+        "schedule_fan_maintenance requires retrieved evidence supporting Fan_related_degradation",
+        "schedule_HPC_maintenance requires retrieved evidence supporting HPC_related_degradation",
+        "maintenance action must be supported by at least one DegradationHypothesis or ReflectionRule",
+        "if component evidence is uncertain or conflicting, action_type should be schedule_monitoring",
+        "critical_risk_hypothesis alone is insufficient to trigger fan/HPC maintenance"
+      ]
+    },
+    "MaintenanceExecutionFeedback": {
+      "required_fields": [
+        "feedback_id",
+        "case_id",
+        "action_id",
+        "feedback_label",
+        "maintenance_needed",
+        "component_feedback",
+        "feedback_time"
+      ],
+      "allowed_feedback_labels": [
+        "correct_maintenance",
+        "over_maintenance",
+        "wrong_component",
+        "too_early"
+      ],
+      "relations": {
+        "evaluates": "ActionHypothesis",
+        "belongs_to_case": "ForecastCase",
+        "updates": "ReflectionRule"
+      }
+    },
+    "BreakdownFeedback": {
+      "required_fields": [
+        "feedback_id",
+        "case_id",
+        "action_id",
+        "feedback_label",
+        "breakdown_time",
+        "scheduled_action_time",
+        "timing_issue",
+        "likely_component"
+      ],
+      "allowed_feedback_labels": [
+        "missed_fan_maintenance",
+        "missed_HPC_maintenance",
+        "missed_maintenance_unknown"
+      ],
+      "allowed_timing_issues": [
+        "too_late",
+        "no_maintenance_scheduled"
+      ],
+      "allowed_likely_components": [
+        "FAN",
+        "HPC",
+        "unknown"
+      ],
+      "relations": {
+        "evaluates": "ActionHypothesis",
+        "belongs_to_case": "ForecastCase",
+        "updates": "ReflectionRule"
+      }
+    }
+  },
+  "example_case": {
+    "case_id": "ForecastCase_FD002_Engine12_Cycle150",
+    "dataset_subset": "FD002",
+    "unit_id": 12,
+    "cutoff_cycle": 150,
+    "forecast_horizon": "t+1 to t+50",
+    "forecast_summary": {
+      "summary_id": "ForecastSummary_FD002_Engine12_Cycle150",
+      "current_score": 0.42,
+      "peak_score": 0.81,
+      "peak_score_cycle": "t+38",
+      "score_trend": "increasing",
+      "first_warning_crossing_cycle": "t+24",
+      "first_critical_crossing_cycle": null,
+      "persistent_high_risk_duration": 12,
+      "first_persistent_pattern_cycle": "t+18",
+      "dominant_component_hypothesis": "HPC_related_degradation",
+      "dominant_top_sensors": [
+        "S7",
+        "S11",
+        "S3"
+      ],
+      "top_sensor_at_peak_cycle": [
+        "S7",
+        "S11",
+        "S4"
+      ],
+      "final_cycle_score": 0.78
+    },
+    "action_hypothesis": {
+      "action_id": "ActionHypothesis_FD002_Engine12_Cycle150",
+      "action_type": "schedule_HPC_maintenance",
+      "action_time": "t+38",
+      "reason": "Persistent S7/S11/S3 evidence is physically associated with HPC outlet pressure and temperature, and FD002 allows HPC-related degradation.",
+      "confidence": 0.78,
+      "retrieved_paths": [
+        "FD002->allows_hypothesis->HPC_related_degradation",
+        "S7->measures->P30_total_pressure_at_HPC_outlet->associated_with->HPC",
+        "P30_total_pressure_at_HPC_outlet->alias_of->P3->supports_working_characteristic->Ghpc->characterizes->HPC",
+        "S11->measures->Ps30_static_pressure_at_HPC_outlet->associated_with->HPC",
+        "Ps30_static_pressure_at_HPC_outlet->alias_of->Ps3",
+        "S3->measures->T30_total_temperature_at_HPC_outlet->alias_of->T3->supports_working_characteristic->Ghpc",
+        "HPC_related_degradation->suggests_action_type->schedule_HPC_maintenance"
+      ]
+    }
+  }
+}

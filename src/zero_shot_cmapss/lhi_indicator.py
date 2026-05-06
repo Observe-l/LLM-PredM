@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -68,41 +67,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--rolling_window", type=int, default=5)
-    parser.add_argument("--plot_examples", type=int, default=4)
     parser.add_argument(
-        "--plot_units",
-        nargs="*",
-        default=None,
-        help="Optional unit-level plots, e.g. FD001:1 FD004:3. If omitted, plots first --plot_examples units per FD.",
+        "--top_k_sensors",
+        type=int,
+        default=5,
+        help="Number of highest-drift sensors to report for each LHI point.",
+    )
+    parser.add_argument(
+        "--chunksize",
+        type=int,
+        default=1_000_000,
+        help="Rows per CSV chunk when streaming window_forecasts.csv. Use 0 to run the legacy in-memory path.",
     )
     return parser.parse_args()
 
 
-def parse_plot_units(items: Sequence[str] | None, scores: pd.DataFrame, examples_per_fd: int) -> List[Tuple[str, int]]:
-    if items:
-        parsed = []
-        for item in items:
-            if ":" not in item:
-                raise ValueError(f"--plot_units entries must look like FD004:3, got {item!r}")
-            fd_name, unit_text = item.split(":", 1)
-            if fd_name not in FD_NAMES:
-                raise ValueError(f"Unknown FD in --plot_units: {fd_name!r}")
-            parsed.append((fd_name, int(unit_text)))
-        return parsed
-
-    keys = (
-        scores[["fd", "unit_id"]]
-        .drop_duplicates()
-        .sort_values(["fd", "unit_id"])
-        .groupby("fd", as_index=False)
-        .head(examples_per_fd)
-    )
-    return [(str(row.fd), int(row.unit_id)) for row in keys.itertuples(index=False)]
-
-
 def load_window_forecasts(args: argparse.Namespace) -> pd.DataFrame:
     path = args.forecast_dir / "window_forecasts.csv"
-    forecasts = pd.read_csv(path)
     required = {
         "covariate_mode",
         "fd",
@@ -117,6 +98,7 @@ def load_window_forecasts(args: argparse.Namespace) -> pd.DataFrame:
         "op_condition_key",
         "prediction_length",
     }
+    forecasts = pd.read_csv(path, usecols=sorted(required))
     missing = required - set(forecasts.columns)
     if missing:
         raise ValueError(f"Missing required columns in {path}: {sorted(missing)}")
@@ -130,6 +112,36 @@ def load_window_forecasts(args: argparse.Namespace) -> pd.DataFrame:
     if forecasts.empty:
         raise ValueError(f"No forecast rows left after filtering {path}.")
     return forecasts
+
+
+def iter_window_forecast_chunks(args: argparse.Namespace):
+    path = args.forecast_dir / "window_forecasts.csv"
+    required = {
+        "covariate_mode",
+        "fd",
+        "unit_id",
+        "cutoff_cycle",
+        "forecast_start_cycle",
+        "context_start_cycle",
+        "cycle",
+        "sensor",
+        "y_pred",
+        "op_condition_key",
+        "prediction_length",
+    }
+    reader = pd.read_csv(path, usecols=sorted(required), chunksize=args.chunksize)
+    for chunk in reader:
+        missing = required - set(chunk.columns)
+        if missing:
+            raise ValueError(f"Missing required columns in {path}: {sorted(missing)}")
+        mode_filter = chunk["covariate_mode"].isin(args.covariate_modes) if args.covariate_modes else True
+        chunk = chunk[
+            chunk["fd"].isin(args.fds)
+            & mode_filter
+            & chunk["sensor"].isin(args.sensors)
+        ].copy()
+        if not chunk.empty:
+            yield chunk
 
 
 def load_eval_frames(data_dir: Path, eval_split: str, fds: Sequence[str]) -> dict[str, pd.DataFrame]:
@@ -184,42 +196,64 @@ def compute_past_sensor_ranges(
     window_keys = (
         forecasts[["fd", "unit_id", "context_start_cycle", "cutoff_cycle"]]
         .drop_duplicates()
-        .sort_values(["fd", "unit_id", "cutoff_cycle"])
+        .sort_values(["fd", "unit_id", "context_start_cycle", "cutoff_cycle"])
     )
-    for key in window_keys.itertuples(index=False):
-        fd_name = str(key.fd)
-        unit_id = int(key.unit_id)
-        context_start_cycle = int(key.context_start_cycle)
-        cutoff_cycle = int(key.cutoff_cycle)
-        frame = frames[fd_name]
-        past = frame[
-            (frame["unit_id"] == unit_id)
-            & (frame["cycle"] >= context_start_cycle)
-            & (frame["cycle"] <= cutoff_cycle)
-        ]
-        if past.empty:
-            raise ValueError(
-                f"No past rows for {fd_name} unit {unit_id}, "
-                f"context_start_cycle={context_start_cycle}, cutoff_cycle={cutoff_cycle}."
-            )
-        for sensor in sensors:
-            minimum = float(past[sensor].min())
-            maximum = float(past[sensor].max())
-            value_range = maximum - minimum
-            rows.append(
-                {
-                    "fd": fd_name,
-                    "unit_id": unit_id,
-                    "context_start_cycle": context_start_cycle,
-                    "cutoff_cycle": cutoff_cycle,
-                    "sensor": sensor,
-                    "past_min": minimum,
-                    "past_max": maximum,
-                    "past_range": value_range,
-                    "range_usable": bool(np.isfinite(value_range) and value_range > range_epsilon),
-                    "past_n": int(len(past)),
-                }
-            )
+    for (fd_name, unit_id), key_group in window_keys.groupby(["fd", "unit_id"], sort=True):
+        unit_frame = (
+            frames[str(fd_name)][frames[str(fd_name)]["unit_id"] == int(unit_id)]
+            .sort_values("cycle")
+            .set_index("cycle", drop=False)
+        )
+        if unit_frame.empty:
+            raise ValueError(f"No rows for {fd_name} unit {unit_id}.")
+
+        sensor_values = unit_frame.loc[:, sensors]
+        uses_expanding_context = (
+            key_group["context_start_cycle"].nunique() == 1
+            and int(key_group["context_start_cycle"].iloc[0]) == int(unit_frame["cycle"].min())
+        )
+        if uses_expanding_context:
+            expanding_min = sensor_values.expanding().min()
+            expanding_max = sensor_values.expanding().max()
+
+        for key in key_group.itertuples(index=False):
+            context_start_cycle = int(key.context_start_cycle)
+            cutoff_cycle = int(key.cutoff_cycle)
+            if cutoff_cycle not in unit_frame.index:
+                raise ValueError(f"Missing cutoff cycle {cutoff_cycle} for {fd_name} unit {unit_id}.")
+            if uses_expanding_context:
+                minimums = expanding_min.loc[cutoff_cycle]
+                maximums = expanding_max.loc[cutoff_cycle]
+                past_n = int(cutoff_cycle - context_start_cycle + 1)
+            else:
+                past = sensor_values.loc[context_start_cycle:cutoff_cycle]
+                if past.empty:
+                    raise ValueError(
+                        f"No past rows for {fd_name} unit {unit_id}, "
+                        f"context_start_cycle={context_start_cycle}, cutoff_cycle={cutoff_cycle}."
+                    )
+                minimums = past.min()
+                maximums = past.max()
+                past_n = int(len(past))
+
+            for sensor in sensors:
+                minimum = float(minimums[sensor])
+                maximum = float(maximums[sensor])
+                value_range = maximum - minimum
+                rows.append(
+                    {
+                        "fd": fd_name,
+                        "unit_id": int(unit_id),
+                        "context_start_cycle": context_start_cycle,
+                        "cutoff_cycle": cutoff_cycle,
+                        "sensor": sensor,
+                        "past_min": minimum,
+                        "past_max": maximum,
+                        "past_range": value_range,
+                        "range_usable": bool(np.isfinite(value_range) and value_range > range_epsilon),
+                        "past_n": past_n,
+                    }
+                )
     return pd.DataFrame(rows)
 
 
@@ -276,6 +310,162 @@ def compute_lhi_scores(
         .reset_index()
     )
     return scores, sensor_scores
+
+
+def aggregate_lhi_chunk(
+    forecasts: pd.DataFrame,
+    past_ranges: pd.DataFrame,
+    condition_means: pd.DataFrame,
+) -> pd.DataFrame:
+    keyed = forecasts.merge(
+        past_ranges,
+        on=["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"],
+        how="left",
+        validate="many_to_one",
+    )
+    if keyed["past_min"].isna().any() or keyed["past_range"].isna().any():
+        raise ValueError("Missing past-context min-max ranges for some forecast rows.")
+    keyed = keyed[keyed["range_usable"]].copy()
+    keyed["y_pred_minmax"] = (keyed["y_pred"] - keyed["past_min"]) / keyed["past_range"]
+    keyed = keyed.merge(
+        condition_means,
+        on=["fd", "unit_id", "op_condition_key", "sensor"],
+        how="left",
+        validate="many_to_one",
+    )
+    keyed = keyed[keyed["healthy_condition_mean_raw"].notna()].copy()
+    keyed["healthy_condition_mean_minmax"] = (
+        keyed["healthy_condition_mean_raw"] - keyed["past_min"]
+    ) / keyed["past_range"]
+    keyed["drift"] = (keyed["y_pred_minmax"] - keyed["healthy_condition_mean_minmax"]).abs()
+    keyed["drift_sq"] = keyed["drift"] ** 2
+
+    score_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle"]
+    return (
+        keyed.groupby(score_cols + ["sensor"], sort=True)
+        .agg(
+            drift_sum=("drift", "sum"),
+            drift_sq_sum=("drift_sq", "sum"),
+            n=("drift", "size"),
+            healthy_condition_n=("healthy_condition_n", "min"),
+            past_range=("past_range", "first"),
+            prediction_length=("prediction_length", "max"),
+        )
+        .reset_index()
+    )
+
+
+def finalize_lhi_partials(partials: Sequence[pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if not partials:
+        raise ValueError("No LHI partial aggregates were produced.")
+    partial = pd.concat(partials, ignore_index=True)
+    score_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle"]
+    sensor_scores = (
+        partial.groupby(score_cols + ["sensor"], sort=True)
+        .agg(
+            drift_sum=("drift_sum", "sum"),
+            drift_sq_sum=("drift_sq_sum", "sum"),
+            n=("n", "sum"),
+            healthy_condition_n=("healthy_condition_n", "min"),
+            past_range=("past_range", "first"),
+            prediction_length=("prediction_length", "max"),
+        )
+        .reset_index()
+    )
+    sensor_scores["sensor_d_mae"] = sensor_scores["drift_sum"] / sensor_scores["n"]
+    sensor_scores["sensor_d_rmse"] = np.sqrt(sensor_scores["drift_sq_sum"] / sensor_scores["n"])
+
+    score_partials = (
+        sensor_scores.groupby(score_cols, sort=True)
+        .agg(
+            drift_sum=("drift_sum", "sum"),
+            drift_sq_sum=("drift_sq_sum", "sum"),
+            row_count=("n", "sum"),
+            sensor_count=("sensor", "nunique"),
+            prediction_length=("prediction_length", "max"),
+        )
+        .reset_index()
+    )
+    score_partials["d_mae"] = score_partials["drift_sum"] / score_partials["row_count"]
+    score_partials["d_rmse"] = np.sqrt(score_partials["drift_sq_sum"] / score_partials["row_count"])
+    scores = score_partials[
+        [*score_cols, "d_mae", "d_rmse", "sensor_count", "row_count", "prediction_length"]
+    ].copy()
+    sensor_scores = sensor_scores[
+        [
+            *score_cols,
+            "sensor",
+            "sensor_d_mae",
+            "sensor_d_rmse",
+            "n",
+            "healthy_condition_n",
+            "past_range",
+        ]
+    ].copy()
+    return scores, sensor_scores
+
+
+def compute_lhi_scores_streaming(
+    args: argparse.Namespace,
+    frames: dict[str, pd.DataFrame],
+    condition_means: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    range_partials = []
+    lhi_partials = []
+    range_cache: dict[tuple, pd.DataFrame] = {}
+    total_rows = 0
+    kept_rows = 0
+    for chunk_idx, chunk in enumerate(iter_window_forecast_chunks(args), start=1):
+        total_rows += len(chunk)
+        window_keys = chunk[["fd", "unit_id", "context_start_cycle", "cutoff_cycle"]].drop_duplicates()
+        missing_keys = []
+        for key in window_keys.itertuples(index=False):
+            cache_key = (str(key.fd), int(key.unit_id), int(key.context_start_cycle), int(key.cutoff_cycle))
+            if cache_key not in range_cache:
+                missing_keys.append(
+                    {
+                        "fd": cache_key[0],
+                        "unit_id": cache_key[1],
+                        "context_start_cycle": cache_key[2],
+                        "cutoff_cycle": cache_key[3],
+                    }
+                )
+        if missing_keys:
+            missing_frame = pd.DataFrame(missing_keys).drop_duplicates()
+            ranges = compute_past_sensor_ranges(frames, missing_frame, args.sensors, args.range_epsilon)
+            for cache_key, range_group in ranges.groupby(
+                ["fd", "unit_id", "context_start_cycle", "cutoff_cycle"], sort=False
+            ):
+                range_cache[(str(cache_key[0]), int(cache_key[1]), int(cache_key[2]), int(cache_key[3]))] = range_group
+            range_partials.append(ranges)
+
+        chunk_ranges = pd.concat(
+            [
+                range_cache[(str(key.fd), int(key.unit_id), int(key.context_start_cycle), int(key.cutoff_cycle))]
+                for key in window_keys.itertuples(index=False)
+            ],
+            ignore_index=True,
+        )
+        partial = aggregate_lhi_chunk(chunk, chunk_ranges, condition_means)
+        kept_rows += int(partial["n"].sum()) if not partial.empty else 0
+        lhi_partials.append(partial)
+        print(
+            f"  chunk {chunk_idx}: input rows={len(chunk):,}, partial sensor groups={len(partial):,}",
+            flush=True,
+        )
+
+    if total_rows == 0:
+        raise ValueError("No forecast rows left after filtering window_forecasts.csv.")
+    print(f"Streamed LHI rows: forecast rows={total_rows:,}, usable drift rows={kept_rows:,}", flush=True)
+    past_ranges = (
+        pd.concat(range_partials, ignore_index=True)
+        .drop_duplicates(["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"])
+        .reset_index(drop=True)
+        if range_partials
+        else pd.DataFrame()
+    )
+    scores, sensor_scores = finalize_lhi_partials(lhi_partials)
+    return scores, sensor_scores, past_ranges
 
 
 def compute_initial_forecast_baselines(
@@ -348,6 +538,71 @@ def add_lhi_columns(scores: pd.DataFrame, baselines: pd.DataFrame, lhi_epsilon: 
     return scores
 
 
+def add_top_drift_sensors(
+    scores: pd.DataFrame,
+    sensor_scores: pd.DataFrame,
+    top_k: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if top_k < 1:
+        raise ValueError("--top_k_sensors must be >= 1.")
+
+    key_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle"]
+    ranked = sensor_scores.merge(scores[key_cols], on=key_cols, how="inner").copy()
+    if ranked.empty:
+        empty_cols = key_cols + [
+            "top_drift_rank",
+            "sensor",
+            "sensor_d_mae",
+            "sensor_d_rmse",
+            "n",
+            "healthy_condition_n",
+            "past_range",
+        ]
+        return scores.assign(
+            top_drift_sensors="",
+            top_drift_sensor_rmse_values="",
+            top_drift_sensor_mae_values="",
+        ), pd.DataFrame(columns=empty_cols)
+
+    ranked = ranked.sort_values(
+        key_cols + ["sensor_d_rmse", "sensor_d_mae", "sensor"],
+        ascending=[True, True, True, True, True, True, False, False, True],
+    )
+    ranked["top_drift_rank"] = ranked.groupby(key_cols, sort=False).cumcount() + 1
+    top_rows = ranked[ranked["top_drift_rank"] <= top_k].copy()
+
+    summary_rows = []
+    for key, group in top_rows.groupby(key_cols, sort=True):
+        key_values = key if isinstance(key, tuple) else (key,)
+        row = dict(zip(key_cols, key_values))
+        group = group.sort_values("top_drift_rank")
+        row["top_drift_sensors"] = ",".join(group["sensor"].astype(str))
+        row["top_drift_sensor_rmse_values"] = ";".join(
+            f"{r.sensor}:{float(r.sensor_d_rmse):.6g}" for r in group.itertuples(index=False)
+        )
+        row["top_drift_sensor_mae_values"] = ";".join(
+            f"{r.sensor}:{float(r.sensor_d_mae):.6g}" for r in group.itertuples(index=False)
+        )
+        summary_rows.append(row)
+
+    summary = pd.DataFrame(summary_rows)
+    scores = scores.merge(summary, on=key_cols, how="left", validate="one_to_one")
+    for col in ["top_drift_sensors", "top_drift_sensor_rmse_values", "top_drift_sensor_mae_values"]:
+        scores[col] = scores[col].fillna("")
+
+    ordered_cols = key_cols + [
+        "top_drift_rank",
+        "sensor",
+        "sensor_d_rmse",
+        "sensor_d_mae",
+        "n",
+        "healthy_condition_n",
+        "past_range",
+    ]
+    remaining_cols = [col for col in top_rows.columns if col not in ordered_cols]
+    return scores, top_rows[ordered_cols + remaining_cols]
+
+
 def add_rolling_scores(scores: pd.DataFrame, rolling_window: int) -> pd.DataFrame:
     if rolling_window < 1:
         raise ValueError("--rolling_window must be >= 1.")
@@ -380,69 +635,16 @@ def summarize_fd(scores: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def plot_units(scores: pd.DataFrame, units: Sequence[Tuple[str, int]], output_dir: Path) -> None:
-    import matplotlib.pyplot as plt
-
-    drift_dir = output_dir / "unit_drift"
-    lhi_dir = output_dir / "unit_lhi"
-    drift_dir.mkdir(parents=True, exist_ok=True)
-    lhi_dir.mkdir(parents=True, exist_ok=True)
-    colors = {"past_only": "#1f77b4", "known_future": "#ff7f0e", "none": "#2ca02c"}
-    baseline_styles = {"past_only": "--", "known_future": "-", "none": ":"}
-    for fd_name, unit_id in units:
-        unit_df = scores[(scores["fd"] == fd_name) & (scores["unit_id"] == unit_id)]
-        if unit_df.empty:
-            continue
-
-        fig, ax = plt.subplots(figsize=(12, 5))
-        for mode, group in unit_df.groupby("covariate_mode", sort=True):
-            group = group.sort_values(["cycle", "forecast_start_cycle"])
-            color = colors.get(str(mode))
-            ax.plot(group["cycle"], group["d_rmse"], color=color, alpha=0.25, linewidth=0.9, label=f"{mode} D_RMSE raw")
-            ax.plot(group["cycle"], group["d_rmse_roll_mean"], color=color, linewidth=1.8, label=f"{mode} D_RMSE rolling")
-            baseline = float(group["b_rmse"].iloc[0])
-            ax.axhline(
-                baseline,
-                color="#ef4444",
-                linestyle=baseline_styles.get(str(mode), "-"),
-                linewidth=1.6,
-                label=f"{mode} B_RMSE={baseline:.4g}",
-            )
-        ax.set_title(f"Condition-matched min-max drift: {fd_name} unit {unit_id}")
-        ax.set_xlabel("target cycle")
-        ax.set_ylabel("D_RMSE")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        fig.savefig(drift_dir / f"{fd_name}_unit{unit_id}_drift.png", dpi=160)
-        plt.close(fig)
-
-        fig, ax = plt.subplots(figsize=(12, 5))
-        ax.axhline(0.0, color="#6b7280", linewidth=1.0, label="healthy baseline")
-        for mode, group in unit_df.groupby("covariate_mode", sort=True):
-            group = group.sort_values(["cycle", "forecast_start_cycle"])
-            color = colors.get(str(mode))
-            ax.plot(group["cycle"], group["lhi_rmse"], color=color, alpha=0.25, linewidth=0.9, label=f"{mode} LHI raw")
-            ax.plot(group["cycle"], group["lhi_rmse_roll_mean"], color=color, linewidth=1.8, label=f"{mode} LHI rolling")
-        ax.set_title(f"Log-ratio LHI: {fd_name} unit {unit_id}")
-        ax.set_xlabel("target cycle")
-        ax.set_ylabel("log((D_RMSE + eps) / (B_RMSE + eps))")
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        fig.savefig(lhi_dir / f"{fd_name}_unit{unit_id}_lhi.png", dpi=160)
-        plt.close(fig)
-
-
 def main() -> None:
     args = parse_args()
     if args.range_epsilon <= 0:
         raise ValueError("--range_epsilon must be positive.")
     if args.lhi_epsilon <= 0:
         raise ValueError("--lhi_epsilon must be positive.")
+    if args.top_k_sensors < 1:
+        raise ValueError("--top_k_sensors must be >= 1.")
     output_dir = args.output_dir or (args.forecast_dir / "lhi")
     output_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(output_dir / ".mplconfig"))
     for legacy_name in (
         "unit_healthy_minmax_ranges.csv",
         "healthy_baseline_points.csv",
@@ -453,27 +655,35 @@ def main() -> None:
             legacy_path.unlink()
 
     print(f"Loading {args.forecast_dir / 'window_forecasts.csv'}...", flush=True)
-    forecasts = load_window_forecasts(args)
     run_config_path = args.forecast_dir / "run_config.json"
     run_config = json.loads(run_config_path.read_text()) if run_config_path.exists() else {}
     eval_split = str(run_config.get("eval_split", "train"))
     frames = load_eval_frames(args.data_dir, eval_split, args.fds)
     condition_means = build_condition_means(frames, args.sensors, args.healthy_cycles)
-    past_ranges = compute_past_sensor_ranges(frames, forecasts, args.sensors, args.range_epsilon)
-    all_scores, sensor_scores = compute_lhi_scores(
-        forecasts=forecasts,
-        past_ranges=past_ranges,
-        condition_means=condition_means,
-    )
+    if args.chunksize and args.chunksize > 0:
+        all_scores, sensor_scores, past_ranges = compute_lhi_scores_streaming(
+            args=args,
+            frames=frames,
+            condition_means=condition_means,
+        )
+    else:
+        forecasts = load_window_forecasts(args)
+        past_ranges = compute_past_sensor_ranges(frames, forecasts, args.sensors, args.range_epsilon)
+        all_scores, sensor_scores = compute_lhi_scores(
+            forecasts=forecasts,
+            past_ranges=past_ranges,
+            condition_means=condition_means,
+        )
     baseline_points, baselines = compute_initial_forecast_baselines(
         all_scores,
         healthy_cycles=args.healthy_cycles,
         baseline_cycles=args.baseline_cycles,
     )
-    scores = all_scores[all_scores["cycle"] > args.healthy_cycles].copy()
+    scores = all_scores.copy()
     if scores.empty:
-        raise ValueError(f"No monitor forecast rows found for cycle > {args.healthy_cycles}.")
+        raise ValueError("No LHI score rows were computed.")
     scores = add_lhi_columns(scores, baselines, args.lhi_epsilon)
+    scores, top_drift_sensors = add_top_drift_sensors(scores, sensor_scores, args.top_k_sensors)
     scores = add_rolling_scores(scores, args.rolling_window)
     fd_summary = summarize_fd(scores)
 
@@ -482,13 +692,11 @@ def main() -> None:
     baseline_points.to_csv(output_dir / "baseline_forecast_points.csv", index=False)
     baselines.to_csv(output_dir / "lhi_baselines.csv", index=False)
     scores.to_csv(output_dir / "lhi_scores.csv", index=False)
+    top_drift_sensors.to_csv(output_dir / "top_drift_sensors.csv", index=False)
     sensor_scores.to_csv(output_dir / "sensor_lhi_components.csv", index=False)
     fd_summary.to_csv(output_dir / "fd_lhi_summary.csv", index=False)
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, default=str)
-
-    units = parse_plot_units(args.plot_units, scores, args.plot_examples)
-    plot_units(scores, units, output_dir)
 
     usable_ranges = past_ranges["range_usable"].mean()
     print(f"Usable past-context min-max ranges: {usable_ranges:.2%}", flush=True)

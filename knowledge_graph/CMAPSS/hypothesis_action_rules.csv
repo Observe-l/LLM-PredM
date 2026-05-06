@@ -1,0 +1,29 @@
+head,relation,tail,weight,source,notes
+continue_normal_operation,node_type,MaintenanceActionType,1.0,manual,no action_time required
+schedule_monitoring,node_type,MaintenanceActionType,1.0,manual,action_time required
+schedule_fan_maintenance,node_type,MaintenanceActionType,1.0,manual,action_time required
+schedule_HPC_maintenance,node_type,MaintenanceActionType,1.0,manual,action_time required
+low_risk_hypothesis,node_type,RiskHypothesis,1.0,manual,forecast horizon has no clear risk escalation
+warning_risk_hypothesis,node_type,RiskHypothesis,1.0,manual,score crosses warning boundary or trend rises
+critical_risk_hypothesis,node_type,RiskHypothesis,1.0,manual,score crosses critical boundary or persistent high-risk duration is long
+HPC_related_degradation,node_type,DegradationHypothesis,1.0,manual,HPC degradation hypothesis
+Fan_related_degradation,node_type,DegradationHypothesis,1.0,manual,Fan degradation hypothesis
+uncertain_component_degradation,node_type,DegradationHypothesis,1.0,manual,component evidence is weak or conflicting
+HPC_related_degradation,suggests_action_type,schedule_HPC_maintenance,0.9,manual,use only when dataset allows HPC and risk threshold is met
+Fan_related_degradation,suggests_action_type,schedule_fan_maintenance,0.9,manual,use only when dataset allows Fan and risk threshold is met
+uncertain_component_degradation,suggests_action_type,schedule_monitoring,0.85,manual,prefer monitoring under uncertainty
+low_risk_hypothesis,suggests_action_type,continue_normal_operation,0.9,manual,no warning/critical crossing and no persistent sensor pattern
+warning_risk_hypothesis,suggests_action_type,schedule_monitoring,0.8,manual,warning risk without strong component evidence
+critical_risk_hypothesis,suggests_action_type,schedule_monitoring,0.6,manual,critical risk alone requires component confirmation before maintenance
+Pattern_high_score_without_persistent_top_sensor_pattern,suggests_action_type,schedule_monitoring,0.9,manual,avoid hard maintenance from score alone
+Pattern_score_increasing_sensor_evidence_conflict,suggests_action_type,schedule_monitoring,0.9,manual,conflicting evidence should trigger re-monitoring
+schedule_monitoring,select_action_time,first_warning_crossing_cycle,0.8,manual,preferred when available
+schedule_monitoring,select_action_time,peak_score_cycle,0.5,manual,fallback when warning crossing missing
+schedule_HPC_maintenance,select_action_time,first_high_risk_cycle_with_persistent_HPC_evidence,0.9,manual,preferred maintenance timing
+schedule_HPC_maintenance,select_action_time,peak_score_cycle,0.7,manual,fallback maintenance timing
+schedule_fan_maintenance,select_action_time,first_high_risk_cycle_with_persistent_Fan_evidence,0.9,manual,preferred maintenance timing
+schedule_fan_maintenance,select_action_time,peak_score_cycle,0.7,manual,fallback maintenance timing
+continue_normal_operation,requires_action_time,false,1.0,manual,no scheduled time
+schedule_monitoring,requires_action_time,true,1.0,manual,must select a future monitoring time
+schedule_fan_maintenance,requires_action_time,true,1.0,manual,must select a future maintenance time
+schedule_HPC_maintenance,requires_action_time,true,1.0,manual,must select a future maintenance time

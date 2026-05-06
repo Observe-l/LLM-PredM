@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 from typing import Sequence
@@ -34,6 +35,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dpi", type=int, default=160)
     parser.add_argument("--fig_width", type=float, default=12.0)
     parser.add_argument("--fig_height", type=float, default=8.0)
+    parser.add_argument(
+        "--plot_stride",
+        type=int,
+        default=0,
+        help="Forecast-start stride for plotting. 0 means read prediction_length from the source run_config.json.",
+    )
+    parser.add_argument(
+        "--healthy_cycles",
+        type=int,
+        default=50,
+        help="Only plot cycles after this healthy reference interval. Default: 50.",
+    )
     return parser.parse_args()
 
 
@@ -80,6 +93,43 @@ def load_scores(lhi_dir: Path, fd_name: str, unit_start: int, unit_end: int, mod
     return scores
 
 
+def infer_plot_stride(lhi_dir: Path, requested_stride: int) -> int:
+    if requested_stride > 0:
+        return int(requested_stride)
+    lhi_config_path = lhi_dir / "run_config.json"
+    if lhi_config_path.exists():
+        lhi_config = json.loads(lhi_config_path.read_text())
+        forecast_dir = lhi_config.get("forecast_dir")
+        if forecast_dir:
+            forecast_config_path = Path(forecast_dir) / "run_config.json"
+            if forecast_config_path.exists():
+                forecast_config = json.loads(forecast_config_path.read_text())
+                return int(forecast_config.get("prediction_length", 1))
+        if "prediction_length" in lhi_config:
+            return int(lhi_config["prediction_length"])
+    parent_config_path = lhi_dir.parent / "run_config.json"
+    if parent_config_path.exists():
+        parent_config = json.loads(parent_config_path.read_text())
+        return int(parent_config.get("prediction_length", 1))
+    return 1
+
+
+def filter_plot_windows(frame: pd.DataFrame, plot_stride: int) -> pd.DataFrame:
+    if plot_stride <= 1 or "forecast_start_cycle" not in frame.columns:
+        return frame
+    rows = []
+    for _, group in frame.groupby(["covariate_mode", "fd", "unit_id"], sort=True):
+        first_start = int(group["forecast_start_cycle"].min())
+        rows.append(group[(group["forecast_start_cycle"] - first_start) % plot_stride == 0])
+    return pd.concat(rows, ignore_index=True) if rows else frame.iloc[0:0].copy()
+
+
+def filter_monitor_cycles(frame: pd.DataFrame, healthy_cycles: int) -> pd.DataFrame:
+    if "cycle" not in frame.columns:
+        return frame
+    return frame[frame["cycle"] > int(healthy_cycles)].copy()
+
+
 def plot_unit(scores: pd.DataFrame, fd_name: str, unit_id: int, metric: str, output_dir: Path, dpi: int, fig_size: tuple[float, float]) -> bool:
     import matplotlib.pyplot as plt
 
@@ -93,8 +143,20 @@ def plot_unit(scores: pd.DataFrame, fd_name: str, unit_id: int, metric: str, out
     d_roll_col = f"d_{metric}_roll_mean"
     lhi_roll_col = f"lhi_{metric}_roll_mean"
     metric_label = metric.upper()
-    colors = {"past_only": "#1f77b4", "known_future": "#ff7f0e", "none": "#2ca02c"}
-    baseline_styles = {"past_only": "--", "known_future": "-", "none": ":"}
+    colors = {
+        "cluster_covariate": "#ff7f0e",
+        "future_covariate": "#1f77b4",
+        "no_covariate": "#2ca02c",
+        "known_future": "#ff7f0e",
+        "none": "#2ca02c",
+    }
+    baseline_styles = {
+        "cluster_covariate": "-",
+        "future_covariate": "--",
+        "no_covariate": ":",
+        "known_future": "-",
+        "none": ":",
+    }
 
     fig, axes = plt.subplots(2, 1, figsize=fig_size, sharex=True)
     drift_ax, lhi_ax = axes
@@ -142,6 +204,14 @@ def main() -> None:
     os.environ.setdefault("MPLCONFIGDIR", str(output_dir / ".mplconfig"))
 
     scores = load_scores(args.lhi_dir, args.fd, args.unit_start, args.unit_end, args.covariate_modes)
+    plot_stride = infer_plot_stride(args.lhi_dir, args.plot_stride)
+    scores = filter_plot_windows(scores, plot_stride)
+    scores = filter_monitor_cycles(scores, args.healthy_cycles)
+    if scores.empty:
+        raise ValueError(
+            f"No LHI rows remain after applying plot stride {plot_stride} "
+            f"and cycle > {args.healthy_cycles}."
+        )
     plotted = 0
     skipped = []
     for unit_id in range(args.unit_start, args.unit_end + 1):

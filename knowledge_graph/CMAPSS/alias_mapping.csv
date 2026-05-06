@@ -1,0 +1,13 @@
+head,relation,tail,weight,source,notes
+P30_total_pressure_at_HPC_outlet,alias_of,P3,1.0,manual,C-MAPSS P30 corresponds to DKAMFormer P3/HPC outlet total pressure
+P30_total_pressure_at_HPC_outlet,alias_of,P30,1.0,manual,C-MAPSS expanded node keeps direct alias to abbreviated P30
+T30_total_temperature_at_HPC_outlet,alias_of,T3,1.0,manual,C-MAPSS T30 corresponds to DKAMFormer T3/HPC outlet total temperature
+Ps30_static_pressure_at_HPC_outlet,alias_of,Ps3,1.0,manual,C-MAPSS Ps30 corresponds to DKAMFormer Ps3/HPC outlet static pressure
+Nc_physical_core_speed,alias_of,N2,1.0,manual,C-MAPSS core speed corresponds to high-pressure rotor speed
+NRc_corrected_core_speed,alias_of,NRc,1.0,manual,corrected core speed
+Nf_physical_fan_speed,alias_of,N1,0.9,manual,fan speed is a low-pressure rotor side signal
+NRf_corrected_fan_speed,alias_of,NfRdm,0.8,manual,corrected fan speed is related to low-pressure rotor control
+BPR_bypass_ratio,alias_of,B,0.8,manual,bypass ratio
+phi_fuel_flow_ratio_to_Ps30,alias_of,phi,0.8,manual,fuel flow ratio to Ps30 corresponds to phi-style combustion ratio variable
+W31_HPT_coolant_bleed,alias_of,W29,0.6,manual,HPT coolant bleed approximate mapping
+W32_LPT_coolant_bleed,alias_of,W28,0.6,manual,LPT coolant bleed approximate mapping

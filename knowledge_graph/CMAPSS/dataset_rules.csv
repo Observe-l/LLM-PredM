@@ -1,0 +1,71 @@
+head,relation,tail,weight,source,notes
+FD001,node_type,DatasetSubset,1.0,CMAPSS,dataset subset
+FD002,node_type,DatasetSubset,1.0,CMAPSS,dataset subset
+FD003,node_type,DatasetSubset,1.0,CMAPSS,dataset subset
+FD004,node_type,DatasetSubset,1.0,CMAPSS,dataset subset
+FD001,has_operation_condition_count,1,1.0,CMAPSS,do not bind runtime decisions to operating condition in zero-shot setting
+FD002,has_operation_condition_count,6,1.0,CMAPSS,do not bind runtime decisions to operating condition in zero-shot setting
+FD003,has_operation_condition_count,1,1.0,CMAPSS,do not bind runtime decisions to operating condition in zero-shot setting
+FD004,has_operation_condition_count,6,1.0,CMAPSS,do not bind runtime decisions to operating condition in zero-shot setting
+FD001,has_degradation_mode_count,1,1.0,CMAPSS,single degradation mode
+FD002,has_degradation_mode_count,1,1.0,CMAPSS,single degradation mode
+FD003,has_degradation_mode_count,2,1.0,CMAPSS,two degradation modes
+FD004,has_degradation_mode_count,2,1.0,CMAPSS,two degradation modes
+FD001,has_training_engine_count,100,1.0,CMAPSS,dataset metadata
+FD002,has_training_engine_count,259,1.0,CMAPSS,dataset metadata
+FD003,has_training_engine_count,100,1.0,CMAPSS,dataset metadata
+FD004,has_training_engine_count,249,1.0,CMAPSS,dataset metadata
+FD001,has_testing_engine_count,100,1.0,CMAPSS,dataset metadata
+FD002,has_testing_engine_count,259,1.0,CMAPSS,dataset metadata
+FD003,has_testing_engine_count,100,1.0,CMAPSS,dataset metadata
+FD004,has_testing_engine_count,248,1.0,CMAPSS,dataset metadata
+FD001,allows_hypothesis,HPC_related_degradation,1.0,CMAPSS,FD001 has one degradation mode; use HPC-related as conservative task hypothesis
+FD001,allows_hypothesis,uncertain_component_degradation,0.5,manual,allow monitoring when evidence is weak or conflicting
+FD002,allows_hypothesis,HPC_related_degradation,1.0,CMAPSS,FD002 has one degradation mode; use HPC-related as conservative task hypothesis
+FD002,allows_hypothesis,uncertain_component_degradation,0.5,manual,allow monitoring when evidence is weak or conflicting
+FD003,allows_hypothesis,HPC_related_degradation,1.0,CMAPSS,FD003 has two degradation modes
+FD003,allows_hypothesis,Fan_related_degradation,1.0,CMAPSS,FD003 has two degradation modes
+FD003,allows_hypothesis,uncertain_component_degradation,0.8,manual,uncertainty allowed for conflicting evidence
+FD004,allows_hypothesis,HPC_related_degradation,1.0,CMAPSS,FD004 has two degradation modes
+FD004,allows_hypothesis,Fan_related_degradation,1.0,CMAPSS,FD004 has two degradation modes
+FD004,allows_hypothesis,uncertain_component_degradation,0.8,manual,uncertainty allowed for conflicting evidence
+FD001,has_threshold_hypothesis,Threshold_FD001_v1,1.0,manual,dataset-specific threshold hypothesis
+FD002,has_threshold_hypothesis,Threshold_FD002_v1,1.0,manual,dataset-specific threshold hypothesis
+FD003,has_threshold_hypothesis,Threshold_FD003_v1,1.0,manual,dataset-specific threshold hypothesis
+FD004,has_threshold_hypothesis,Threshold_FD004_v1,1.0,manual,dataset-specific threshold hypothesis
+Threshold_FD001_v1,node_type,ThresholdHypothesis,1.0,manual,threshold is learned or revised; not a hard event label
+Threshold_FD002_v1,node_type,ThresholdHypothesis,1.0,manual,threshold is learned or revised; not a hard event label
+Threshold_FD003_v1,node_type,ThresholdHypothesis,1.0,manual,threshold is learned or revised; not a hard event label
+Threshold_FD004_v1,node_type,ThresholdHypothesis,1.0,manual,threshold is learned or revised; not a hard event label
+Threshold_FD001_v1,has_warning_rule,q95_or_learned_boundary,1.0,manual,initial warning boundary
+Threshold_FD002_v1,has_warning_rule,q95_or_learned_boundary,1.0,manual,initial warning boundary
+Threshold_FD003_v1,has_warning_rule,q95_or_learned_boundary,1.0,manual,initial warning boundary
+Threshold_FD004_v1,has_warning_rule,q95_or_learned_boundary,1.0,manual,initial warning boundary
+Threshold_FD001_v1,has_critical_rule,q99_or_learned_boundary,1.0,manual,initial critical boundary
+Threshold_FD002_v1,has_critical_rule,q99_or_learned_boundary,1.0,manual,initial critical boundary
+Threshold_FD003_v1,has_critical_rule,q99_or_learned_boundary,1.0,manual,initial critical boundary
+Threshold_FD004_v1,has_critical_rule,q99_or_learned_boundary,1.0,manual,initial critical boundary
+FD001,has_action_policy,Policy_FD001_v1,1.0,manual,dataset-level action policy
+FD002,has_action_policy,Policy_FD002_v1,1.0,manual,dataset-level action policy
+FD003,has_action_policy,Policy_FD003_v1,1.0,manual,dataset-level action policy
+FD004,has_action_policy,Policy_FD004_v1,1.0,manual,dataset-level action policy
+Policy_FD001_v1,allows_action_type,continue_normal_operation,1.0,manual,always allowed
+Policy_FD001_v1,allows_action_type,schedule_monitoring,1.0,manual,always allowed
+Policy_FD001_v1,allows_action_type,schedule_HPC_maintenance,1.0,manual,HPC action allowed in FD001
+Policy_FD001_v1,disallows_action_type,schedule_fan_maintenance,1.0,manual,Fan action not allowed by default in FD001
+Policy_FD002_v1,allows_action_type,continue_normal_operation,1.0,manual,always allowed
+Policy_FD002_v1,allows_action_type,schedule_monitoring,1.0,manual,always allowed
+Policy_FD002_v1,allows_action_type,schedule_HPC_maintenance,1.0,manual,HPC action allowed in FD002
+Policy_FD002_v1,disallows_action_type,schedule_fan_maintenance,1.0,manual,Fan action not allowed by default in FD002
+Policy_FD003_v1,allows_action_type,continue_normal_operation,1.0,manual,always allowed
+Policy_FD003_v1,allows_action_type,schedule_monitoring,1.0,manual,always allowed
+Policy_FD003_v1,allows_action_type,schedule_HPC_maintenance,1.0,manual,HPC action allowed in FD003
+Policy_FD003_v1,allows_action_type,schedule_fan_maintenance,1.0,manual,Fan action allowed in FD003
+Policy_FD004_v1,allows_action_type,continue_normal_operation,1.0,manual,always allowed
+Policy_FD004_v1,allows_action_type,schedule_monitoring,1.0,manual,always allowed
+Policy_FD004_v1,allows_action_type,schedule_HPC_maintenance,1.0,manual,HPC action allowed in FD004
+Policy_FD004_v1,allows_action_type,schedule_fan_maintenance,1.0,manual,Fan action allowed in FD004
+FD001,has_reflection_rule_anchor,ReflectionRule_FD001_seed,1.0,manual,seed namespace for future reflection rows
+FD002,has_reflection_rule_anchor,ReflectionRule_FD002_seed,1.0,manual,seed namespace for future reflection rows
+FD003,has_reflection_rule_anchor,ReflectionRule_FD003_seed,1.0,manual,seed namespace for future reflection rows
+FD004,has_reflection_rule_anchor,ReflectionRule_FD004_seed,1.0,manual,seed namespace for future reflection rows
