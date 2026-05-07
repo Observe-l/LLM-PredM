@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--default_interval", type=int, default=20)
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--ollama_url", default=DEFAULT_OLLAMA_URL)
-    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--ollama_num_predict", type=int, default=512)
     parser.add_argument(
