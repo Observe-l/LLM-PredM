@@ -9,18 +9,23 @@ import numpy as np
 import pandas as pd
 
 
+HPC_EVIDENCE_SENSORS = {"S7", "S11", "S3", "S9", "S14"}
+FAN_EVIDENCE_SENSORS = {"S8", "S13", "S15"}
+CONFLICT_EVIDENCE_SENSORS = {"S4", "S12", "S20", "S21"}
+
+
 DEFAULT_THRESHOLD_CONFIG = {
-    "FD001": {"warning_score": 1.0, "critical_score": 2.0},
-    "FD002": {"warning_score": 1.0, "critical_score": 2.0},
-    "FD003": {"warning_score": 1.0, "critical_score": 2.0},
-    "FD004": {"warning_score": 1.0, "critical_score": 2.0},
+    "FD001": {"warning_score": None, "critical_score": None},
+    "FD002": {"warning_score": None, "critical_score": None},
+    "FD003": {"warning_score": None, "critical_score": None},
+    "FD004": {"warning_score": None, "critical_score": None},
 }
 
 
 GROUP_COLS = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle"]
 
 
-def load_threshold_config(path: str | Path | None) -> dict[str, dict[str, float]]:
+def load_threshold_config(path: str | Path | None) -> dict[str, dict[str, float | None]]:
     if path is None:
         return DEFAULT_THRESHOLD_CONFIG
     loaded = json.loads(Path(path).read_text())
@@ -98,8 +103,9 @@ def build_forecast_case(
     score_col: str,
     raw_score_col: str,
     lhi_col: str,
-    threshold_config: dict[str, dict[str, float]],
+    threshold_config: dict[str, dict[str, float | None]],
     window_detail_dir: str | Path | None = None,
+    engine_history: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     if window.empty:
         raise ValueError("Cannot build ForecastCase from an empty LHI window.")
@@ -124,20 +130,32 @@ def build_forecast_case(
     peak_row = window.loc[peak_idx]
     peak_abs_cycle = int(peak_row["cycle"])
 
-    thresholds = threshold_config.get(fd_name, {})
-    warning_score = thresholds.get("warning_score")
-    critical_score = thresholds.get("critical_score")
-
-    warning_rel = _first_crossing(window, score_col, warning_score, cutoff_cycle)
-    critical_rel = _first_crossing(window, score_col, critical_score, cutoff_cycle)
-    persistent_duration = _persistent_duration(window, score_col, warning_score)
-    first_persistent = warning_rel if persistent_duration > 1 else None
-
     top_rows = _window_top_rows(top_drift, first)
     dominant_top_sensors = _dominant_top_sensors(top_rows, window)
     top_sensor_at_peak = _top_sensors_at_cycle(top_rows, peak_abs_cycle)
     if not top_sensor_at_peak:
         top_sensor_at_peak = _parse_sensor_list(str(peak_row.get("top_drift_sensors", "")))
+    unit_past = _unit_past_statistics(engine_history, score_col, cutoff_cycle)
+    if unit_past.get("unit_past_q95") is not None:
+        unit_past["peak_minus_unit_q95"] = _finite_float(float(peak_row.get(score_col)) - float(unit_past["unit_past_q95"]))
+    if unit_past.get("unit_past_q99") is not None:
+        unit_past["peak_minus_unit_q99"] = _finite_float(float(peak_row.get(score_col)) - float(unit_past["unit_past_q99"]))
+
+    thresholds = threshold_config.get(fd_name, {})
+    warning_score = thresholds.get("warning_score")
+    critical_score = thresholds.get("critical_score")
+    if warning_score is None:
+        warning_score = unit_past.get("unit_past_q95")
+    if critical_score is None:
+        critical_score = unit_past.get("unit_past_q99")
+
+    warning_rel = _first_crossing(window, score_col, warning_score, cutoff_cycle)
+    critical_rel = _first_crossing(window, score_col, critical_score, cutoff_cycle)
+    persistent_duration = _persistent_duration(window, score_col, warning_score)
+    first_persistent = warning_rel if persistent_duration > 1 else None
+    trend_stats = _trend_statistics(window, score_col, cutoff_cycle, unit_past)
+    multi_score_stats = _multi_score_statistics(window, score_col, raw_score_col, lhi_col)
+    sensor_stats = _sensor_evidence_statistics(top_rows, window, top_sensor_at_peak)
 
     case_id = f"ForecastCase_{fd_name}_Engine{unit_id}_Cycle{cutoff_cycle}"
     detail_path = None
@@ -183,10 +201,190 @@ def build_forecast_case(
             "preliminary_component_hint": None,
             "dominant_component_hypothesis": None,
         },
+        "risk_statistics": {
+            "score_col": score_col,
+            "current_score": _finite_float(window.iloc[0].get(score_col)),
+            "peak_score": _finite_float(peak_row.get(score_col)),
+            "peak_score_cycle": _relative_cycle(peak_abs_cycle, cutoff_cycle),
+            "final_score": _finite_float(window.iloc[-1].get(score_col)),
+            "current_d_rmse": _finite_float(window.iloc[0].get(raw_score_col)),
+            "peak_d_rmse": _finite_float(peak_row.get(raw_score_col)),
+            "final_d_rmse": _finite_float(window.iloc[-1].get(raw_score_col)),
+            **unit_past,
+        },
+        "trend_statistics": trend_stats,
+        "multi_score_statistics": multi_score_stats,
+        "sensor_evidence_statistics": sensor_stats,
         "key_cycles": _key_cycles(window, top_rows, score_col, cutoff_cycle, warning_rel, critical_rel, peak_abs_cycle),
         "forecast_window_detail_path": str(detail_path) if detail_path else None,
         "prediction_length": prediction_length,
     }
+
+
+def _unit_past_statistics(engine_history: pd.DataFrame | None, score_col: str, cutoff_cycle: int) -> dict[str, Any]:
+    base = {
+        "unit_past_count": 0,
+        "unit_past_mean": None,
+        "unit_past_std": None,
+        "unit_past_q95": None,
+        "unit_past_q99": None,
+        "peak_minus_unit_q95": None,
+        "peak_minus_unit_q99": None,
+        "unit_past_context_reliable": False,
+    }
+    if engine_history is None or engine_history.empty or score_col not in engine_history:
+        return base
+    history = engine_history.copy()
+    if "cutoff_cycle" in history:
+        history = history[pd.to_numeric(history["cutoff_cycle"], errors="coerce") < cutoff_cycle]
+    if "cycle" in history:
+        history = history[pd.to_numeric(history["cycle"], errors="coerce") <= cutoff_cycle]
+        history = history.sort_values(["cycle", "cutoff_cycle"]).drop_duplicates("cycle", keep="last")
+    values = pd.to_numeric(history[score_col], errors="coerce").dropna()
+    if values.empty:
+        return base
+    count = int(values.shape[0])
+    reliable = count >= 10
+    return {
+        "unit_past_count": count,
+        "unit_past_mean": _finite_float(values.mean()),
+        "unit_past_std": _finite_float(values.std(ddof=0)),
+        "unit_past_q95": _finite_float(values.quantile(0.95)),
+        "unit_past_q99": _finite_float(values.quantile(0.99)),
+        "peak_minus_unit_q95": None,
+        "peak_minus_unit_q99": None,
+        "unit_past_context_reliable": reliable,
+    }
+
+
+def _trend_statistics(window: pd.DataFrame, score_col: str, cutoff_cycle: int, unit_past: dict[str, Any]) -> dict[str, Any]:
+    values = pd.to_numeric(window[score_col], errors="coerce")
+    cycles = pd.to_numeric(window["cycle"], errors="coerce") - cutoff_cycle
+    mask = values.notna() & cycles.notna()
+    y = values[mask].to_numpy(dtype=float)
+    x = cycles[mask].to_numpy(dtype=float)
+    if len(y) == 0:
+        return {}
+    slope = float(np.polyfit(x, y, 1)[0]) if len(y) >= 2 else 0.0
+    diffs = np.diff(y)
+    q95 = unit_past.get("unit_past_q95")
+    q99 = unit_past.get("unit_past_q99")
+    return {
+        "slope": _finite_float(slope),
+        "delta_score": _finite_float(y[-1] - y[0]),
+        "relative_increase": _finite_float((y[-1] - y[0]) / max(abs(y[0]), 1e-9)),
+        "monotonicity": _finite_float(float((diffs >= 0).mean()) if len(diffs) else 1.0),
+        "volatility": _finite_float(float(np.std(diffs)) if len(diffs) else 0.0),
+        "duration_above_unit_q95": _duration_above_threshold(y, q95),
+        "duration_above_unit_q99": _duration_above_threshold(y, q99),
+        "area_above_unit_q95": _area_above_threshold(y, q95),
+        "area_above_unit_q99": _area_above_threshold(y, q99),
+        "first_unit_q95_crossing_cycle": _first_array_crossing(x, y, q95),
+        "first_unit_q99_crossing_cycle": _first_array_crossing(x, y, q99),
+    }
+
+
+def _multi_score_statistics(window: pd.DataFrame, score_col: str, raw_score_col: str, lhi_col: str) -> dict[str, Any]:
+    stats = {
+        score_col: _series_stats(window, score_col),
+        raw_score_col: _series_stats(window, raw_score_col),
+        lhi_col: _series_stats(window, lhi_col),
+    }
+    score_slope = stats.get(score_col, {}).get("slope")
+    raw_slope = stats.get(raw_score_col, {}).get("slope")
+    if score_slope is None or raw_slope is None:
+        consistency = "unknown"
+    elif score_slope > 0 and raw_slope > 0:
+        consistency = "consistent_increasing"
+    elif score_slope < 0 and raw_slope < 0:
+        consistency = "consistent_decreasing"
+    else:
+        consistency = "mixed"
+    stats["d_rmse_lhi_consistency"] = consistency
+    return stats
+
+
+def _sensor_evidence_statistics(top_rows: pd.DataFrame, window: pd.DataFrame, top_sensor_at_peak: list[str]) -> dict[str, Any]:
+    cycle_sets: list[list[str]] = []
+    cycle_ranks: dict[str, list[int]] = defaultdict(list)
+    for row in window.sort_values("cycle").itertuples(index=False):
+        abs_cycle = int(getattr(row, "cycle"))
+        sensors = _top_sensors_at_cycle(top_rows, abs_cycle)
+        if not sensors:
+            sensors = _parse_sensor_list(str(getattr(row, "top_drift_sensors", "")))
+        cycle_sets.append(sensors)
+        for rank, sensor in enumerate(sensors, start=1):
+            cycle_ranks[sensor].append(rank)
+    n = max(len(cycle_sets), 1)
+    presence = {sensor: round(len(ranks) / n, 4) for sensor, ranks in sorted(cycle_ranks.items())}
+    mean_rank = {sensor: round(float(np.mean(ranks)), 4) for sensor, ranks in sorted(cycle_ranks.items())}
+    stability = _sensor_pattern_stability(cycle_sets)
+    return {
+        "dominant_top_sensors": [s for s, _ in sorted(presence.items(), key=lambda item: item[1], reverse=True)[:5]],
+        "top_sensor_at_peak_cycle": top_sensor_at_peak,
+        "sensor_presence_ratio": presence,
+        "sensor_mean_rank": mean_rank,
+        "sensor_pattern_stability": stability,
+        "hpc_sensor_presence_ratio": _group_presence(presence, HPC_EVIDENCE_SENSORS),
+        "fan_sensor_presence_ratio": _group_presence(presence, FAN_EVIDENCE_SENSORS),
+        "conflict_sensor_presence_ratio": _group_presence(presence, CONFLICT_EVIDENCE_SENSORS),
+    }
+
+
+def _duration_above_threshold(values: np.ndarray, threshold: Any) -> int | None:
+    threshold = _finite_float(threshold)
+    if threshold is None:
+        return None
+    return int((values > threshold).sum())
+
+
+def _area_above_threshold(values: np.ndarray, threshold: Any) -> float | None:
+    threshold = _finite_float(threshold)
+    if threshold is None:
+        return None
+    return _finite_float(np.maximum(values - threshold, 0.0).sum())
+
+
+def _first_array_crossing(cycles: np.ndarray, values: np.ndarray, threshold: Any) -> str | None:
+    threshold = _finite_float(threshold)
+    if threshold is None:
+        return None
+    indices = np.where(values > threshold)[0]
+    if len(indices) == 0:
+        return None
+    return f"t+{max(1, int(cycles[int(indices[0])]))}"
+
+
+def _series_stats(window: pd.DataFrame, col: str) -> dict[str, Any]:
+    if col not in window:
+        return {"peak": None, "final": None, "slope": None}
+    values = pd.to_numeric(window[col], errors="coerce")
+    cycles = pd.to_numeric(window["cycle"], errors="coerce")
+    mask = values.notna() & cycles.notna()
+    if not mask.any():
+        return {"peak": None, "final": None, "slope": None}
+    y = values[mask].to_numpy(dtype=float)
+    x = cycles[mask].to_numpy(dtype=float)
+    slope = float(np.polyfit(x, y, 1)[0]) if len(y) >= 2 else 0.0
+    return {"peak": _finite_float(np.max(y)), "final": _finite_float(y[-1]), "slope": _finite_float(slope)}
+
+
+def _sensor_pattern_stability(cycle_sets: list[list[str]]) -> float | None:
+    if len(cycle_sets) < 2:
+        return 1.0 if cycle_sets else None
+    scores = []
+    for left, right in zip(cycle_sets, cycle_sets[1:]):
+        lset, rset = set(left), set(right)
+        if not lset and not rset:
+            scores.append(1.0)
+        elif lset or rset:
+            scores.append(len(lset & rset) / len(lset | rset))
+    return _finite_float(float(np.mean(scores)) if scores else 1.0)
+
+
+def _group_presence(presence: dict[str, float], sensors: set[str]) -> float:
+    values = [presence.get(sensor, 0.0) for sensor in sensors]
+    return round(max(values) if values else 0.0, 4)
 
 
 def build_window_detail(

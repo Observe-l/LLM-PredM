@@ -131,6 +131,76 @@ def retrieve_action_paths(kg: KGStore, hypotheses: list[str]) -> list[dict[str, 
     return sorted(action_paths, key=lambda x: x["weight"], reverse=True)
 
 
+def build_component_evidence_statistics(
+    sensor_paths: list[dict[str, Any]],
+    sensor_evidence_statistics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    sensor_presence = (sensor_evidence_statistics or {}).get("sensor_presence_ratio", {})
+    grouped: dict[str, dict[str, Any]] = {}
+    for path in sensor_paths:
+        hypothesis = str(path.get("hypothesis"))
+        if hypothesis not in {
+            "HPC_related_degradation",
+            "Fan_related_degradation",
+            "uncertain_component_degradation",
+        }:
+            continue
+        item = grouped.setdefault(hypothesis, {"scores": [], "sensors": set(), "presence": []})
+        item["scores"].append(float(path.get("score", 0.0)))
+        sensor = str(path.get("sensor", ""))
+        if sensor:
+            item["sensors"].add(sensor)
+            item["presence"].append(float(sensor_presence.get(sensor, 0.0)))
+
+    result: dict[str, Any] = {}
+    for hypothesis, item in grouped.items():
+        scores = item["scores"]
+        presence = item["presence"]
+        result[hypothesis] = {
+            "path_score": round(max(scores) if scores else 0.0, 4),
+            "mean_path_score": round(sum(scores) / len(scores), 4) if scores else 0.0,
+            "supporting_sensors": sorted(item["sensors"]),
+            "presence_ratio": round(max(presence) if presence else 0.0, 4),
+            "evidence_strength": _component_strength(hypothesis, max(scores) if scores else 0.0, max(presence) if presence else 0.0),
+        }
+
+    hpc = result.get("HPC_related_degradation", {}).get("path_score", 0.0)
+    fan = result.get("Fan_related_degradation", {}).get("path_score", 0.0)
+    uncertain = result.get("uncertain_component_degradation", {}).get("path_score", 0.0)
+    scores = {
+        "HPC_related_degradation": hpc,
+        "Fan_related_degradation": fan,
+        "uncertain_component_degradation": uncertain,
+    }
+    dominant, dominant_score = max(scores.items(), key=lambda item: item[1])
+    second_score = sorted(scores.values(), reverse=True)[1]
+    result.update(
+        {
+            "hpc_path_score": hpc,
+            "fan_path_score": fan,
+            "uncertain_path_score": uncertain,
+            "component_conflict_score": round(min(hpc, fan) + 0.5 * uncertain, 4),
+            "dominant_component": dominant if dominant_score > 0 else None,
+            "dominance_margin": round(dominant_score - second_score, 4),
+        }
+    )
+    return result
+
+
+def _component_strength(hypothesis: str, path_score: float, presence_ratio: float) -> str:
+    if path_score >= 0.75 and presence_ratio >= 0.5:
+        prefix = "strong"
+    elif path_score >= 0.6 or presence_ratio >= 0.3:
+        prefix = "moderate"
+    else:
+        prefix = "weak"
+    if hypothesis == "HPC_related_degradation":
+        return f"{prefix}_HPC"
+    if hypothesis == "Fan_related_degradation":
+        return f"{prefix}_FAN"
+    return f"{prefix}_uncertain"
+
+
 def infer_candidate_action(
     dataset_rules: dict[str, Any],
     sensor_paths: list[dict[str, Any]],
@@ -190,4 +260,3 @@ def _persistence_score(forecast_summary: dict[str, Any]) -> float:
     if forecast_summary.get("score_trend") == "increasing":
         return 0.5
     return 0.2
-

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+import math
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -17,9 +19,27 @@ REFLECTION_COLUMNS = [
     "feedback_label",
     "feedback_reason",
     "peak_score",
+    "final_score",
+    "unit_past_q95",
+    "unit_past_q99",
+    "peak_minus_unit_q95",
+    "peak_minus_unit_q99",
     "peak_score_cycle",
     "score_at_action_time",
     "score_trend",
+    "slope",
+    "delta_score",
+    "monotonicity",
+    "volatility",
+    "duration_above_unit_q95",
+    "duration_above_unit_q99",
+    "area_above_unit_q95",
+    "area_above_unit_q99",
+    "peak_lhi",
+    "peak_d_rmse",
+    "lhi_slope",
+    "d_rmse_slope",
+    "d_rmse_lhi_consistency",
     "first_warning_crossing_cycle",
     "first_critical_crossing_cycle",
     "persistent_high_risk_duration",
@@ -30,7 +50,17 @@ REFLECTION_COLUMNS = [
     "dominant_top_sensors",
     "top_sensor_at_action_time",
     "top_sensor_at_peak_cycle",
+    "sensor_pattern_stability",
+    "hpc_sensor_presence_ratio",
+    "fan_sensor_presence_ratio",
+    "conflict_sensor_presence_ratio",
     "component_evidence_strength",
+    "hpc_path_score",
+    "fan_path_score",
+    "uncertain_path_score",
+    "component_conflict_score",
+    "dominant_component",
+    "dominance_margin",
     "then_revise_action_type",
     "recommended_time_rule",
     "then_adjust_threshold",
@@ -61,6 +91,8 @@ def retrieve_reflection_rules(
     forecast_summary: dict[str, Any],
     candidate_action: str,
     max_rules: int = 5,
+    case: dict[str, Any] | None = None,
+    component_stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     path = Path(kg_dir) / "reflection_rules.csv"
     if not path.exists():
@@ -70,52 +102,47 @@ def retrieve_reflection_rules(
     if not rows:
         return []
 
-    pattern = infer_forecast_pattern(forecast_summary)
-    query = _feature_vector_from_summary(forecast_summary)
-    query_sensors = _as_sensor_set(forecast_summary.get("dominant_top_sensors", [])) | _as_sensor_set(
-        forecast_summary.get("top_sensor_at_peak_cycle", [])
+    query = build_reflection_feature(
+        case
+        or {
+            "dataset_subset": dataset_subset,
+            "forecast_summary": forecast_summary,
+        },
+        component_stats=component_stats,
+        candidate_action=candidate_action,
     )
-    results: list[tuple[tuple[float, float, float, float], dict[str, Any]]] = []
+    results: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
         applies = str(row.get("applies_to_dataset", ""))
-        rule_pattern = str(row.get("if_pattern", ""))
 
         if applies not in {dataset_subset, "ALL"}:
             continue
-        pattern_match = rule_pattern == pattern or rule_pattern in pattern or pattern in rule_pattern
-        peak_similarity = _peak_similarity(query, _feature_vector_from_row(row))
-        persistence_similarity = _persistence_similarity(query, _feature_vector_from_row(row))
-        sensor_similarity = _jaccard(query_sensors, _as_sensor_set(row.get("dominant_top_sensors", "")) | _as_sensor_set(row.get("top_sensor_at_peak_cycle", "")))
-        rank_score = (
-            10.0 * peak_similarity
-            + 0.5 * persistence_similarity
-            + 0.25 * sensor_similarity
-            + 0.1 * float(pattern_match)
-        )
-        sort_key = (
-            round(peak_similarity, 6),
-            round(persistence_similarity, 6),
-            round(sensor_similarity, 6),
-            float(pattern_match),
-        )
+        memory = _feature_vector_from_row(row)
+        similarity = reflection_similarity(query, memory)
         compact = _compact_reflection_row(row)
-        compact["retrieval_similarity"] = round(rank_score, 4)
-        compact["peak_similarity"] = round(peak_similarity, 4)
-        compact["persistence_similarity"] = round(persistence_similarity, 4)
-        compact["sensor_similarity"] = round(sensor_similarity, 4)
-        compact["matched_pattern"] = pattern_match
-        results.append((sort_key, compact))
+        compact["retrieval_similarity"] = round(similarity["total"], 4)
+        compact["similarity_breakdown"] = {k: round(v, 4) for k, v in similarity.items()}
+        compact["helpfulness_score"] = round(
+            similarity["total"] + _helpfulness_bonus(query, memory, compact),
+            4,
+        )
+        results.append((float(compact["helpfulness_score"]), compact))
 
-    return [row for _, row in sorted(results, key=lambda x: x[0], reverse=True)[:max_rules]]
+    return _balanced_topk([row for _, row in sorted(results, key=lambda x: x[0], reverse=True)], max_rules=max_rules)
 
 
-def feedback_to_rule(feedback: dict[str, Any], case: dict[str, Any], action: dict[str, Any]) -> dict[str, str] | None:
+def feedback_to_rule(
+    feedback: dict[str, Any],
+    case: dict[str, Any],
+    action: dict[str, Any],
+    component_stats: dict[str, Any] | None = None,
+) -> dict[str, str] | None:
     dataset = str(case["dataset_subset"])
     pattern = infer_forecast_pattern(case["forecast_summary"])
     previous_action = str(action.get("action_type", ""))
     label = str(feedback["feedback_label"])
     feedback_id = str(feedback.get("feedback_id") or feedback.get("case_id") or "unknown")
-    features = reflection_features(case, action)
+    features = reflection_features(case, action, component_stats=component_stats)
 
     base = {
         "applies_to_dataset": dataset,
@@ -229,23 +256,52 @@ def initialize_reflection_file(path: str | Path) -> None:
     path.write_text(",".join(REFLECTION_COLUMNS) + "\n")
 
 
-def reflection_features(case: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+def reflection_features(
+    case: dict[str, Any],
+    action: dict[str, Any],
+    component_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     summary = case.get("forecast_summary", {})
+    risk = case.get("risk_statistics", {})
+    trend = case.get("trend_statistics", {})
+    multi = case.get("multi_score_statistics", {})
+    sensor = case.get("sensor_evidence_statistics", {})
     peak = _to_float(summary.get("peak_score"))
     action_time = action.get("action_time")
     peak_cycle = str(summary.get("peak_score_cycle") or "")
     warning_cycle = summary.get("first_warning_crossing_cycle")
     persistence_cycle = summary.get("first_persistent_pattern_cycle")
     score_at_action, sensors_at_action = _score_and_sensors_at_relative_cycle(case, action_time)
-    dominant_sensors = [str(s).upper() for s in summary.get("dominant_top_sensors", [])]
-    peak_sensors = [str(s).upper() for s in summary.get("top_sensor_at_peak_cycle", [])]
+    dominant_sensors = [str(s).upper() for s in sensor.get("dominant_top_sensors") or summary.get("dominant_top_sensors", [])]
+    peak_sensors = [str(s).upper() for s in sensor.get("top_sensor_at_peak_cycle") or summary.get("top_sensor_at_peak_cycle", [])]
     component_evidence = _component_evidence_strength(previous_action=str(action.get("action_type", "")), sensors=dominant_sensors + peak_sensors + sensors_at_action)
+    component_stats = component_stats or case.get("component_evidence_statistics", {})
+    lhi_stats = multi.get("lhi_rmse_roll_mean") or multi.get(case.get("score_source", {}).get("lhi_name", ""), {})
+    d_stats = multi.get("d_rmse") or multi.get(case.get("score_source", {}).get("raw_score_name", ""), {})
     return {
         "previous_action_time": _csv_value(action_time),
         "peak_score": _csv_value(peak),
+        "final_score": _csv_value(risk.get("final_score") or summary.get("final_cycle_score")),
+        "unit_past_q95": _csv_value(risk.get("unit_past_q95")),
+        "unit_past_q99": _csv_value(risk.get("unit_past_q99")),
+        "peak_minus_unit_q95": _csv_value(risk.get("peak_minus_unit_q95")),
+        "peak_minus_unit_q99": _csv_value(risk.get("peak_minus_unit_q99")),
         "peak_score_cycle": peak_cycle,
         "score_at_action_time": _csv_value(score_at_action),
         "score_trend": _csv_value(summary.get("score_trend")),
+        "slope": _csv_value(trend.get("slope")),
+        "delta_score": _csv_value(trend.get("delta_score")),
+        "monotonicity": _csv_value(trend.get("monotonicity")),
+        "volatility": _csv_value(trend.get("volatility")),
+        "duration_above_unit_q95": _csv_value(trend.get("duration_above_unit_q95")),
+        "duration_above_unit_q99": _csv_value(trend.get("duration_above_unit_q99")),
+        "area_above_unit_q95": _csv_value(trend.get("area_above_unit_q95")),
+        "area_above_unit_q99": _csv_value(trend.get("area_above_unit_q99")),
+        "peak_lhi": _csv_value(lhi_stats.get("peak")),
+        "peak_d_rmse": _csv_value(d_stats.get("peak")),
+        "lhi_slope": _csv_value(lhi_stats.get("slope")),
+        "d_rmse_slope": _csv_value(d_stats.get("slope")),
+        "d_rmse_lhi_consistency": _csv_value(multi.get("d_rmse_lhi_consistency")),
         "first_warning_crossing_cycle": _csv_value(warning_cycle),
         "first_critical_crossing_cycle": _csv_value(summary.get("first_critical_crossing_cycle")),
         "persistent_high_risk_duration": _csv_value(summary.get("persistent_high_risk_duration")),
@@ -256,7 +312,17 @@ def reflection_features(case: dict[str, Any], action: dict[str, Any]) -> dict[st
         "dominant_top_sensors": "|".join(dominant_sensors),
         "top_sensor_at_action_time": "|".join(sensors_at_action),
         "top_sensor_at_peak_cycle": "|".join(peak_sensors),
+        "sensor_pattern_stability": _csv_value(sensor.get("sensor_pattern_stability")),
+        "hpc_sensor_presence_ratio": _csv_value(sensor.get("hpc_sensor_presence_ratio")),
+        "fan_sensor_presence_ratio": _csv_value(sensor.get("fan_sensor_presence_ratio")),
+        "conflict_sensor_presence_ratio": _csv_value(sensor.get("conflict_sensor_presence_ratio")),
         "component_evidence_strength": component_evidence,
+        "hpc_path_score": _csv_value(component_stats.get("hpc_path_score")),
+        "fan_path_score": _csv_value(component_stats.get("fan_path_score")),
+        "uncertain_path_score": _csv_value(component_stats.get("uncertain_path_score")),
+        "component_conflict_score": _csv_value(component_stats.get("component_conflict_score")),
+        "dominant_component": _csv_value(component_stats.get("dominant_component")),
+        "dominance_margin": _csv_value(component_stats.get("dominance_margin")),
     }
 
 
@@ -348,6 +414,58 @@ def _conflicts_with_candidate_component(row: dict[str, Any], candidate_action: s
     return False
 
 
+def build_reflection_feature(
+    case: dict[str, Any],
+    component_stats: dict[str, Any] | None = None,
+    candidate_action: str | None = None,
+) -> dict[str, Any]:
+    summary = case.get("forecast_summary", {})
+    risk = case.get("risk_statistics", {})
+    trend = case.get("trend_statistics", {})
+    multi = case.get("multi_score_statistics", {})
+    sensor = case.get("sensor_evidence_statistics", {})
+    component_stats = component_stats or case.get("component_evidence_statistics", {})
+    lhi_stats = multi.get("lhi_rmse_roll_mean") or multi.get(case.get("score_source", {}).get("lhi_name", ""), {})
+    d_stats = multi.get("d_rmse") or multi.get(case.get("score_source", {}).get("raw_score_name", ""), {})
+    return {
+        "dataset": case.get("dataset_subset"),
+        "candidate_action": candidate_action,
+        "peak_score": _to_float(risk.get("peak_score") or summary.get("peak_score")),
+        "final_score": _to_float(risk.get("final_score") or summary.get("final_cycle_score")),
+        "peak_minus_unit_q95": _to_float(risk.get("peak_minus_unit_q95")),
+        "peak_minus_unit_q99": _to_float(risk.get("peak_minus_unit_q99")),
+        "unit_past_context_reliable": bool(risk.get("unit_past_context_reliable")),
+        "slope": _to_float(trend.get("slope")),
+        "delta_score": _to_float(trend.get("delta_score")),
+        "monotonicity": _to_float(trend.get("monotonicity")),
+        "volatility": _to_float(trend.get("volatility")),
+        "duration_above_unit_q95": _to_float(trend.get("duration_above_unit_q95")),
+        "duration_above_unit_q99": _to_float(trend.get("duration_above_unit_q99")),
+        "area_above_unit_q95": _to_float(trend.get("area_above_unit_q95")),
+        "area_above_unit_q99": _to_float(trend.get("area_above_unit_q99")),
+        "peak_lhi": _to_float(lhi_stats.get("peak") or risk.get("peak_score") or summary.get("peak_score")),
+        "peak_d_rmse": _to_float(d_stats.get("peak")),
+        "lhi_slope": _to_float(lhi_stats.get("slope") or trend.get("slope")),
+        "d_rmse_slope": _to_float(d_stats.get("slope")),
+        "d_rmse_lhi_consistency": multi.get("d_rmse_lhi_consistency"),
+        "dominant_top_sensors": sensor.get("dominant_top_sensors") or summary.get("dominant_top_sensors", []),
+        "top_sensor_at_peak_cycle": sensor.get("top_sensor_at_peak_cycle") or summary.get("top_sensor_at_peak_cycle", []),
+        "sensor_pattern_stability": _to_float(sensor.get("sensor_pattern_stability")),
+        "hpc_sensor_presence_ratio": _to_float(sensor.get("hpc_sensor_presence_ratio")),
+        "fan_sensor_presence_ratio": _to_float(sensor.get("fan_sensor_presence_ratio")),
+        "conflict_sensor_presence_ratio": _to_float(sensor.get("conflict_sensor_presence_ratio")),
+        "hpc_path_score": _to_float(component_stats.get("hpc_path_score")),
+        "fan_path_score": _to_float(component_stats.get("fan_path_score")),
+        "uncertain_path_score": _to_float(component_stats.get("uncertain_path_score")),
+        "component_conflict_score": _to_float(component_stats.get("component_conflict_score")),
+        "dominant_component": component_stats.get("dominant_component"),
+        "dominance_margin": _to_float(component_stats.get("dominance_margin")),
+        "action_to_peak_gap": None,
+        "action_to_persistence_gap": None,
+        "action_to_warning_gap": None,
+    }
+
+
 def _feature_vector_from_summary(summary: dict[str, Any]) -> dict[str, float | None]:
     return {
         "peak_score": _to_float(summary.get("peak_score")),
@@ -361,11 +479,195 @@ def _feature_vector_from_summary(summary: dict[str, Any]) -> dict[str, float | N
 def _feature_vector_from_row(row: dict[str, Any]) -> dict[str, float | None]:
     return {
         "peak_score": _to_float(row.get("peak_score")),
+        "final_score": _to_float(row.get("final_score")),
+        "peak_minus_unit_q95": _to_float(row.get("peak_minus_unit_q95")),
+        "peak_minus_unit_q99": _to_float(row.get("peak_minus_unit_q99")),
+        "slope": _to_float(row.get("slope")),
+        "delta_score": _to_float(row.get("delta_score")),
+        "monotonicity": _to_float(row.get("monotonicity")),
+        "volatility": _to_float(row.get("volatility")),
+        "duration_above_unit_q95": _to_float(row.get("duration_above_unit_q95")),
+        "duration_above_unit_q99": _to_float(row.get("duration_above_unit_q99")),
+        "area_above_unit_q95": _to_float(row.get("area_above_unit_q95")),
+        "area_above_unit_q99": _to_float(row.get("area_above_unit_q99")),
+        "peak_lhi": _to_float(row.get("peak_lhi") or row.get("peak_score")),
+        "peak_d_rmse": _to_float(row.get("peak_d_rmse")),
+        "lhi_slope": _to_float(row.get("lhi_slope")),
+        "d_rmse_slope": _to_float(row.get("d_rmse_slope")),
+        "d_rmse_lhi_consistency": row.get("d_rmse_lhi_consistency"),
+        "dominant_top_sensors": _as_sensor_set(row.get("dominant_top_sensors", "")),
+        "top_sensor_at_peak_cycle": _as_sensor_set(row.get("top_sensor_at_peak_cycle", "")),
+        "sensor_pattern_stability": _to_float(row.get("sensor_pattern_stability")),
+        "hpc_sensor_presence_ratio": _to_float(row.get("hpc_sensor_presence_ratio")),
+        "fan_sensor_presence_ratio": _to_float(row.get("fan_sensor_presence_ratio")),
+        "conflict_sensor_presence_ratio": _to_float(row.get("conflict_sensor_presence_ratio")),
+        "hpc_path_score": _to_float(row.get("hpc_path_score")),
+        "fan_path_score": _to_float(row.get("fan_path_score")),
+        "uncertain_path_score": _to_float(row.get("uncertain_path_score")),
+        "component_conflict_score": _to_float(row.get("component_conflict_score")),
+        "dominant_component": row.get("dominant_component"),
+        "dominance_margin": _to_float(row.get("dominance_margin")),
+        "action_to_peak_gap": _to_float(row.get("action_to_peak_gap")),
+        "action_to_persistence_gap": _to_float(row.get("action_to_persistence_gap")),
+        "action_to_warning_gap": _to_float(row.get("action_to_warning_gap")),
         "persistent_high_risk_duration": _to_float(row.get("persistent_high_risk_duration")),
         "peak_cycle_num": _to_float(_parse_rel_cycle(row.get("peak_score_cycle"))),
         "warning_cycle_num": _to_float(_parse_rel_cycle(row.get("first_warning_crossing_cycle"))),
         "persistence_cycle_num": _to_float(_parse_rel_cycle(row.get("first_persistent_pattern_cycle"))),
     }
+
+
+def reflection_similarity(query: dict[str, Any], memory: dict[str, Any]) -> dict[str, float]:
+    s_risk = _risk_similarity(query, memory)
+    s_trend = _trend_similarity(query, memory)
+    s_multi = _multi_score_similarity(query, memory)
+    s_sensor = _sensor_similarity(query, memory)
+    s_component = _component_similarity(query, memory)
+    s_timing = _timing_similarity(query, memory)
+    total = (
+        0.20 * s_risk
+        + 0.20 * s_trend
+        + 0.15 * s_multi
+        + 0.15 * s_sensor
+        + 0.20 * s_component
+        + 0.10 * s_timing
+    )
+    return {
+        "total": total,
+        "risk": s_risk,
+        "trend": s_trend,
+        "multi_score": s_multi,
+        "sensor": s_sensor,
+        "component": s_component,
+        "timing": s_timing,
+    }
+
+
+def _risk_similarity(query: dict[str, Any], memory: dict[str, Any]) -> float:
+    if query.get("unit_past_context_reliable"):
+        return _mean(
+            [
+                _numeric_sim(query.get("peak_score"), memory.get("peak_score"), 1.0),
+                _numeric_sim(query.get("final_score"), memory.get("final_score"), 1.0),
+                _numeric_sim(query.get("peak_minus_unit_q95"), memory.get("peak_minus_unit_q95"), 1.0),
+                _numeric_sim(query.get("peak_minus_unit_q99"), memory.get("peak_minus_unit_q99"), 1.0),
+            ]
+        )
+    return _mean(
+        [
+            _numeric_sim(query.get("peak_score"), memory.get("peak_score"), 1.0),
+            _numeric_sim(query.get("final_score"), memory.get("final_score"), 1.0),
+        ]
+    )
+
+
+def _trend_similarity(query: dict[str, Any], memory: dict[str, Any]) -> float:
+    return _mean(
+        [
+            _numeric_sim(query.get("slope"), memory.get("slope"), 0.05),
+            _numeric_sim(query.get("delta_score"), memory.get("delta_score"), 1.0),
+            _numeric_sim(query.get("monotonicity"), memory.get("monotonicity"), 0.5),
+            _numeric_sim(query.get("volatility"), memory.get("volatility"), 0.1),
+            _numeric_sim(query.get("duration_above_unit_q95"), memory.get("duration_above_unit_q95"), 20.0),
+            _numeric_sim(query.get("duration_above_unit_q99"), memory.get("duration_above_unit_q99"), 20.0),
+            _numeric_sim(query.get("area_above_unit_q95"), memory.get("area_above_unit_q95"), 10.0),
+            _numeric_sim(query.get("area_above_unit_q99"), memory.get("area_above_unit_q99"), 10.0),
+        ]
+    )
+
+
+def _multi_score_similarity(query: dict[str, Any], memory: dict[str, Any]) -> float:
+    consistency = 1.0 if query.get("d_rmse_lhi_consistency") == memory.get("d_rmse_lhi_consistency") else 0.0
+    return _mean(
+        [
+            _numeric_sim(query.get("peak_lhi"), memory.get("peak_lhi"), 1.0),
+            _numeric_sim(query.get("peak_d_rmse"), memory.get("peak_d_rmse"), 0.2),
+            _numeric_sim(query.get("lhi_slope"), memory.get("lhi_slope"), 0.05),
+            _numeric_sim(query.get("d_rmse_slope"), memory.get("d_rmse_slope"), 0.02),
+            consistency,
+        ]
+    )
+
+
+def _sensor_similarity(query: dict[str, Any], memory: dict[str, Any]) -> float:
+    return _mean(
+        [
+            _jaccard(_as_sensor_set(query.get("dominant_top_sensors", [])), _as_sensor_set(memory.get("dominant_top_sensors", []))),
+            _jaccard(
+                _as_sensor_set(query.get("top_sensor_at_peak_cycle", [])),
+                _as_sensor_set(memory.get("top_sensor_at_peak_cycle", [])),
+            ),
+            _numeric_sim(query.get("hpc_sensor_presence_ratio"), memory.get("hpc_sensor_presence_ratio"), 0.5),
+            _numeric_sim(query.get("fan_sensor_presence_ratio"), memory.get("fan_sensor_presence_ratio"), 0.5),
+            _numeric_sim(query.get("conflict_sensor_presence_ratio"), memory.get("conflict_sensor_presence_ratio"), 0.5),
+            _numeric_sim(query.get("sensor_pattern_stability"), memory.get("sensor_pattern_stability"), 0.5),
+        ]
+    )
+
+
+def _component_similarity(query: dict[str, Any], memory: dict[str, Any]) -> float:
+    dominant_match = 1.0 if query.get("dominant_component") and query.get("dominant_component") == memory.get("dominant_component") else 0.0
+    return _mean(
+        [
+            _numeric_sim(query.get("hpc_path_score"), memory.get("hpc_path_score"), 0.4),
+            _numeric_sim(query.get("fan_path_score"), memory.get("fan_path_score"), 0.4),
+            _numeric_sim(query.get("uncertain_path_score"), memory.get("uncertain_path_score"), 0.4),
+            _numeric_sim(query.get("component_conflict_score"), memory.get("component_conflict_score"), 0.5),
+            _numeric_sim(query.get("dominance_margin"), memory.get("dominance_margin"), 0.4),
+            dominant_match,
+        ]
+    )
+
+
+def _timing_similarity(query: dict[str, Any], memory: dict[str, Any]) -> float:
+    return _mean(
+        [
+            _numeric_sim(query.get("action_to_peak_gap"), memory.get("action_to_peak_gap"), 20.0),
+            _numeric_sim(query.get("action_to_persistence_gap"), memory.get("action_to_persistence_gap"), 20.0),
+            _numeric_sim(query.get("action_to_warning_gap"), memory.get("action_to_warning_gap"), 20.0),
+        ]
+    )
+
+
+def _numeric_sim(left: Any, right: Any, scale: float) -> float:
+    left = _to_float(left)
+    right = _to_float(right)
+    if left is None or right is None:
+        return 0.0
+    return math.exp(-abs(left - right) / max(scale, 1e-9))
+
+
+def _mean(values: list[float]) -> float:
+    values = [float(value) for value in values if value is not None]
+    return sum(values) / len(values) if values else 0.0
+
+
+def _helpfulness_bonus(query: dict[str, Any], memory: dict[str, Any], compact: dict[str, Any]) -> float:
+    bonus = 0.0
+    if query.get("candidate_action") and compact.get("then_revise_action_type") == query.get("candidate_action"):
+        bonus += 0.05
+    if query.get("dominant_component") and query.get("dominant_component") == memory.get("dominant_component"):
+        bonus += 0.05
+    if compact.get("feedback_label") in {"correct_maintenance", "missed_HPC_maintenance", "missed_fan_maintenance"}:
+        bonus += 0.05
+    return bonus
+
+
+def _balanced_topk(rows: list[dict[str, Any]], max_rules: int) -> list[dict[str, Any]]:
+    by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_label[str(row.get("feedback_label", "unknown"))].append(row)
+    selected: list[dict[str, Any]] = []
+    for label in ["correct_maintenance", "too_early", "missed_HPC_maintenance", "missed_fan_maintenance", "over_maintenance", "wrong_component"]:
+        selected.extend(by_label.get(label, [])[:2])
+    if len(selected) < max_rules:
+        used = {str(item.get("rule_id")) for item in selected}
+        for row in rows:
+            if str(row.get("rule_id")) not in used:
+                selected.append(row)
+            if len(selected) >= max_rules:
+                break
+    return selected[:max_rules]
 
 
 def _peak_similarity(query: dict[str, float | None], row: dict[str, float | None]) -> float:
@@ -394,9 +696,27 @@ def _compact_reflection_row(row: dict[str, Any]) -> dict[str, Any]:
         "feedback_label",
         "feedback_reason",
         "peak_score",
+        "final_score",
+        "unit_past_q95",
+        "unit_past_q99",
+        "peak_minus_unit_q95",
+        "peak_minus_unit_q99",
         "peak_score_cycle",
         "score_at_action_time",
         "score_trend",
+        "slope",
+        "delta_score",
+        "monotonicity",
+        "volatility",
+        "duration_above_unit_q95",
+        "duration_above_unit_q99",
+        "area_above_unit_q95",
+        "area_above_unit_q99",
+        "peak_lhi",
+        "peak_d_rmse",
+        "lhi_slope",
+        "d_rmse_slope",
+        "d_rmse_lhi_consistency",
         "first_warning_crossing_cycle",
         "first_critical_crossing_cycle",
         "persistent_high_risk_duration",
@@ -407,7 +727,17 @@ def _compact_reflection_row(row: dict[str, Any]) -> dict[str, Any]:
         "dominant_top_sensors",
         "top_sensor_at_action_time",
         "top_sensor_at_peak_cycle",
+        "sensor_pattern_stability",
+        "hpc_sensor_presence_ratio",
+        "fan_sensor_presence_ratio",
+        "conflict_sensor_presence_ratio",
         "component_evidence_strength",
+        "hpc_path_score",
+        "fan_path_score",
+        "uncertain_path_score",
+        "component_conflict_score",
+        "dominant_component",
+        "dominance_margin",
         "then_revise_action_type",
         "recommended_time_rule",
         "then_adjust_threshold",
@@ -421,10 +751,36 @@ def _parse_compact_value(key: str, value: Any) -> Any:
         return [item for item in str(value).split("|") if item]
     if key in {
         "peak_score",
+        "final_score",
+        "unit_past_q95",
+        "unit_past_q99",
+        "peak_minus_unit_q95",
+        "peak_minus_unit_q99",
         "score_at_action_time",
+        "slope",
+        "delta_score",
+        "monotonicity",
+        "volatility",
+        "duration_above_unit_q95",
+        "duration_above_unit_q99",
+        "area_above_unit_q95",
+        "area_above_unit_q99",
+        "peak_lhi",
+        "peak_d_rmse",
+        "lhi_slope",
+        "d_rmse_slope",
         "action_to_peak_gap",
         "action_to_warning_gap",
         "action_to_persistence_gap",
+        "sensor_pattern_stability",
+        "hpc_sensor_presence_ratio",
+        "fan_sensor_presence_ratio",
+        "conflict_sensor_presence_ratio",
+        "hpc_path_score",
+        "fan_path_score",
+        "uncertain_path_score",
+        "component_conflict_score",
+        "dominance_margin",
     }:
         return _to_float(value)
     if key == "persistent_high_risk_duration":

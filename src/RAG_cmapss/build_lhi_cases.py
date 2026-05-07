@@ -40,10 +40,19 @@ def main() -> None:
     count = 0
     cases_path = args.output_dir / "forecast_cases.jsonl"
     with cases_path.open("w") as f:
+        engine_windows_by_key: dict[tuple[str, int], list[pd.DataFrame]] = {}
         for _key, window in iter_lhi_windows(scores, fds=args.fds):
+            first = window.iloc[0]
+            engine_key = (str(first["fd"]), int(first["unit_id"]))
+            history = [
+                item
+                for item in engine_windows_by_key.get(engine_key, [])
+                if int(item.iloc[0]["cutoff_cycle"]) < int(first["cutoff_cycle"])
+            ]
             if args.lhi_trigger is not None:
                 peak_lhi = case_peak_lhi(window, args.lhi_col)
                 if not pd.notna(peak_lhi) or peak_lhi <= args.lhi_trigger:
+                    engine_windows_by_key.setdefault(engine_key, []).append(window)
                     continue
             case = build_forecast_case(
                 window=window,
@@ -53,7 +62,9 @@ def main() -> None:
                 lhi_col=args.lhi_col,
                 threshold_config=threshold_config,
                 window_detail_dir=window_dir,
+                engine_history=pd.concat(history, ignore_index=True) if history else pd.DataFrame(),
             )
+            engine_windows_by_key.setdefault(engine_key, []).append(window)
             f.write(json.dumps(case) + "\n")
             count += 1
             if args.limit is not None and count >= args.limit:

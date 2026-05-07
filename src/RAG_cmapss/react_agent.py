@@ -6,11 +6,13 @@ from typing import Any
 from .action_validator import validate_action
 from .action_validator import STRONG_FAN_SENSORS, STRONG_HPC_SENSORS
 from .graph_retriever import (
+    build_component_evidence_statistics,
     get_dataset_rules,
     infer_candidate_action,
     retrieve_action_paths,
     retrieve_sensor_paths,
 )
+from .evidence_gates import build_component_gate, build_reflection_gate, build_risk_gate
 from .kg_store import KGStore
 from .ollama_client import extract_json, ollama_chat
 from .prompt_builder import SYSTEM_PROMPT, build_prompt
@@ -46,17 +48,26 @@ def prepare_context(case: dict[str, Any], kg_dir: str, kg_store: KGStore) -> dic
         forecast_summary=forecast_summary,
         dataset_rules=dataset_rules,
     )
+    component_evidence_statistics = build_component_evidence_statistics(
+        sensor_paths,
+        sensor_evidence_statistics=case.get("sensor_evidence_statistics", {}),
+    )
     hypotheses = sorted({p["hypothesis"] for p in sensor_paths})
     action_paths = retrieve_action_paths(kg_store, hypotheses)
     candidate_action = infer_candidate_action(dataset_rules, sensor_paths, forecast_summary)
     reflection_rules = retrieve_multi_action_reflections(
         kg_dir=kg_dir,
         dataset_subset=dataset_subset,
+        case=case,
+        component_evidence_statistics=component_evidence_statistics,
         forecast_summary=forecast_summary,
         sensor_paths=sensor_paths,
         dataset_rules=dataset_rules,
         candidate_action=candidate_action,
     )
+    risk_gate = build_risk_gate(case, reflection_rules=reflection_rules)
+    component_gate = build_component_gate(component_evidence_statistics, dataset_rules)
+    reflection_gate = build_reflection_gate(reflection_rules)
     return {
         "case": case,
         "dataset_rules": dataset_rules,
@@ -64,12 +75,18 @@ def prepare_context(case: dict[str, Any], kg_dir: str, kg_store: KGStore) -> dic
         "action_paths": action_paths,
         "candidate_action": candidate_action,
         "reflection_rules": reflection_rules,
+        "component_evidence_statistics": component_evidence_statistics,
+        "risk_gate": risk_gate,
+        "component_gate": component_gate,
+        "reflection_gate": reflection_gate,
     }
 
 
 def retrieve_multi_action_reflections(
     kg_dir: str,
     dataset_subset: str,
+    case: dict[str, Any],
+    component_evidence_statistics: dict[str, Any],
     forecast_summary: dict[str, Any],
     sensor_paths: list[dict[str, Any]],
     dataset_rules: dict[str, Any],
@@ -84,7 +101,9 @@ def retrieve_multi_action_reflections(
             dataset_subset=dataset_subset,
             forecast_summary=forecast_summary,
             candidate_action=query_action,
-            max_rules=max_rules,
+            max_rules=50,
+            case=case,
+            component_stats=component_evidence_statistics,
         )
         for row in rows:
             row = dict(row)
@@ -94,9 +113,25 @@ def retrieve_multi_action_reflections(
                 combined[key].get("retrieval_similarity", 0.0)
             ):
                 combined[key] = row
-    return sorted(combined.values(), key=lambda item: float(item.get("retrieval_similarity", 0.0)), reverse=True)[
-        :max_rules
-    ]
+    return _label_balanced_reflections(list(combined.values()), max_rules=max_rules)
+
+
+def _label_balanced_reflections(rows: list[dict[str, Any]], max_rules: int) -> list[dict[str, Any]]:
+    preferred = ["correct_maintenance", "too_early", "missed_HPC_maintenance", "missed_fan_maintenance", "over_maintenance"]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in sorted(rows, key=lambda item: float(item.get("retrieval_similarity", 0.0)), reverse=True):
+        grouped.setdefault(str(row.get("feedback_label")), []).append(row)
+    selected: list[dict[str, Any]] = []
+    for label in preferred:
+        selected.extend(grouped.get(label, [])[:2])
+    if len(selected) < max_rules:
+        selected_ids = {str(item.get("rule_id")) for item in selected}
+        for row in sorted(rows, key=lambda item: float(item.get("retrieval_similarity", 0.0)), reverse=True):
+            if str(row.get("rule_id")) not in selected_ids:
+                selected.append(row)
+            if len(selected) >= max_rules:
+                break
+    return selected[:max_rules]
 
 
 def _reflection_query_actions(
@@ -107,18 +142,14 @@ def _reflection_query_actions(
 ) -> list[str]:
     actions = [candidate_action]
     allowed = set(dataset_rules.get("allowed_actions", []))
-    peak = _to_float(forecast_summary.get("peak_score")) or 0.0
-    persistent = int(_to_float(forecast_summary.get("persistent_high_risk_duration")) or 0)
-    high_persistent_risk = peak >= 2.0 and persistent >= 5
-    if high_persistent_risk:
-        if "schedule_HPC_maintenance" in allowed and _has_strong_evidence(
-            sensor_paths, "HPC_related_degradation", STRONG_HPC_SENSORS
-        ):
-            actions.append("schedule_HPC_maintenance")
-        if "schedule_fan_maintenance" in allowed and _has_strong_evidence(
-            sensor_paths, "Fan_related_degradation", STRONG_FAN_SENSORS
-        ):
-            actions.append("schedule_fan_maintenance")
+    if "schedule_HPC_maintenance" in allowed and _has_strong_evidence(
+        sensor_paths, "HPC_related_degradation", STRONG_HPC_SENSORS
+    ):
+        actions.append("schedule_HPC_maintenance")
+    if "schedule_fan_maintenance" in allowed and _has_strong_evidence(
+        sensor_paths, "Fan_related_degradation", STRONG_FAN_SENSORS
+    ):
+        actions.append("schedule_fan_maintenance")
     return list(dict.fromkeys(actions))
 
 
@@ -141,6 +172,10 @@ def run_agent(
         sensor_paths=context["sensor_paths"],
         action_paths=context["action_paths"],
         reflection_rules=context["reflection_rules"],
+        component_evidence_statistics=context["component_evidence_statistics"],
+        risk_gate=context["risk_gate"],
+        component_gate=context["component_gate"],
+        reflection_gate=context["reflection_gate"],
     )
 
     llm_calls = 0
@@ -212,6 +247,7 @@ def run_agent(
         context["case"],
         context["dataset_rules"],
         context["sensor_paths"],
+        risk_gate=context["risk_gate"],
     )
 
     if not validation["valid"] and not dry_run and not llm_fallback_used:
@@ -252,7 +288,13 @@ Return only valid JSON.
                 repaired_action = extract_json(raw2)
                 repair_entry["parse_ok"] = True
                 action = repaired_action
-                validation = validate_action(action, context["case"], context["dataset_rules"], context["sensor_paths"])
+                validation = validate_action(
+                    action,
+                    context["case"],
+                    context["dataset_rules"],
+                    context["sensor_paths"],
+                    risk_gate=context["risk_gate"],
+                )
             except Exception as exc:
                 repair_entry["parse_ok"] = False
                 repair_entry["error"] = str(exc)
@@ -260,7 +302,13 @@ Return only valid JSON.
                 llm_fallback_used = True
                 action = rule_based_action(context)
                 action["reason"] = "Repair output was not parseable; used deterministic KG rule fallback."
-                validation = validate_action(action, context["case"], context["dataset_rules"], context["sensor_paths"])
+                validation = validate_action(
+                    action,
+                    context["case"],
+                    context["dataset_rules"],
+                    context["sensor_paths"],
+                    risk_gate=context["risk_gate"],
+                )
             raw_outputs.append(repair_entry)
         except Exception as exc:
             llm_errors.append(f"repair: {exc}")
@@ -268,7 +316,13 @@ Return only valid JSON.
             llm_fallback_used = True
             action = rule_based_action(context)
             action["reason"] = "Repair call failed; used deterministic KG rule fallback."
-            validation = validate_action(action, context["case"], context["dataset_rules"], context["sensor_paths"])
+            validation = validate_action(
+                action,
+                context["case"],
+                context["dataset_rules"],
+                context["sensor_paths"],
+                risk_gate=context["risk_gate"],
+            )
 
     action["validation"] = validation
     action["validation_status"] = "valid" if validation["valid"] else "invalid"
@@ -285,6 +339,10 @@ Return only valid JSON.
             "sensor_paths": context["sensor_paths"],
             "action_paths": context["action_paths"],
             "reflection_rules": context["reflection_rules"],
+            "component_evidence_statistics": context["component_evidence_statistics"],
+            "risk_gate": context["risk_gate"],
+            "component_gate": context["component_gate"],
+            "reflection_gate": context["reflection_gate"],
         },
         "llm_calls": llm_calls,
         "raw_outputs": raw_outputs,
@@ -338,6 +396,9 @@ def _minimal_json_prompt(context: dict[str, Any]) -> str:
             "first_warning_crossing_cycle": summary.get("first_warning_crossing_cycle"),
             "dominant_top_sensors": summary.get("dominant_top_sensors"),
         },
+        "risk_gate": context.get("risk_gate"),
+        "component_gate": context.get("component_gate"),
+        "reflection_gate": context.get("reflection_gate"),
         "dataset_rules": context["dataset_rules"],
         "top_evidence_paths": [p["path_text"] for p in context["sensor_paths"][:5]],
         "action_paths": [p["path_text"] for p in context["action_paths"][:4]],
@@ -363,6 +424,8 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     sensor_paths = context["sensor_paths"]
     path_hypotheses = {p["hypothesis"] for p in sensor_paths}
     disallowed = set(dataset_rules.get("disallowed_actions", []))
+    risk_gate = context.get("risk_gate", {})
+    component_gate = context.get("component_gate", {})
 
     if summary.get("first_critical_crossing_cycle"):
         risk = "critical_risk_hypothesis"
@@ -375,12 +438,21 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     degradation = "low_risk_hypothesis"
     strong_hpc = _has_strong_evidence(sensor_paths, "HPC_related_degradation", STRONG_HPC_SENSORS)
     strong_fan = _has_strong_evidence(sensor_paths, "Fan_related_degradation", STRONG_FAN_SENSORS)
-    if strong_hpc and "schedule_HPC_maintenance" not in disallowed:
-        action_type = "schedule_HPC_maintenance"
-        degradation = "HPC_related_degradation"
-    elif strong_fan and "schedule_fan_maintenance" not in disallowed:
-        action_type = "schedule_fan_maintenance"
-        degradation = "Fan_related_degradation"
+
+    if not risk_gate.get("maintenance_candidate", False):
+        action_type = "schedule_monitoring"
+        degradation = "uncertain_component_degradation"
+    elif component_gate.get("component_supported", False):
+        suggested = component_gate.get("suggested_component_action")
+        if suggested == "schedule_HPC_maintenance" and strong_hpc and suggested not in disallowed:
+            action_type = "schedule_HPC_maintenance"
+            degradation = "HPC_related_degradation"
+        elif suggested == "schedule_fan_maintenance" and strong_fan and suggested not in disallowed:
+            action_type = "schedule_fan_maintenance"
+            degradation = "Fan_related_degradation"
+        else:
+            action_type = "schedule_monitoring"
+            degradation = "uncertain_component_degradation"
     elif risk != "low_risk_hypothesis" or "uncertain_component_degradation" in path_hypotheses:
         action_type = "schedule_monitoring"
         degradation = "uncertain_component_degradation"
@@ -396,9 +468,9 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
         )
     else:
         action_time = (
-            summary.get("first_persistent_pattern_cycle")
+            summary.get("peak_score_cycle")
             or summary.get("first_critical_crossing_cycle")
-            or summary.get("peak_score_cycle")
+            or summary.get("first_persistent_pattern_cycle")
             or "t+1"
         )
 

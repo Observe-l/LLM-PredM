@@ -31,6 +31,7 @@ def validate_action(
     case: dict[str, Any],
     dataset_rules: dict[str, Any],
     sensor_paths: list[dict[str, Any]],
+    risk_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     action_type = action.get("action_type")
     action_time = action.get("action_time")
@@ -82,6 +83,8 @@ def validate_action(
             "uncertain_component_degradation",
         }:
             violations.append("critical_risk_hypothesis alone is insufficient to trigger fan/HPC maintenance")
+        if risk_gate and not risk_gate.get("maintenance_candidate", False):
+            violations.append("maintenance action lacks strong statistical risk-gate support")
 
     if "uncertain_component_degradation" in path_hypotheses and not path_hypotheses.intersection(
         {"HPC_related_degradation", "Fan_related_degradation"}

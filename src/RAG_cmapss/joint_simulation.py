@@ -68,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--ollama_url", default=DEFAULT_OLLAMA_URL)
     parser.add_argument("--temperature", type=float, default=0.1)
-    parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--ollama_num_predict", type=int, default=512)
     parser.add_argument(
         "--disable_ollama_json_format",
@@ -139,6 +139,7 @@ def main() -> None:
         state = EngineState(fd=str(fd_name), unit_id=int(unit_id), next_due_cutoff=None)
         last_case: dict[str, Any] | None = None
         last_action: dict[str, Any] | None = None
+        last_component_stats: dict[str, Any] | None = None
         terminal_reason = "breakdown"
 
         for window in engine_windows:
@@ -160,6 +161,7 @@ def main() -> None:
                 lhi_col=args.lhi_col,
                 threshold_config=threshold_config,
                 window_detail_dir=case_dir,
+                engine_history=engine_history_frame(engine_windows, cutoff),
             )
             forecast_cases.append(case)
 
@@ -194,6 +196,7 @@ def main() -> None:
             llm_call_count += int(result.get("llm_calls", 0)) if not args.dry_run else 1
             last_case = case
             last_action = action
+            last_component_stats = result.get("context", {}).get("component_evidence_statistics")
 
             if action_type in MAINTENANCE_ACTIONS:
                 feedback = maintenance_feedback(
@@ -202,7 +205,14 @@ def main() -> None:
                     engine_lifetimes=engine_lifetimes,
                     rul_threshold=args.maintenance_rul_threshold,
                 )
-                append_feedback_and_rule(feedback, case, action, feedback_logs, experiment_kg_dir)
+                append_feedback_and_rule(
+                    feedback,
+                    case,
+                    action,
+                    feedback_logs,
+                    experiment_kg_dir,
+                    component_stats=result.get("context", {}).get("component_evidence_statistics"),
+                )
                 write_json(feedback_log_path, feedback_logs)
                 terminal_reason = "maintenance_action"
                 break
@@ -226,11 +236,20 @@ def main() -> None:
                     lhi_col=args.lhi_col,
                     threshold_config=threshold_config,
                     window_detail_dir=case_dir,
+                    engine_history=engine_history_frame(engine_windows, int(last_window.iloc[0]["cutoff_cycle"])),
                 )
                 last_action = fallback_no_maintenance_action(last_case)
+                last_component_stats = None
             assert last_action is not None
             feedback = breakdown_feedback(last_case, last_action, engine_windows[-1], engine_lifetimes)
-            append_feedback_and_rule(feedback, last_case, last_action, feedback_logs, experiment_kg_dir)
+            append_feedback_and_rule(
+                feedback,
+                last_case,
+                last_action,
+                feedback_logs,
+                experiment_kg_dir,
+                component_stats=last_component_stats,
+            )
             write_json(feedback_log_path, feedback_logs)
 
         engine_summaries.append(
@@ -301,6 +320,13 @@ def group_engine_windows(scores: pd.DataFrame, fds: list[str] | None):
         current_windows.append(window)
     if current_key is not None:
         yield current_key, current_windows
+
+
+def engine_history_frame(engine_windows: list[pd.DataFrame], cutoff_cycle: int) -> pd.DataFrame:
+    history = [window for window in engine_windows if int(window.iloc[0]["cutoff_cycle"]) < int(cutoff_cycle)]
+    if not history:
+        return pd.DataFrame()
+    return pd.concat(history, ignore_index=True)
 
 
 def prepare_experiment_kg(
@@ -454,9 +480,10 @@ def append_feedback_and_rule(
     action: dict[str, Any],
     feedback_logs: list[dict[str, Any]],
     experiment_kg_dir: Path,
+    component_stats: dict[str, Any] | None = None,
 ) -> None:
     feedback_logs.append(feedback)
-    rule = feedback_to_rule(feedback, case, action)
+    rule = feedback_to_rule(feedback, case, action, component_stats=component_stats)
     if rule is not None:
         append_reflection_rule(experiment_kg_dir, rule)
 
