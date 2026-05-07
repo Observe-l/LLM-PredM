@@ -204,11 +204,9 @@ def resolve_time_rule(case: dict[str, Any], time_rule: str) -> str | None:
     if time_rule == "peak_score_cycle_minus_margin":
         return _offset_t_plus(summary.get("peak_score_cycle"), case, offset=-3)
     if time_rule == "first_persistent_pattern_cycle":
-        return _clamp_t_plus(summary.get("first_persistent_pattern_cycle"), case) or _clamp_t_plus(
-            summary.get("first_warning_crossing_cycle"), case
-        )
+        return _offset_t_plus(summary.get("peak_score_cycle"), case, offset=-3)
     if time_rule == "first_warning_crossing_cycle":
-        return _clamp_t_plus(summary.get("first_warning_crossing_cycle"), case)
+        return _clamp_t_plus(summary.get("peak_score_cycle"), case)
     if time_rule == "first_critical_crossing_cycle":
         return _clamp_t_plus(summary.get("first_critical_crossing_cycle"), case)
     return None

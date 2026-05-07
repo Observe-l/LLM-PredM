@@ -4,7 +4,9 @@ from collections import defaultdict
 from typing import Any
 
 
-POSITIVE_MAINTENANCE_LABELS = {"correct_maintenance", "missed_HPC_maintenance", "missed_fan_maintenance"}
+CORRECT_MAINTENANCE_LABELS = {"correct_maintenance"}
+MISSED_MAINTENANCE_LABELS = {"missed_HPC_maintenance", "missed_fan_maintenance"}
+POSITIVE_MAINTENANCE_LABELS = CORRECT_MAINTENANCE_LABELS | MISSED_MAINTENANCE_LABELS
 EARLY_MAINTENANCE_LABELS = {"too_early", "over_maintenance"}
 WARMUP_Q95_GAP_MIN = 0.35
 WARMUP_Q99_GAP_MIN = 0.25
@@ -109,18 +111,22 @@ def build_risk_gate(case: dict[str, Any], reflection_rules: list[dict[str, Any]]
 
 
 def _reflection_peak_calibration(current_peak: float | None, reflection_rules: list[dict[str, Any]]) -> dict[str, Any]:
-    positive_peaks: list[float] = []
+    correct_peaks: list[float] = []
+    missed_peaks: list[float] = []
     early_peaks: list[float] = []
     for item in reflection_rules:
         peak = _to_float(item.get("peak_score"))
         if peak is None:
             continue
         label = str(item.get("feedback_label", ""))
-        if label in POSITIVE_MAINTENANCE_LABELS:
-            positive_peaks.append(peak)
+        if label in CORRECT_MAINTENANCE_LABELS:
+            correct_peaks.append(peak)
+        elif label in MISSED_MAINTENANCE_LABELS:
+            missed_peaks.append(peak)
         elif label in EARLY_MAINTENANCE_LABELS:
             early_peaks.append(peak)
 
+    positive_peaks = _positive_values_with_weak_missed(correct_peaks, missed_peaks, early_peaks)
     positive_min = min(positive_peaks) if positive_peaks else None
     early_max = max(early_peaks) if early_peaks else None
     learned_min: float | None = None
@@ -159,6 +165,8 @@ def _reflection_peak_calibration(current_peak: float | None, reflection_rules: l
         "positive_peak_min": round(positive_min, 6) if positive_min is not None else None,
         "early_peak_max": round(early_max, 6) if early_max is not None else None,
         "positive_anchor_count": len(positive_peaks),
+        "correct_anchor_count": len(correct_peaks),
+        "missed_anchor_count": len(missed_peaks),
         "early_anchor_count": len(early_peaks),
     }
 
@@ -169,18 +177,22 @@ def _reflection_lower_bound_calibration(
     field: str,
     warmup_min: float,
 ) -> dict[str, Any]:
-    positive_values: list[float] = []
+    correct_values: list[float] = []
+    missed_values: list[float] = []
     early_values: list[float] = []
     for item in reflection_rules:
         value = _to_float(item.get(field))
         if value is None:
             continue
         label = str(item.get("feedback_label", ""))
-        if label in POSITIVE_MAINTENANCE_LABELS:
-            positive_values.append(value)
+        if label in CORRECT_MAINTENANCE_LABELS:
+            correct_values.append(value)
+        elif label in MISSED_MAINTENANCE_LABELS:
+            missed_values.append(value)
         elif label in EARLY_MAINTENANCE_LABELS:
             early_values.append(value)
 
+    positive_values = _positive_values_with_weak_missed(correct_values, missed_values, early_values)
     positive_min = min(positive_values) if positive_values else None
     early_max = max(early_values) if early_values else None
     learned_min = warmup_min
@@ -221,8 +233,26 @@ def _reflection_lower_bound_calibration(
         "positive_min": round(positive_min, 6) if positive_min is not None else None,
         "early_max": round(early_max, 6) if early_max is not None else None,
         "positive_anchor_count": len(positive_values),
+        "correct_anchor_count": len(correct_values),
+        "missed_anchor_count": len(missed_values),
         "early_anchor_count": len(early_values),
     }
+
+
+def _positive_values_with_weak_missed(
+    correct_values: list[float],
+    missed_values: list[float],
+    early_values: list[float],
+) -> list[float]:
+    if not missed_values:
+        return list(correct_values)
+    if not early_values:
+        return [*correct_values, *missed_values]
+    early_max = max(early_values)
+    compatible_missed = [value for value in missed_values if value >= early_max]
+    if correct_values or compatible_missed:
+        return [*correct_values, *compatible_missed]
+    return list(correct_values)
 
 
 def build_component_gate(component_stats: dict[str, Any], dataset_rules: dict[str, Any]) -> dict[str, Any]:

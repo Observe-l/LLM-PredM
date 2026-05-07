@@ -362,10 +362,6 @@ def _maintenance_still_supported(features: dict[str, Any], action_type: str) -> 
 
 
 def _missed_time_rule(features: dict[str, Any]) -> str:
-    if features.get("first_persistent_pattern_cycle"):
-        return "first_persistent_pattern_cycle"
-    if features.get("first_warning_crossing_cycle"):
-        return "first_warning_crossing_cycle"
     return "peak_score_cycle_minus_margin"
 
 

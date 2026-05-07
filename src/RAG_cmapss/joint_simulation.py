@@ -101,7 +101,6 @@ def main() -> None:
     )
 
     scores, top_drift = load_lhi_frames(args.lhi_dir, load_top_drift_detail=args.load_top_drift_detail)
-    engine_lifetimes = load_engine_lifetimes(args.data_dir, args.eval_split)
     threshold_config = load_threshold_config(args.threshold_config)
     kg = KGStore(experiment_kg_dir)
 
@@ -202,8 +201,8 @@ def main() -> None:
                 feedback = maintenance_feedback(
                     case=case,
                     action=action,
-                    engine_lifetimes=engine_lifetimes,
                     rul_threshold=args.maintenance_rul_threshold,
+                    failure_cycle=engine_failure_cycle(engine_windows),
                 )
                 append_feedback_and_rule(
                     feedback,
@@ -241,7 +240,7 @@ def main() -> None:
                 last_action = fallback_no_maintenance_action(last_case)
                 last_component_stats = None
             assert last_action is not None
-            feedback = breakdown_feedback(last_case, last_action, engine_windows[-1], engine_lifetimes)
+            feedback = breakdown_feedback(last_case, last_action, engine_failure_cycle(engine_windows))
             append_feedback_and_rule(
                 feedback,
                 last_case,
@@ -329,6 +328,10 @@ def engine_history_frame(engine_windows: list[pd.DataFrame], cutoff_cycle: int) 
     return pd.concat(history, ignore_index=True)
 
 
+def engine_failure_cycle(engine_windows: list[pd.DataFrame]) -> int:
+    return max(int(window.iloc[0]["cutoff_cycle"]) for window in engine_windows) + 1
+
+
 def prepare_experiment_kg(
     source_kg_dir: Path,
     output_dir: Path,
@@ -389,18 +392,22 @@ def persist_progress(
 def maintenance_feedback(
     case: dict[str, Any],
     action: dict[str, Any],
-    engine_lifetimes: dict[tuple[str, int], int],
     rul_threshold: float,
+    failure_cycle: int,
 ) -> dict[str, Any]:
     fd_name = str(case["dataset_subset"])
     unit_id = int(case["unit_id"])
     action_abs_cycle = int(case["cutoff_cycle"]) + action_relative_cycle(action, default=0)
-    failure_cycle = engine_lifetimes.get((fd_name, unit_id))
-    remaining_rul = max(int(failure_cycle) - action_abs_cycle, 0) if failure_cycle is not None else None
+    remaining_rul = max(int(failure_cycle) - action_abs_cycle, 0)
     normalized_remaining_rul = (
-        float(remaining_rul) / float(failure_cycle) if failure_cycle and failure_cycle > 0 and remaining_rul is not None else None
+        float(remaining_rul) / float(failure_cycle) if failure_cycle and failure_cycle > 0 else None
     )
-    is_reasonable = normalized_remaining_rul is not None and normalized_remaining_rul < float(rul_threshold)
+    if normalized_remaining_rul is None:
+        raise ValueError(
+            f"Cannot compute maintenance feedback for {fd_name} unit {unit_id}: "
+            "missing failure cycle from engine lifetimes and fallback."
+        )
+    is_reasonable = normalized_remaining_rul < float(rul_threshold)
     feedback_label = "correct_maintenance" if is_reasonable else "too_early"
     return {
         "feedback_id": f"Feedback_{case['case_id']}_maintenance",
@@ -422,13 +429,11 @@ def maintenance_feedback(
 def breakdown_feedback(
     case: dict[str, Any],
     action: dict[str, Any],
-    last_window: pd.DataFrame,
-    engine_lifetimes: dict[tuple[str, int], int],
+    failure_cycle: int,
 ) -> dict[str, Any]:
     likely_component = likely_component_from_case(case)
     fd_name = str(case["dataset_subset"])
     unit_id = int(case["unit_id"])
-    failure_cycle = engine_lifetimes.get((fd_name, unit_id), int(last_window["cycle"].max()))
     label = {
         "HPC": "missed_HPC_maintenance",
         "FAN": "missed_fan_maintenance",
@@ -447,31 +452,6 @@ def breakdown_feedback(
         else "too_late",
         "likely_component": likely_component,
     }
-
-
-def load_engine_lifetimes(data_dir: Path, eval_split: str) -> dict[tuple[str, int], int]:
-    lifetimes: dict[tuple[str, int], int] = {}
-    for fd_dir in sorted(data_dir.glob("FD*")):
-        fd_name = fd_dir.name
-        split_path = fd_dir / f"{eval_split}_{fd_name}.txt"
-        if not split_path.exists():
-            continue
-        frame = pd.read_csv(split_path, sep=r"\s+", header=None, usecols=[0, 1], names=["unit_id", "cycle"])
-        observed_max = frame.groupby("unit_id", sort=True)["cycle"].max()
-        if eval_split == "test":
-            rul_path = fd_dir / f"RUL_{fd_name}.txt"
-            if rul_path.exists():
-                final_rul = pd.read_csv(rul_path, sep=r"\s+", header=None).iloc[:, 0].reset_index(drop=True)
-                for idx, (unit_id, max_cycle) in enumerate(observed_max.items()):
-                    extra = int(final_rul.iloc[idx]) if idx < len(final_rul) else 0
-                    lifetimes[(fd_name, int(unit_id))] = int(max_cycle) + extra
-            else:
-                for unit_id, max_cycle in observed_max.items():
-                    lifetimes[(fd_name, int(unit_id))] = int(max_cycle)
-        else:
-            for unit_id, max_cycle in observed_max.items():
-                lifetimes[(fd_name, int(unit_id))] = int(max_cycle)
-    return lifetimes
 
 
 def append_feedback_and_rule(
