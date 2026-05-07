@@ -166,25 +166,29 @@ def run_agent(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     context = prepare_context(case, kg_dir, kg_store)
-    prompt = build_prompt(
-        case=context["case"],
-        dataset_rules=context["dataset_rules"],
-        sensor_paths=context["sensor_paths"],
-        action_paths=context["action_paths"],
-        reflection_rules=context["reflection_rules"],
-        component_evidence_statistics=context["component_evidence_statistics"],
-        risk_gate=context["risk_gate"],
-        component_gate=context["component_gate"],
-        reflection_gate=context["reflection_gate"],
-    )
-
     llm_calls = 0
     llm_fallback_used = False
     llm_errors: list[str] = []
     if dry_run:
         action = rule_based_action(context)
         raw_outputs: list[dict[str, Any] | str] = ["<dry_run rule_based_action>"]
+    elif _hard_gate_blocks_llm(context):
+        action = rule_based_action(context)
+        action["hard_gate_used"] = True
+        action["reason"] = "Hard risk/component gate blocks maintenance; used deterministic KG monitoring."
+        raw_outputs = ["<hard_gate rule_based_action>"]
     else:
+        prompt = build_prompt(
+            case=context["case"],
+            dataset_rules=context["dataset_rules"],
+            sensor_paths=context["sensor_paths"],
+            action_paths=context["action_paths"],
+            reflection_rules=context["reflection_rules"],
+            component_evidence_statistics=context["component_evidence_statistics"],
+            risk_gate=context["risk_gate"],
+            component_gate=context["component_gate"],
+            reflection_gate=context["reflection_gate"],
+        )
         raw_outputs = []
         action = None
         for attempt in _llm_attempts(prompt, context, num_predict=num_predict, format_json=format_json):
@@ -251,6 +255,19 @@ def run_agent(
     )
 
     if not validation["valid"] and not dry_run and not llm_fallback_used:
+        local_action = _local_validation_repair(action, validation, context)
+        if local_action is not None:
+            action = local_action
+            action["local_validation_repair_used"] = True
+            validation = validate_action(
+                action,
+                context["case"],
+                context["dataset_rules"],
+                context["sensor_paths"],
+                risk_gate=context["risk_gate"],
+            )
+
+    if not validation["valid"] and not dry_run and not llm_fallback_used:
         repair_prompt = f"""The previous action is invalid.
 
 Previous action:
@@ -295,6 +312,19 @@ Return only valid JSON.
                     context["sensor_paths"],
                     risk_gate=context["risk_gate"],
                 )
+                if not validation["valid"]:
+                    repair_entry["post_repair_validation"] = validation
+                    llm_errors.append(f"repair_invalid: {validation['violations']}")
+                    llm_fallback_used = True
+                    action = rule_based_action(context)
+                    action["reason"] = "Repair output was still invalid; used deterministic KG rule fallback."
+                    validation = validate_action(
+                        action,
+                        context["case"],
+                        context["dataset_rules"],
+                        context["sensor_paths"],
+                        risk_gate=context["risk_gate"],
+                    )
             except Exception as exc:
                 repair_entry["parse_ok"] = False
                 repair_entry["error"] = str(exc)
@@ -323,6 +353,19 @@ Return only valid JSON.
                 context["sensor_paths"],
                 risk_gate=context["risk_gate"],
             )
+
+    if not validation["valid"]:
+        llm_errors.append(f"final_invalid: {validation['violations']}")
+        llm_fallback_used = True
+        action = rule_based_action(context)
+        action["reason"] = "Final action was invalid; used deterministic KG rule fallback."
+        validation = validate_action(
+            action,
+            context["case"],
+            context["dataset_rules"],
+            context["sensor_paths"],
+            risk_gate=context["risk_gate"],
+        )
 
     action["validation"] = validation
     action["validation_status"] = "valid" if validation["valid"] else "invalid"
@@ -381,6 +424,41 @@ def _llm_attempts(
             "num_predict": 384,
         },
     ]
+
+
+def _hard_gate_blocks_llm(context: dict[str, Any]) -> bool:
+    risk_gate = context.get("risk_gate", {})
+    if not risk_gate.get("maintenance_candidate", False):
+        return True
+    return False
+
+
+def _local_validation_repair(
+    action: dict[str, Any],
+    validation: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any] | None:
+    violations = list(validation.get("violations", []))
+    if action.get("action_type") == "schedule_monitoring" and violations == [
+        "schedule_monitoring must have non-null action_time"
+    ]:
+        repaired = dict(action)
+        repaired["action_time"] = rule_based_action(context)["action_time"]
+        repaired["reason"] = "Filled missing monitoring time from KG rule fallback."
+        return repaired
+
+    hard_gate_violations = {
+        "maintenance action lacks strong statistical risk-gate support",
+        "schedule_HPC_maintenance requires strong HPC sensor evidence from S7/S11/S3/S9/S14",
+        "schedule_fan_maintenance requires strong Fan sensor evidence from S8/S13/S15",
+    }
+    if action.get("action_type") in {"schedule_HPC_maintenance", "schedule_fan_maintenance"} and any(
+        item in hard_gate_violations for item in violations
+    ):
+        repaired = rule_based_action(context)
+        repaired["reason"] = "Maintenance violated hard validation gates; used deterministic KG fallback."
+        return repaired
+    return None
 
 
 def _minimal_json_prompt(context: dict[str, Any]) -> str:
@@ -460,19 +538,10 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     if action_type == "continue_normal_operation":
         action_time = None
     elif action_type == "schedule_monitoring":
-        action_time = (
-            summary.get("first_warning_crossing_cycle")
-            or summary.get("first_persistent_pattern_cycle")
-            or summary.get("peak_score_cycle")
-            or "t+1"
-        )
+        horizon = case.get("forecast_horizon", {})
+        action_time = f"t+{int(horizon.get('end', 20))}"
     else:
-        action_time = (
-            summary.get("peak_score_cycle")
-            or summary.get("first_critical_crossing_cycle")
-            or summary.get("first_persistent_pattern_cycle")
-            or "t+1"
-        )
+        action_time = _maintenance_action_time(context)
 
     return {
         "action_type": action_type,
@@ -491,6 +560,40 @@ def _confidence(sensor_paths: list[dict[str, Any]], hypothesis: str) -> float:
     if not scores:
         return 0.5
     return round(min(max(sum(scores[:3]) / min(len(scores), 3), 0.0), 1.0), 3)
+
+
+def _maintenance_action_time(context: dict[str, Any]) -> str:
+    case = context["case"]
+    summary = case["forecast_summary"]
+    peak_time = (
+        summary.get("peak_score_cycle")
+        or summary.get("first_critical_crossing_cycle")
+        or summary.get("first_persistent_pattern_cycle")
+        or "t+1"
+    )
+    labels = {str(item.get("feedback_label", "")) for item in context.get("reflection_rules", [])}
+    if labels.intersection({"missed_HPC_maintenance", "missed_fan_maintenance"}) and "too_early" not in labels:
+        return _offset_t_plus(peak_time, case, -3) or str(peak_time)
+    return str(peak_time)
+
+
+def _offset_t_plus(value: Any, case: dict[str, Any], offset: int) -> str | None:
+    number = _parse_t_plus_value(value)
+    if number is None:
+        return None
+    horizon = case.get("forecast_horizon", {})
+    start = int(horizon.get("start", 1))
+    end = int(horizon.get("end", number))
+    return f"t+{min(max(number + offset, start), end)}"
+
+
+def _parse_t_plus_value(value: Any) -> int | None:
+    if not isinstance(value, str) or not value.startswith("t+"):
+        return None
+    try:
+        return int(value[2:])
+    except ValueError:
+        return None
 
 
 def _has_strong_evidence(sensor_paths: list[dict[str, Any]], hypothesis: str, sensors: set[str]) -> bool:

@@ -11,6 +11,7 @@ EARLY_MAINTENANCE_LABELS = {"too_early", "over_maintenance"}
 WARMUP_Q95_GAP_MIN = 0.35
 WARMUP_Q99_GAP_MIN = 0.25
 WARMUP_DURATION_MIN = 10.0
+MIN_CORRECT_ONLY_ANCHORS = 3
 
 
 def build_risk_gate(case: dict[str, Any], reflection_rules: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -59,11 +60,14 @@ def build_risk_gate(case: dict[str, Any], reflection_rules: list[dict[str, Any]]
     strong_q99_excess = q99_gap_calibration["decision"] == "supports_maintenance"
     persistent_q95 = q95_duration_calibration["decision"] == "supports_maintenance"
     persistent_q99 = q99_duration_calibration["decision"] == "supports_maintenance"
+    learned_peak_support = calibration["decision"] == "supports_maintenance"
 
     if reliable and strong_q99_excess and persistent_q99 and increasing:
         level = "high_persistent"
     elif reliable and strong_q95_excess and persistent_q95 and increasing:
         level = "persistent_warning"
+    elif reliable and learned_peak_support and persistent_q95 and increasing and q95_gap is not None and q95_gap > 0:
+        level = "learned_peak_persistent"
     elif reliable and q95_gap is not None and q95_gap > 0:
         level = "transient_warning"
     elif not reliable and persistent_duration >= 10 and increasing:
@@ -73,7 +77,12 @@ def build_risk_gate(case: dict[str, Any], reflection_rules: list[dict[str, Any]]
     else:
         level = "low"
 
-    statistical_candidate = level in {"high_persistent", "persistent_warning", "high_persistent_uncalibrated"}
+    statistical_candidate = level in {
+        "high_persistent",
+        "persistent_warning",
+        "learned_peak_persistent",
+        "high_persistent_uncalibrated",
+    }
     reflection_allows = calibration["decision"] == "supports_maintenance"
     maintenance_candidate = bool(statistical_candidate and reflection_allows)
 
@@ -115,10 +124,10 @@ def _reflection_peak_calibration(current_peak: float | None, reflection_rules: l
     missed_peaks: list[float] = []
     early_peaks: list[float] = []
     for item in reflection_rules:
-        peak = _to_float(item.get("peak_score"))
+        label = str(item.get("feedback_label", ""))
+        peak = _reflection_peak_anchor_value(item, label)
         if peak is None:
             continue
-        label = str(item.get("feedback_label", ""))
         if label in CORRECT_MAINTENANCE_LABELS:
             correct_peaks.append(peak)
         elif label in MISSED_MAINTENANCE_LABELS:
@@ -127,24 +136,33 @@ def _reflection_peak_calibration(current_peak: float | None, reflection_rules: l
             early_peaks.append(peak)
 
     positive_peaks = _positive_values_with_weak_missed(correct_peaks, missed_peaks, early_peaks)
+    positive_boundary = _robust_lower_boundary(positive_peaks)
     positive_min = min(positive_peaks) if positive_peaks else None
     early_max = max(early_peaks) if early_peaks else None
     learned_min: float | None = None
     source = "cold_start_no_reflection"
     separability = "unknown"
 
-    if positive_min is not None and early_max is not None:
-        if early_max < positive_min:
-            learned_min = (early_max + positive_min) / 2.0
+    if positive_boundary is None:
+        learned_min = None
+    elif not missed_peaks and not early_peaks and len(correct_peaks) < MIN_CORRECT_ONLY_ANCHORS:
+        learned_min = None
+        source = "exploration_required_correct_only_memory"
+    elif early_max is not None:
+        if early_max < positive_boundary:
+            learned_min = (early_max + positive_boundary) / 2.0
             source = "midpoint_between_early_max_and_positive_min"
             separability = "separable"
         else:
-            learned_min = positive_min
-            source = "overlap_use_positive_min"
+            learned_min = max(positive_boundary, _median(positive_peaks))
+            source = "overlap_use_robust_positive_boundary"
             separability = "overlap"
-    elif positive_min is not None:
-        learned_min = positive_min
-        source = "positive_anchor_min"
+    elif positive_boundary is not None:
+        learned_min = positive_boundary
+        if missed_peaks and not correct_peaks:
+            source = "missed_anchor_boundary"
+        else:
+            source = "robust_positive_anchor_boundary"
     elif early_max is not None:
         learned_min = early_max
         source = "above_early_anchor_max"
@@ -163,6 +181,7 @@ def _reflection_peak_calibration(current_peak: float | None, reflection_rules: l
         "separability": separability,
         "current_peak_score": current_peak,
         "positive_peak_min": round(positive_min, 6) if positive_min is not None else None,
+        "positive_peak_boundary": round(positive_boundary, 6) if positive_boundary is not None else None,
         "early_peak_max": round(early_max, 6) if early_max is not None else None,
         "positive_anchor_count": len(positive_peaks),
         "correct_anchor_count": len(correct_peaks),
@@ -193,24 +212,32 @@ def _reflection_lower_bound_calibration(
             early_values.append(value)
 
     positive_values = _positive_values_with_weak_missed(correct_values, missed_values, early_values)
+    positive_boundary = _robust_lower_boundary(positive_values)
     positive_min = min(positive_values) if positive_values else None
     early_max = max(early_values) if early_values else None
     learned_min = warmup_min
     source = "warmup_prior"
     separability = "unknown"
 
-    if positive_min is not None and early_max is not None:
-        if early_max < positive_min:
-            learned_min = (early_max + positive_min) / 2.0
+    if positive_boundary is not None and not missed_values and not early_values and len(correct_values) < MIN_CORRECT_ONLY_ANCHORS:
+        learned_min = warmup_min
+        source = "exploration_required_correct_only_memory_with_warmup_prior"
+    elif positive_boundary is not None and early_max is not None:
+        if early_max < positive_boundary:
+            learned_min = (early_max + positive_boundary) / 2.0
             source = "midpoint_between_early_max_and_positive_min"
             separability = "separable"
         else:
-            learned_min = positive_min
-            source = "overlap_use_positive_min"
+            learned_min = max(positive_boundary, _median(positive_values))
+            source = "overlap_use_robust_positive_boundary"
             separability = "overlap"
-    elif positive_min is not None:
-        learned_min = min(warmup_min, positive_min)
-        source = "positive_anchor_min_with_warmup_prior"
+    elif positive_boundary is not None:
+        if missed_values and not correct_values:
+            learned_min = min(warmup_min, positive_boundary)
+            source = "missed_anchor_boundary_with_warmup_prior"
+        else:
+            learned_min = min(warmup_min, positive_boundary)
+            source = "robust_positive_anchor_boundary_with_warmup_prior"
     elif early_max is not None:
         learned_min = max(warmup_min, early_max)
         source = "above_early_anchor_max_with_warmup_prior"
@@ -231,6 +258,7 @@ def _reflection_lower_bound_calibration(
         "boundary_source": source,
         "separability": separability,
         "positive_min": round(positive_min, 6) if positive_min is not None else None,
+        "positive_boundary": round(positive_boundary, 6) if positive_boundary is not None else None,
         "early_max": round(early_max, 6) if early_max is not None else None,
         "positive_anchor_count": len(positive_values),
         "correct_anchor_count": len(correct_values),
@@ -253,6 +281,50 @@ def _positive_values_with_weak_missed(
     if correct_values or compatible_missed:
         return [*correct_values, *compatible_missed]
     return list(correct_values)
+
+
+def _reflection_peak_anchor_value(item: dict[str, Any], label: str) -> float | None:
+    peak = _to_float(item.get("peak_score"))
+    if peak is None:
+        return None
+    action_score = _to_float(item.get("score_at_action_time"))
+    if label in CORRECT_MAINTENANCE_LABELS and action_score is not None:
+        return action_score
+    if label in EARLY_MAINTENANCE_LABELS and action_score is not None:
+        return action_score
+    if label in MISSED_MAINTENANCE_LABELS:
+        q95_gap = max(_to_float(item.get("peak_minus_unit_q95")) or 0.0, 0.0)
+        q99_gap = max(_to_float(item.get("peak_minus_unit_q99")) or 0.0, 0.0)
+        lower_margin = max(q95_gap, q99_gap)
+        if lower_margin > 0:
+            return peak - lower_margin
+    return peak
+
+
+def _robust_lower_boundary(values: list[float]) -> float | None:
+    values = sorted(float(value) for value in values if value is not None)
+    if not values:
+        return None
+    if len(values) < 3:
+        return values[0]
+    return _quantile(values, 0.25)
+
+
+def _median(values: list[float]) -> float:
+    return _quantile(sorted(float(value) for value in values), 0.5)
+
+
+def _quantile(values: list[float], q: float) -> float:
+    if not values:
+        raise ValueError("quantile requires at least one value")
+    values = sorted(values)
+    if len(values) == 1:
+        return values[0]
+    pos = (len(values) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(values) - 1)
+    frac = pos - lo
+    return values[lo] * (1.0 - frac) + values[hi] * frac
 
 
 def build_component_gate(component_stats: dict[str, Any], dataset_rules: dict[str, Any]) -> dict[str, Any]:

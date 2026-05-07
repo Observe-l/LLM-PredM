@@ -18,11 +18,11 @@ Hard constraints:
 - schedule_monitoring, schedule_fan_maintenance, and schedule_HPC_maintenance must have action_time as a string like "t+20" within the forecast horizon.
 - schedule_fan_maintenance requires retrieved evidence supporting Fan_related_degradation.
 - schedule_HPC_maintenance requires retrieved evidence supporting HPC_related_degradation.
-- If component evidence is uncertain or conflicting, choose schedule_monitoring.
+- If component evidence is uncertain and no strong sensor evidence supports a maintainable component, choose schedule_monitoring.
 - If risk_gate.maintenance_candidate is false, do not choose schedule_fan_maintenance or schedule_HPC_maintenance.
 - A high or critical score alone is insufficient to trigger fan/HPC maintenance.
 - Reflection memory is auxiliary evidence; do not follow historical feedback blindly.
-- Maintenance requires persistent statistical risk, supported component evidence, and no stronger conflicting evidence.
+- Maintenance requires persistent statistical risk, strong component evidence, and no stronger conflicting evidence.
 - Absolute peak-score cutoffs must come from reflection_peak_calibration, not from fixed dataset constants.
 - Historical feedback contains forecast-state features only; do not infer or mention hidden RUL.
 - In evidence_paths, return only evidence IDs such as ["E1", "E3"], not full path text.

@@ -20,7 +20,7 @@ def action_decision_record(result: dict[str, Any]) -> dict[str, Any]:
 def recent_ollama_records(result: dict[str, Any], case: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for idx, raw in enumerate(result.get("raw_outputs", [])):
-        if raw == "<dry_run rule_based_action>":
+        if isinstance(raw, str) and raw in {"<dry_run rule_based_action>", "<hard_gate rule_based_action>"}:
             continue
 
         if isinstance(raw, dict):
