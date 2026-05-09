@@ -23,6 +23,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--dry_run", action="store_true", help="Skip Ollama and use deterministic rule-based actions.")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--risk_model_path", type=Path, default=None)
+    parser.add_argument("--risk_theta_low", type=float, default=0.4)
+    parser.add_argument("--risk_theta_conf", type=float, default=0.3)
     return parser.parse_args()
 
 
@@ -50,6 +53,9 @@ def main() -> None:
             temperature=args.temperature,
             timeout=args.timeout,
             dry_run=args.dry_run,
+            risk_model_path=str(args.risk_model_path) if args.risk_model_path else None,
+            risk_theta_low=args.risk_theta_low,
+            risk_theta_conf=args.risk_theta_conf,
         )
         result["case_path"] = str(case_path)
         result["latency_sec"] = round(time.time() - started, 3)
@@ -87,4 +93,3 @@ def summarize_results(results: list[dict]) -> dict:
 
 if __name__ == "__main__":
     main()
-

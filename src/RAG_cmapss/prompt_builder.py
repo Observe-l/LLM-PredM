@@ -19,11 +19,10 @@ Hard constraints:
 - schedule_fan_maintenance requires retrieved evidence supporting Fan_related_degradation.
 - schedule_HPC_maintenance requires retrieved evidence supporting HPC_related_degradation.
 - If component evidence is uncertain and no strong sensor evidence supports a maintainable component, choose schedule_monitoring.
-- If risk_gate.maintenance_candidate is false, do not choose schedule_fan_maintenance or schedule_HPC_maintenance.
+- The active risk tool (LightGBMRiskTool or LLMPolicyRiskTool) is the risk perception tool. Use it to decide whether the case is normal, early warning, maintenance window, or late/missed.
 - A high or critical score alone is insufficient to trigger fan/HPC maintenance.
-- Reflection memory is auxiliary evidence; do not follow historical feedback blindly.
-- Maintenance requires persistent statistical risk, strong component evidence, and no stronger conflicting evidence.
-- Absolute peak-score cutoffs must come from reflection_peak_calibration, not from fixed dataset constants.
+- Reflection memory is not action evidence. It is used only to train/update LightGBM tools after feedback.
+- Maintenance requires learned risk support, strong component evidence, and no stronger conflicting evidence.
 - Historical feedback contains forecast-state features only; do not infer or mention hidden RUL.
 - In evidence_paths, return only evidence IDs such as ["E1", "E3"], not full path text.
 - Keep reason under 30 words.
@@ -36,11 +35,10 @@ def build_prompt(
     dataset_rules: dict[str, Any],
     sensor_paths: list[dict[str, Any]],
     action_paths: list[dict[str, Any]],
-    reflection_rules: list[dict[str, Any]],
     component_evidence_statistics: dict[str, Any],
     risk_gate: dict[str, Any],
     component_gate: dict[str, Any],
-    reflection_gate: dict[str, Any],
+    lightgbm_risk: dict[str, Any] | None = None,
 ) -> str:
     top_sensor_paths = [
         {
@@ -65,7 +63,6 @@ def build_prompt(
     ]
     risk_profile = build_risk_profile(case)
     trend_profile = build_trend_profile(case)
-    timing_guidance = build_reflection_timing_guidance(case, reflection_rules)
     return f"""Forecast case:
 {json.dumps({"case_id": case.get("case_id"), "forecast_horizon": case.get("forecast_horizon")}, indent=2)}
 
@@ -82,19 +79,16 @@ Component evidence profile:
 {json.dumps(component_evidence_statistics, indent=2)}
 
 Decision gates:
-{json.dumps({"risk_gate": risk_gate, "component_gate": component_gate, "reflection_gate": reflection_gate}, indent=2)}
+{json.dumps({"risk_gate": compact_risk_gate(risk_gate), "component_gate": component_gate}, indent=2)}
+
+Active risk-tool evidence:
+{json.dumps(lightgbm_risk or {}, indent=2)}
 
 Top graph evidence paths:
 {json.dumps(top_sensor_paths, indent=2)}
 
 Retrieved action paths:
 {json.dumps(action_path_texts, indent=2)}
-
-Label-balanced reflection anchors:
-{json.dumps(compact_reflection_anchors(reflection_rules), indent=2)}
-
-Reflection timing guidance:
-{json.dumps(timing_guidance, indent=2)}
 
 Choose exactly one action and return JSON with this schema:
 {{
@@ -112,16 +106,13 @@ Important:
 - evidence_paths must contain only evidence IDs, not full path strings.
 - action_time must be null or a string like "t+20", never a bare number.
 - The action_type must agree with the reason: if the reason says maintenance is required, choose the corresponding maintenance action rather than schedule_monitoring.
-- Use risk_gate and component_gate as primary evidence.
-- risk_gate.statistical_candidate is the online statistical signal; risk_gate.reflection_peak_calibration is the learned peak-score boundary from retrieved reflection memory.
-- q95/q99 gap and persistence duration thresholds are calibrated by reflection memory with warm-up priors; use the reported calibration decisions rather than fixed score constants.
-- Use reflection_gate and reflection anchors only as auxiliary calibration; do not copy suggested actions blindly.
-- Use recommended_time_rule only after choosing the action type, as guidance for action_time.
-- If top reflection timing guidance has a concrete suggested_action_time, use it unless it conflicts with hard constraints.
-- For maintenance actions without concrete reflection timing, use peak_score_cycle; do not schedule maintenance at first_persistent_pattern_cycle.
-- If risk_gate.maintenance_candidate is false, schedule_fan_maintenance and schedule_HPC_maintenance are invalid; choose schedule_monitoring.
-- If reflection_peak_calibration has no learned_peak_score_min, treat this as cold start and choose schedule_monitoring.
-- If risk_gate.maintenance_candidate is true and component_gate.component_supported is true, choose the supported maintenance action unless reflection_gate shows stronger too_early evidence.
+- Use Graph RAG paths and component_gate to choose the degradation hypothesis.
+- Use the active risk tool as the primary risk-stage evidence.
+- If the risk tool says normal or monitor_without_llm, choose schedule_monitoring or continue_normal_operation.
+- If the risk tool says maintenance_window or late_or_missed and component_gate.component_supported is true, choose the supported maintenance action.
+- Use risk_gate only as a transparent statistical diagnostic, not as reflection memory.
+- Do not use reflection anchors, historical feedback, or hidden RUL in action reasoning.
+- For maintenance timing, use peak_score_cycle unless it conflicts with the forecast horizon.
 """
 
 
@@ -165,86 +156,19 @@ def build_trend_profile(case: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def compact_reflection_anchors(reflection_rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "feedback_label": item.get("feedback_label"),
-            "peak_score": item.get("peak_score"),
-            "retrieval_similarity": item.get("retrieval_similarity"),
-            "peak_similarity": item.get("peak_similarity"),
-            "suggested_action_type": item.get("then_revise_action_type"),
-            "recommended_time_rule": item.get("recommended_time_rule"),
-        }
-        for item in reflection_rules[:5]
+def compact_risk_gate(risk_gate: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "risk_level",
+        "maintenance_candidate",
+        "unit_past_context_reliable",
+        "peak_score",
+        "peak_minus_unit_q95",
+        "peak_minus_unit_q99",
+        "duration_above_unit_q95",
+        "duration_above_unit_q99",
+        "slope",
+        "d_rmse_lhi_consistency",
+        "statistical_candidate",
+        "reason",
     ]
-
-
-def build_reflection_timing_guidance(case: dict[str, Any], reflection_rules: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    guidance: list[dict[str, Any]] = []
-    for item in reflection_rules[:5]:
-        time_rule = item.get("recommended_time_rule")
-        guidance.append(
-            {
-                "rule_id": item.get("rule_id"),
-                "feedback_label": item.get("feedback_label"),
-                "peak_score": item.get("peak_score"),
-                "then_revise_action_type": item.get("then_revise_action_type"),
-                "recommended_time_rule": time_rule,
-                "suggested_action_time": resolve_time_rule(case, str(time_rule or "")),
-                "time_rule_interpretation": time_rule_interpretation(str(time_rule or "")),
-            }
-        )
-    return guidance
-
-
-def resolve_time_rule(case: dict[str, Any], time_rule: str) -> str | None:
-    summary = case.get("forecast_summary", {})
-    if time_rule in {"schedule_monitoring_at_peak_cycle", "keep_similar_timing"}:
-        return _clamp_t_plus(summary.get("peak_score_cycle"), case)
-    if time_rule == "peak_score_cycle_minus_margin":
-        return _offset_t_plus(summary.get("peak_score_cycle"), case, offset=-3)
-    if time_rule == "first_persistent_pattern_cycle":
-        return _offset_t_plus(summary.get("peak_score_cycle"), case, offset=-3)
-    if time_rule == "first_warning_crossing_cycle":
-        return _clamp_t_plus(summary.get("peak_score_cycle"), case)
-    if time_rule == "first_critical_crossing_cycle":
-        return _clamp_t_plus(summary.get("first_critical_crossing_cycle"), case)
-    return None
-
-
-def time_rule_interpretation(time_rule: str) -> str:
-    meanings = {
-        "schedule_monitoring_at_peak_cycle": "monitor again near the forecasted peak score cycle",
-        "keep_similar_timing": "reuse timing from similar correct maintenance cases; use peak cycle when uncertain",
-        "peak_score_cycle_minus_margin": "schedule maintenance shortly before the peak score cycle",
-        "first_persistent_pattern_cycle": "schedule maintenance when persistent high-risk evidence first appears",
-        "first_warning_crossing_cycle": "schedule at the first warning crossing",
-        "first_critical_crossing_cycle": "schedule at the first critical crossing",
-    }
-    return meanings.get(time_rule, "")
-
-
-def _clamp_t_plus(value: Any, case: dict[str, Any]) -> str | None:
-    number = _parse_t_plus(value)
-    if number is None:
-        return None
-    horizon = case.get("forecast_horizon", {})
-    start = int(horizon.get("start", 1))
-    end = int(horizon.get("end", number))
-    return f"t+{min(max(number, start), end)}"
-
-
-def _offset_t_plus(value: Any, case: dict[str, Any], offset: int) -> str | None:
-    number = _parse_t_plus(value)
-    if number is None:
-        return None
-    return _clamp_t_plus(f"t+{number + offset}", case)
-
-
-def _parse_t_plus(value: Any) -> int | None:
-    if not isinstance(value, str) or not value.startswith("t+"):
-        return None
-    try:
-        return int(value[2:])
-    except ValueError:
-        return None
+    return {key: risk_gate.get(key) for key in keys if key in risk_gate}

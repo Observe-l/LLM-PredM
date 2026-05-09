@@ -32,6 +32,7 @@ def validate_action(
     dataset_rules: dict[str, Any],
     sensor_paths: list[dict[str, Any]],
     risk_gate: dict[str, Any] | None = None,
+    lightgbm_risk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     action_type = action.get("action_type")
     action_time = action.get("action_time")
@@ -83,8 +84,8 @@ def validate_action(
             "uncertain_component_degradation",
         }:
             violations.append("critical_risk_hypothesis alone is insufficient to trigger fan/HPC maintenance")
-        if risk_gate and not risk_gate.get("maintenance_candidate", False):
-            violations.append("maintenance action lacks strong statistical risk-gate support")
+        if risk_gate and not risk_gate.get("maintenance_candidate", False) and not _learned_risk_supports_maintenance(lightgbm_risk):
+            violations.append("maintenance action lacks LightGBM or statistical risk support")
 
     if "uncertain_component_degradation" in path_hypotheses and not path_hypotheses.intersection(
         {"HPC_related_degradation", "Fan_related_degradation"}
@@ -104,3 +105,24 @@ def _has_strong_sensor_evidence(
         str(path.get("hypothesis")) == hypothesis and str(path.get("sensor", "")).upper() in strong_sensors
         for path in sensor_paths
     )
+
+
+def _learned_risk_supports_maintenance(lightgbm_risk: dict[str, Any] | None) -> bool:
+    if not lightgbm_risk:
+        return False
+    score = _to_float(lightgbm_risk.get("maintenance_risk_score")) or 0.0
+    theta = _to_float(lightgbm_risk.get("theta_low")) or 0.4
+    stage = str(lightgbm_risk.get("predicted_risk_stage", ""))
+    decision = str(lightgbm_risk.get("risk_decision", ""))
+    return bool(
+        score >= max(theta, 0.60)
+        and decision in {"activate_llm_agent", "activate_llm_agent_uncertain"}
+        and stage in {"maintenance_window", "late_or_missed"}
+    )
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

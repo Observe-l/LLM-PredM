@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from .action_validator import validate_action
 from .action_validator import STRONG_FAN_SENSORS, STRONG_HPC_SENSORS
+from .agentic_controller import initial_risk_policy, llm_design_policy_tool
 from .graph_retriever import (
     build_component_evidence_statistics,
     get_dataset_rules,
@@ -12,11 +14,12 @@ from .graph_retriever import (
     retrieve_action_paths,
     retrieve_sensor_paths,
 )
-from .evidence_gates import build_component_gate, build_reflection_gate, build_risk_gate
+from .evidence_gates import build_component_gate, build_risk_gate
 from .kg_store import KGStore
+from .lightgbm_risk_tool import LightGBMRiskTool
+from .llm_policy_risk_tool import LLMPolicyRiskTool
 from .ollama_client import extract_json, ollama_chat
 from .prompt_builder import SYSTEM_PROMPT, build_prompt
-from .reflection_memory import retrieve_reflection_rules
 
 
 def normalize_case(case: dict[str, Any]) -> dict[str, Any]:
@@ -35,7 +38,12 @@ def normalize_case(case: dict[str, Any]) -> dict[str, Any]:
     return case
 
 
-def prepare_context(case: dict[str, Any], kg_dir: str, kg_store: KGStore) -> dict[str, Any]:
+def prepare_context(
+    case: dict[str, Any],
+    kg_dir: str,
+    kg_store: KGStore,
+    risk_threshold_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     case = normalize_case(case)
     dataset_subset = str(case["dataset_subset"])
     forecast_summary = case["forecast_summary"]
@@ -55,19 +63,9 @@ def prepare_context(case: dict[str, Any], kg_dir: str, kg_store: KGStore) -> dic
     hypotheses = sorted({p["hypothesis"] for p in sensor_paths})
     action_paths = retrieve_action_paths(kg_store, hypotheses)
     candidate_action = infer_candidate_action(dataset_rules, sensor_paths, forecast_summary)
-    reflection_rules = retrieve_multi_action_reflections(
-        kg_dir=kg_dir,
-        dataset_subset=dataset_subset,
-        case=case,
-        component_evidence_statistics=component_evidence_statistics,
-        forecast_summary=forecast_summary,
-        sensor_paths=sensor_paths,
-        dataset_rules=dataset_rules,
-        candidate_action=candidate_action,
-    )
-    risk_gate = build_risk_gate(case, reflection_rules=reflection_rules)
+    reflection_rules: list[dict[str, Any]] = []
+    risk_gate = build_risk_gate(case, reflection_rules=[], threshold_overrides=risk_threshold_overrides)
     component_gate = build_component_gate(component_evidence_statistics, dataset_rules)
-    reflection_gate = build_reflection_gate(reflection_rules)
     return {
         "case": case,
         "dataset_rules": dataset_rules,
@@ -78,79 +76,9 @@ def prepare_context(case: dict[str, Any], kg_dir: str, kg_store: KGStore) -> dic
         "component_evidence_statistics": component_evidence_statistics,
         "risk_gate": risk_gate,
         "component_gate": component_gate,
-        "reflection_gate": reflection_gate,
+        "reflection_memory_usage": "training_only",
+        "risk_threshold_overrides": risk_threshold_overrides or {},
     }
-
-
-def retrieve_multi_action_reflections(
-    kg_dir: str,
-    dataset_subset: str,
-    case: dict[str, Any],
-    component_evidence_statistics: dict[str, Any],
-    forecast_summary: dict[str, Any],
-    sensor_paths: list[dict[str, Any]],
-    dataset_rules: dict[str, Any],
-    candidate_action: str,
-    max_rules: int = 5,
-) -> list[dict[str, Any]]:
-    query_actions = _reflection_query_actions(candidate_action, sensor_paths, dataset_rules, forecast_summary)
-    combined: dict[str, dict[str, Any]] = {}
-    for query_action in query_actions:
-        rows = retrieve_reflection_rules(
-            kg_dir=kg_dir,
-            dataset_subset=dataset_subset,
-            forecast_summary=forecast_summary,
-            candidate_action=query_action,
-            max_rules=50,
-            case=case,
-            component_stats=component_evidence_statistics,
-        )
-        for row in rows:
-            row = dict(row)
-            row["reflection_query_action"] = query_action
-            key = str(row.get("rule_id"))
-            if key not in combined or float(row.get("retrieval_similarity", 0.0)) > float(
-                combined[key].get("retrieval_similarity", 0.0)
-            ):
-                combined[key] = row
-    return _label_balanced_reflections(list(combined.values()), max_rules=max_rules)
-
-
-def _label_balanced_reflections(rows: list[dict[str, Any]], max_rules: int) -> list[dict[str, Any]]:
-    preferred = ["correct_maintenance", "too_early", "missed_HPC_maintenance", "missed_fan_maintenance", "over_maintenance"]
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in sorted(rows, key=lambda item: float(item.get("retrieval_similarity", 0.0)), reverse=True):
-        grouped.setdefault(str(row.get("feedback_label")), []).append(row)
-    selected: list[dict[str, Any]] = []
-    for label in preferred:
-        selected.extend(grouped.get(label, [])[:2])
-    if len(selected) < max_rules:
-        selected_ids = {str(item.get("rule_id")) for item in selected}
-        for row in sorted(rows, key=lambda item: float(item.get("retrieval_similarity", 0.0)), reverse=True):
-            if str(row.get("rule_id")) not in selected_ids:
-                selected.append(row)
-            if len(selected) >= max_rules:
-                break
-    return selected[:max_rules]
-
-
-def _reflection_query_actions(
-    candidate_action: str,
-    sensor_paths: list[dict[str, Any]],
-    dataset_rules: dict[str, Any],
-    forecast_summary: dict[str, Any],
-) -> list[str]:
-    actions = [candidate_action]
-    allowed = set(dataset_rules.get("allowed_actions", []))
-    if "schedule_HPC_maintenance" in allowed and _has_strong_evidence(
-        sensor_paths, "HPC_related_degradation", STRONG_HPC_SENSORS
-    ):
-        actions.append("schedule_HPC_maintenance")
-    if "schedule_fan_maintenance" in allowed and _has_strong_evidence(
-        sensor_paths, "Fan_related_degradation", STRONG_FAN_SENSORS
-    ):
-        actions.append("schedule_fan_maintenance")
-    return list(dict.fromkeys(actions))
 
 
 def run_agent(
@@ -164,32 +92,100 @@ def run_agent(
     num_predict: int = 512,
     format_json: bool = True,
     dry_run: bool = False,
+    risk_model_path: str | None = None,
+    risk_theta_low: float = 0.4,
+    risk_theta_conf: float = 0.3,
+    risk_threshold_overrides: dict[str, Any] | None = None,
+    risk_policy_mode: str = "hybrid",
+    llm_policy_tool_path: str | None = None,
 ) -> dict[str, Any]:
-    context = prepare_context(case, kg_dir, kg_store)
-    llm_calls = 0
+    context = prepare_context(case, kg_dir, kg_store, risk_threshold_overrides=risk_threshold_overrides)
+    risk_policy_mode = str(risk_policy_mode or "hybrid")
+    risk_tool = LightGBMRiskTool(
+        model_path=risk_model_path,
+        theta_low=risk_theta_low,
+        theta_conf=risk_theta_conf,
+        disable_model=risk_policy_mode == "llm_only",
+    )
+    controller_raw_outputs = []
+    if risk_policy_mode == "llm_only" or (risk_policy_mode == "hybrid" and not risk_tool.has_model):
+        llm_policy_tool = LLMPolicyRiskTool(
+            policy_path=llm_policy_tool_path,
+            theta_low=risk_theta_low,
+            theta_conf=risk_theta_conf,
+        )
+        if not llm_policy_tool.exists:
+            designed_policy = llm_design_policy_tool(
+                case=context["case"],
+                context=context,
+                model=model,
+                ollama_url=ollama_url,
+                temperature=temperature,
+                timeout=timeout,
+                num_predict=min(max(num_predict, 1024), 1536),
+                format_json=format_json,
+                dry_run=dry_run,
+                reflection_rules_path=Path(kg_dir) / "reflection_rules.csv",
+            )
+            llm_policy_tool.save(designed_policy)
+            if designed_policy.get("raw_output"):
+                controller_raw_outputs.append(
+                    {
+                        "stage": "llm_policy_tool_design",
+                        "format_json": format_json,
+                        "num_predict": min(max(num_predict, 1024), 1536),
+                        "messages": [
+                            {"role": "system", "content": "Return only valid JSON."},
+                            {"role": "user", "content": designed_policy.get("prompt", "")},
+                        ],
+                        "raw_output": designed_policy.get("raw_output", ""),
+                        "parse_ok": True,
+                    }
+                )
+        context["lightgbm_risk"] = llm_policy_tool.predict(context["case"], context)
+        context["llm_risk_policy"] = {
+            **context["lightgbm_risk"].get("llm_policy_tool", {}),
+            "source": context["lightgbm_risk"].get("model_source"),
+            "maintenance_risk_score": context["lightgbm_risk"].get("maintenance_risk_score"),
+            "score_components": context["lightgbm_risk"].get("score_components", []),
+            "risk_threshold_policy": {
+                "theta_low": context["lightgbm_risk"].get("theta_low"),
+                "theta_conf": context["lightgbm_risk"].get("theta_conf"),
+                "maintenance_window_threshold": context["lightgbm_risk"]
+                .get("llm_policy_tool", {})
+                .get("maintenance_window_threshold"),
+            },
+        }
+    elif not risk_tool.has_model:
+        context["llm_risk_policy"] = initial_risk_policy(
+            case=context["case"],
+            context=context,
+            source="initial_risk_policy",
+        )
+        context["lightgbm_risk"] = risk_tool.predict(context["case"], context)
+    else:
+        context["lightgbm_risk"] = risk_tool.predict(context["case"], context)
+    llm_calls = len(controller_raw_outputs)
     llm_fallback_used = False
     llm_errors: list[str] = []
     if dry_run:
         action = rule_based_action(context)
-        raw_outputs: list[dict[str, Any] | str] = ["<dry_run rule_based_action>"]
-    elif _hard_gate_blocks_llm(context):
-        action = rule_based_action(context)
-        action["hard_gate_used"] = True
-        action["reason"] = "Hard risk/component gate blocks maintenance; used deterministic KG monitoring."
-        raw_outputs = ["<hard_gate rule_based_action>"]
+        raw_outputs: list[dict[str, Any] | str] = [*controller_raw_outputs, "<dry_run rule_based_action>"]
+    elif not _should_activate_llm(context):
+        action = low_risk_action(context)
+        raw_outputs = [*controller_raw_outputs, "<lightgbm_low_risk_monitoring>"]
     else:
         prompt = build_prompt(
             case=context["case"],
             dataset_rules=context["dataset_rules"],
             sensor_paths=context["sensor_paths"],
             action_paths=context["action_paths"],
-            reflection_rules=context["reflection_rules"],
             component_evidence_statistics=context["component_evidence_statistics"],
             risk_gate=context["risk_gate"],
             component_gate=context["component_gate"],
-            reflection_gate=context["reflection_gate"],
+            lightgbm_risk=context["lightgbm_risk"],
         )
-        raw_outputs = []
+        raw_outputs = list(controller_raw_outputs)
         action = None
         for attempt in _llm_attempts(prompt, context, num_predict=num_predict, format_json=format_json):
             try:
@@ -252,6 +248,7 @@ def run_agent(
         context["dataset_rules"],
         context["sensor_paths"],
         risk_gate=context["risk_gate"],
+        lightgbm_risk=context["lightgbm_risk"],
     )
 
     if not validation["valid"] and not dry_run and not llm_fallback_used:
@@ -265,6 +262,7 @@ def run_agent(
                 context["dataset_rules"],
                 context["sensor_paths"],
                 risk_gate=context["risk_gate"],
+                lightgbm_risk=context["lightgbm_risk"],
             )
 
     if not validation["valid"] and not dry_run and not llm_fallback_used:
@@ -311,6 +309,7 @@ Return only valid JSON.
                     context["dataset_rules"],
                     context["sensor_paths"],
                     risk_gate=context["risk_gate"],
+                    lightgbm_risk=context["lightgbm_risk"],
                 )
                 if not validation["valid"]:
                     repair_entry["post_repair_validation"] = validation
@@ -324,6 +323,7 @@ Return only valid JSON.
                         context["dataset_rules"],
                         context["sensor_paths"],
                         risk_gate=context["risk_gate"],
+                        lightgbm_risk=context["lightgbm_risk"],
                     )
             except Exception as exc:
                 repair_entry["parse_ok"] = False
@@ -338,6 +338,7 @@ Return only valid JSON.
                     context["dataset_rules"],
                     context["sensor_paths"],
                     risk_gate=context["risk_gate"],
+                    lightgbm_risk=context["lightgbm_risk"],
                 )
             raw_outputs.append(repair_entry)
         except Exception as exc:
@@ -352,6 +353,7 @@ Return only valid JSON.
                 context["dataset_rules"],
                 context["sensor_paths"],
                 risk_gate=context["risk_gate"],
+                lightgbm_risk=context["lightgbm_risk"],
             )
 
     if not validation["valid"]:
@@ -365,6 +367,7 @@ Return only valid JSON.
             context["dataset_rules"],
             context["sensor_paths"],
             risk_gate=context["risk_gate"],
+            lightgbm_risk=context["lightgbm_risk"],
         )
 
     action["validation"] = validation
@@ -385,7 +388,10 @@ Return only valid JSON.
             "component_evidence_statistics": context["component_evidence_statistics"],
             "risk_gate": context["risk_gate"],
             "component_gate": context["component_gate"],
-            "reflection_gate": context["reflection_gate"],
+            "reflection_memory_usage": context["reflection_memory_usage"],
+            "risk_threshold_overrides": context.get("risk_threshold_overrides", {}),
+            "llm_risk_policy": context.get("llm_risk_policy"),
+            "lightgbm_risk": context["lightgbm_risk"],
         },
         "llm_calls": llm_calls,
         "raw_outputs": raw_outputs,
@@ -433,6 +439,15 @@ def _hard_gate_blocks_llm(context: dict[str, Any]) -> bool:
     return False
 
 
+def _should_activate_llm(context: dict[str, Any]) -> bool:
+    risk = context.get("lightgbm_risk", {})
+    risk_gate = context.get("risk_gate", {})
+    return bool(
+        float(risk.get("maintenance_risk_score", 0.0)) >= float(risk.get("theta_low", 0.4))
+        or risk_gate.get("statistical_candidate", False)
+    )
+
+
 def _local_validation_repair(
     action: dict[str, Any],
     validation: dict[str, Any],
@@ -476,11 +491,11 @@ def _minimal_json_prompt(context: dict[str, Any]) -> str:
         },
         "risk_gate": context.get("risk_gate"),
         "component_gate": context.get("component_gate"),
-        "reflection_gate": context.get("reflection_gate"),
+        "lightgbm_risk": context.get("lightgbm_risk"),
         "dataset_rules": context["dataset_rules"],
         "top_evidence_paths": [p["path_text"] for p in context["sensor_paths"][:5]],
         "action_paths": [p["path_text"] for p in context["action_paths"][:4]],
-        "reflection_rules": context["reflection_rules"][:3],
+        "reflection_memory_usage": context.get("reflection_memory_usage"),
     }
     return (
         "Return one JSON object only. No prose. No markdown. "
@@ -504,6 +519,7 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     disallowed = set(dataset_rules.get("disallowed_actions", []))
     risk_gate = context.get("risk_gate", {})
     component_gate = context.get("component_gate", {})
+    learned_risk = context.get("lightgbm_risk", {})
 
     if summary.get("first_critical_crossing_cycle"):
         risk = "critical_risk_hypothesis"
@@ -517,7 +533,8 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     strong_hpc = _has_strong_evidence(sensor_paths, "HPC_related_degradation", STRONG_HPC_SENSORS)
     strong_fan = _has_strong_evidence(sensor_paths, "Fan_related_degradation", STRONG_FAN_SENSORS)
 
-    if not risk_gate.get("maintenance_candidate", False):
+    learned_support = _learned_risk_supports_maintenance(learned_risk)
+    if not learned_support and not risk_gate.get("maintenance_candidate", False):
         action_type = "schedule_monitoring"
         degradation = "uncertain_component_degradation"
     elif component_gate.get("component_supported", False):
@@ -555,6 +572,20 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def low_risk_action(context: dict[str, Any]) -> dict[str, Any]:
+    action = rule_based_action(context)
+    if action["action_type"] in {"schedule_HPC_maintenance", "schedule_fan_maintenance"}:
+        action["action_type"] = "schedule_monitoring"
+        action["degradation_hypothesis"] = "uncertain_component_degradation"
+        horizon = context["case"].get("forecast_horizon", {})
+        action["action_time"] = f"t+{int(horizon.get('end', 20))}"
+    action["lightgbm_low_risk_gate_used"] = True
+    action["reason"] = (
+        "LightGBMRiskTool judged this case below LLM activation threshold; scheduled conservative monitoring."
+    )
+    return action
+
+
 def _confidence(sensor_paths: list[dict[str, Any]], hypothesis: str) -> float:
     scores = [float(p.get("score", 0.0)) for p in sensor_paths if p.get("hypothesis") == hypothesis]
     if not scores:
@@ -571,10 +602,19 @@ def _maintenance_action_time(context: dict[str, Any]) -> str:
         or summary.get("first_persistent_pattern_cycle")
         or "t+1"
     )
-    labels = {str(item.get("feedback_label", "")) for item in context.get("reflection_rules", [])}
-    if labels.intersection({"missed_HPC_maintenance", "missed_fan_maintenance"}) and "too_early" not in labels:
-        return _offset_t_plus(peak_time, case, -3) or str(peak_time)
     return str(peak_time)
+
+
+def _learned_risk_supports_maintenance(lightgbm_risk: dict[str, Any]) -> bool:
+    score = _to_float(lightgbm_risk.get("maintenance_risk_score")) or 0.0
+    theta = _to_float(lightgbm_risk.get("theta_low")) or 0.4
+    decision = str(lightgbm_risk.get("risk_decision", ""))
+    stage = str(lightgbm_risk.get("predicted_risk_stage", ""))
+    return (
+        score >= max(theta, 0.60)
+        and decision in {"activate_llm_agent", "activate_llm_agent_uncertain"}
+        and stage in {"maintenance_window", "late_or_missed"}
+    )
 
 
 def _offset_t_plus(value: Any, case: dict[str, Any], offset: int) -> str | None:

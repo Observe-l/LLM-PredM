@@ -11,8 +11,12 @@ from typing import Any
 
 import pandas as pd
 
+from .agentic_controller import llm_decide_adaptation, llm_update_policy_tool
 from .config import DEFAULT_KG_DIR, DEFAULT_MODEL_NAME, DEFAULT_OLLAMA_URL, DEFAULT_OUTPUT_DIR
 from .kg_store import KGStore
+from .lightgbm_train import train_lightgbm_models
+from .lightgbm_update_tool import LightGBMUpdateTool
+from .llm_policy_risk_tool import LLMPolicyRiskTool, load_policy
 from .lhi_case_adapter import (
     GROUP_COLS,
     build_forecast_case,
@@ -24,6 +28,8 @@ from .lhi_case_adapter import (
 from .logging_utils import action_decision_record, append_recent_ollama_records, write_json
 from .react_agent import run_agent
 from .reflection_memory import append_reflection_rule, feedback_to_rule, initialize_reflection_file
+from .update_operator import append_update_operation, build_update_operation
+from .update_validator import validate_update
 
 
 MAINTENANCE_ACTIONS = {"schedule_HPC_maintenance", "schedule_fan_maintenance"}
@@ -76,6 +82,42 @@ def parse_args() -> argparse.Namespace:
         help="Disable Ollama format=json. By default Ollama is asked to return a JSON object.",
     )
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument("--risk_model_path", type=Path, default=None)
+    parser.add_argument("--risk_theta_low", type=float, default=0.4)
+    parser.add_argument("--risk_theta_conf", type=float, default=0.3)
+    parser.add_argument(
+        "--risk_policy_mode",
+        choices=["initial_or_lightgbm", "llm_only", "hybrid"],
+        default="llm_only",
+        help=(
+            "Risk policy arm: initial_or_lightgbm uses deterministic initial policy until a LightGBM risk model exists; "
+            "llm_only ignores LightGBM risk models and uses an experiment-local LLMPolicyRiskTool; "
+            "hybrid uses LightGBM when available and otherwise uses the LLMPolicyRiskTool."
+        ),
+    )
+    parser.add_argument("--update_model_dir", type=Path, default=Path("models"))
+    parser.add_argument(
+        "--online_model_dir",
+        type=Path,
+        default=None,
+        help="Directory for agentic online LightGBM retraining. Defaults to OUTPUT_DIR/models.",
+    )
+    parser.add_argument(
+        "--online_train_min_rows",
+        type=int,
+        default=4,
+        help="Minimum labeled reflection rows before online LightGBM training can succeed.",
+    )
+    parser.add_argument(
+        "--disable_update_tool",
+        action="store_true",
+        help="Disable LightGBMUpdateTool feedback-time adaptation suggestions.",
+    )
+    parser.add_argument(
+        "--disable_update_review_llm",
+        action="store_true",
+        help="Skip the LLM adaptation controller. Fallback policy then decides retraining/update.",
+    )
     parser.add_argument(
         "--save_recent_ollama_outputs",
         type=int,
@@ -103,6 +145,12 @@ def main() -> None:
     scores, top_drift = load_lhi_frames(args.lhi_dir, load_top_drift_detail=args.load_top_drift_detail)
     threshold_config = load_threshold_config(args.threshold_config)
     kg = KGStore(experiment_kg_dir)
+    online_model_dir = args.online_model_dir or (args.output_dir / "models")
+    online_model_dir.mkdir(parents=True, exist_ok=True)
+    active_risk_model_path: Path | None = args.risk_model_path
+    if active_risk_model_path is None and (online_model_dir / "lightgbm_risk.pkl").exists():
+        active_risk_model_path = online_model_dir / "lightgbm_risk.pkl"
+    adaptive_risk_thresholds: dict[str, dict[str, float]] = {}
 
     action_log_path = args.output_dir / "action_hypotheses.json"
     feedback_log_path = args.output_dir / "feedback_logs.json"
@@ -110,6 +158,7 @@ def main() -> None:
     engine_summary_path = args.output_dir / "engine_summary.json"
     engine_summary_csv_path = args.output_dir / "engine_summary.csv"
     recent_ollama_outputs_path = args.output_dir / "recent_ollama_outputs.json"
+    zero_shot_score_log_path = args.output_dir / "zero_shot_risk_scores.json"
     recent_ollama_outputs: deque[dict[str, Any]] = deque(maxlen=max(args.save_recent_ollama_outputs, 0))
 
     engine_count = 0
@@ -118,6 +167,8 @@ def main() -> None:
     engine_summaries: list[dict[str, Any]] = []
     action_hypotheses: list[dict[str, Any]] = []
     feedback_logs: list[dict[str, Any]] = []
+    update_logs: list[dict[str, Any]] = []
+    zero_shot_score_logs: list[dict[str, Any]] = []
     forecast_cases: list[dict[str, Any]] = []
     persist_progress(
         feedback_log_path=feedback_log_path,
@@ -139,6 +190,7 @@ def main() -> None:
         last_case: dict[str, Any] | None = None
         last_action: dict[str, Any] | None = None
         last_component_stats: dict[str, Any] | None = None
+        last_context: dict[str, Any] | None = None
         terminal_reason = "breakdown"
 
         for window in engine_windows:
@@ -176,10 +228,18 @@ def main() -> None:
                 num_predict=args.ollama_num_predict,
                 format_json=not args.disable_ollama_json_format,
                 dry_run=args.dry_run,
+                risk_model_path=str(active_risk_model_path) if active_risk_model_path else None,
+                risk_theta_low=args.risk_theta_low,
+                risk_theta_conf=args.risk_theta_conf,
+                risk_threshold_overrides=adaptive_risk_thresholds.get(str(fd_name)),
+                risk_policy_mode=args.risk_policy_mode,
+                llm_policy_tool_path=str(online_model_dir / "llm_policy_tool.json"),
             )
             result["latency_sec"] = round(time.time() - started, 3)
             result["lhi_gate"] = {"column": args.lhi_col, "peak_lhi": peak_lhi, "trigger": args.lhi_trigger}
             action_hypotheses.append(action_decision_record(result))
+            record_zero_shot_score(zero_shot_score_logs, result, case)
+            write_json(zero_shot_score_log_path, zero_shot_score_logs)
             append_recent_ollama_records(
                 buffer=recent_ollama_outputs,
                 max_items=args.save_recent_ollama_outputs,
@@ -195,7 +255,8 @@ def main() -> None:
             llm_call_count += int(result.get("llm_calls", 0)) if not args.dry_run else 1
             last_case = case
             last_action = action
-            last_component_stats = result.get("context", {}).get("component_evidence_statistics")
+            last_context = result.get("context", {})
+            last_component_stats = last_context.get("component_evidence_statistics")
 
             if action_type in MAINTENANCE_ACTIONS:
                 feedback = maintenance_feedback(
@@ -204,7 +265,7 @@ def main() -> None:
                     rul_threshold=args.maintenance_rul_threshold,
                     failure_cycle=engine_failure_cycle(engine_windows),
                 )
-                append_feedback_and_rule(
+                reflection_rule = append_feedback_and_rule(
                     feedback,
                     case,
                     action,
@@ -212,6 +273,22 @@ def main() -> None:
                     experiment_kg_dir,
                     component_stats=result.get("context", {}).get("component_evidence_statistics"),
                 )
+                new_model_path = maybe_run_update_tool(
+                    args=args,
+                    feedback=feedback,
+                    case=case,
+                    action=action,
+                    result=result,
+                    reflection_rule=reflection_rule,
+                    update_logs=update_logs,
+                    output_dir=args.output_dir,
+                    experiment_kg_dir=experiment_kg_dir,
+                    online_model_dir=online_model_dir,
+                    active_risk_model_path=active_risk_model_path,
+                )
+                if new_model_path is not None:
+                    active_risk_model_path = new_model_path
+                apply_latest_threshold_operation(update_logs, adaptive_risk_thresholds, str(fd_name))
                 write_json(feedback_log_path, feedback_logs)
                 terminal_reason = "maintenance_action"
                 break
@@ -239,9 +316,10 @@ def main() -> None:
                 )
                 last_action = fallback_no_maintenance_action(last_case)
                 last_component_stats = None
+                last_context = {}
             assert last_action is not None
             feedback = breakdown_feedback(last_case, last_action, engine_failure_cycle(engine_windows))
-            append_feedback_and_rule(
+            reflection_rule = append_feedback_and_rule(
                 feedback,
                 last_case,
                 last_action,
@@ -249,6 +327,22 @@ def main() -> None:
                 experiment_kg_dir,
                 component_stats=last_component_stats,
             )
+            new_model_path = maybe_run_update_tool(
+                args=args,
+                feedback=feedback,
+                case=last_case,
+                action=last_action,
+                result={"context": last_context or {"component_evidence_statistics": last_component_stats or {}}},
+                reflection_rule=reflection_rule,
+                update_logs=update_logs,
+                output_dir=args.output_dir,
+                experiment_kg_dir=experiment_kg_dir,
+                online_model_dir=online_model_dir,
+                active_risk_model_path=active_risk_model_path,
+            )
+            if new_model_path is not None:
+                active_risk_model_path = new_model_path
+            apply_latest_threshold_operation(update_logs, adaptive_risk_thresholds, str(last_case.get("dataset_subset")))
             write_json(feedback_log_path, feedback_logs)
 
         engine_summaries.append(
@@ -272,12 +366,19 @@ def main() -> None:
         "action_counts": action_counts,
         "terminal_counts": count_values(item["terminal_reason"] for item in engine_summaries),
         "dry_run": bool(args.dry_run),
+        "risk_policy_mode": args.risk_policy_mode,
         "outputs": {
             "action_hypotheses": str(action_log_path),
             "forecast_cases": str(cases_path),
             "feedback_logs": str(feedback_log_path),
+            "update_logs": str(args.output_dir / "lightgbm_update_logs.json"),
             "engine_summary": str(engine_summary_path),
             "recent_ollama_outputs": str(recent_ollama_outputs_path) if args.save_recent_ollama_outputs > 0 else None,
+            "zero_shot_risk_scores": str(zero_shot_score_log_path),
+            "online_model_dir": str(online_model_dir),
+            "llm_policy_tool_path": str(online_model_dir / "llm_policy_tool.json"),
+            "active_risk_model_path": str(active_risk_model_path) if active_risk_model_path else None,
+            "adaptive_risk_thresholds": adaptive_risk_thresholds,
         },
         "recent_ollama_outputs_path": str(recent_ollama_outputs_path) if args.save_recent_ollama_outputs > 0 else None,
         "engineer_feedback": {
@@ -288,8 +389,10 @@ def main() -> None:
     }
     write_json(args.output_dir / "joint_simulation_summary.json", summary)
     write_json(action_log_path, action_hypotheses)
+    write_json(zero_shot_score_log_path, zero_shot_score_logs)
     write_json(cases_path, forecast_cases)
     write_json(feedback_log_path, feedback_logs)
+    write_json(args.output_dir / "lightgbm_update_logs.json", update_logs)
     write_json(engine_summary_path, engine_summaries)
     write_csv(engine_summary_csv_path, engine_summaries)
     if args.save_recent_ollama_outputs > 0:
@@ -360,9 +463,12 @@ def clean_experiment_outputs(output_dir: Path) -> None:
         "forecast_cases.json",
         "recent_ollama_outputs.jsonl",
         "recent_ollama_outputs.json",
+        "lightgbm_update_logs.json",
+        "lightgbm_update_operations.jsonl",
         "joint_simulation_summary.json",
         "engine_summary.csv",
         "engine_summary.json",
+        "zero_shot_risk_scores.json",
     ):
         path = output_dir / filename
         if path.exists():
@@ -370,6 +476,9 @@ def clean_experiment_outputs(output_dir: Path) -> None:
     window_dir = output_dir / "forecast_windows"
     if window_dir.exists():
         shutil.rmtree(window_dir)
+    model_dir = output_dir / "models"
+    if model_dir.exists():
+        shutil.rmtree(model_dir)
 
 
 def persist_progress(
@@ -387,6 +496,44 @@ def persist_progress(
     write_csv(engine_summary_csv_path, engine_summaries)
     if save_recent_ollama_outputs > 0:
         write_json(recent_ollama_outputs_path, list(recent_ollama_outputs))
+
+
+def record_zero_shot_score(
+    zero_shot_score_logs: list[dict[str, Any]],
+    result: dict[str, Any],
+    case: dict[str, Any],
+) -> None:
+    context = result.get("context", {})
+    policy = context.get("llm_risk_policy")
+    risk = context.get("lightgbm_risk", {})
+    if not policy:
+        return
+    zero_shot_score_logs.append(
+        {
+            "case_id": result.get("case_id"),
+            "dataset_subset": case.get("dataset_subset"),
+            "unit_id": case.get("unit_id"),
+            "cutoff_cycle": case.get("cutoff_cycle"),
+            "model_source": risk.get("model_source"),
+            "maintenance_risk_score": risk.get("maintenance_risk_score"),
+            "predicted_risk_stage": risk.get("predicted_risk_stage"),
+            "risk_decision": risk.get("risk_decision"),
+            "theta_low": risk.get("theta_low"),
+            "theta_conf": risk.get("theta_conf"),
+            "policy_source": policy.get("source"),
+            "score_formula": policy.get("score_formula"),
+            "score_components": policy.get("score_components", []),
+            "risk_threshold_policy": policy.get("risk_threshold_policy", {}),
+            "policy_confidence": policy.get("confidence"),
+            "policy_reason": policy.get("reason"),
+            "policy_error": policy.get("error"),
+            "reflection_calibration_summary": policy.get("reflection_calibration_summary"),
+            "severity_timing_assessment": policy.get("severity_timing_assessment"),
+            "reflection_policy_context": policy.get("reflection_policy_context", {}),
+            "action_type": result.get("action", {}).get("action_type"),
+            "action_time": result.get("action", {}).get("action_time"),
+        }
+    )
 
 
 def maintenance_feedback(
@@ -461,11 +608,285 @@ def append_feedback_and_rule(
     feedback_logs: list[dict[str, Any]],
     experiment_kg_dir: Path,
     component_stats: dict[str, Any] | None = None,
-) -> None:
+) -> dict[str, Any] | None:
     feedback_logs.append(feedback)
     rule = feedback_to_rule(feedback, case, action, component_stats=component_stats)
     if rule is not None:
         append_reflection_rule(experiment_kg_dir, rule)
+    return rule
+
+
+def maybe_run_update_tool(
+    args: argparse.Namespace,
+    feedback: dict[str, Any],
+    case: dict[str, Any],
+    action: dict[str, Any],
+    result: dict[str, Any],
+    reflection_rule: dict[str, Any] | None,
+    update_logs: list[dict[str, Any]],
+    output_dir: Path,
+    experiment_kg_dir: Path,
+    online_model_dir: Path,
+    active_risk_model_path: Path | None,
+) -> Path | None:
+    context = result.get("context", {})
+    if str(feedback.get("feedback_label", "")) == "correct_maintenance":
+        record = {
+            "case_id": case.get("case_id"),
+            "feedback_label": feedback.get("feedback_label"),
+            "llm_adaptation_decision": {
+                "retrain_lightgbm_risk": False,
+                "call_lightgbm_update_tool": False,
+                "reason": "Skipped adaptation: correct_maintenance feedback does not trigger policy or threshold update review.",
+                "expected_update_focus": "none",
+                "confidence": 1.0,
+                "source": "skipped_correct_maintenance",
+            },
+            "llm_policy_update_result": {
+                "update_policy": False,
+                "reason": "Skipped adaptation: correct_maintenance feedback does not trigger policy or threshold update review.",
+                "source": "skipped_correct_maintenance",
+            },
+            "training_result": None,
+            "update_result": None,
+            "validation": {"valid": True, "violations": []},
+            "operation": None,
+        }
+        update_logs.append(record)
+        write_json(output_dir / "lightgbm_update_logs.json", update_logs)
+        return None
+    if args.risk_policy_mode == "llm_only":
+        llm_policy_update_result = maybe_update_llm_policy_tool(
+            args=args,
+            feedback=feedback,
+            case=case,
+            action=action,
+            context=context,
+            reflection_rule=reflection_rule,
+            experiment_kg_dir=experiment_kg_dir,
+            online_model_dir=online_model_dir,
+        )
+        update_logs.append(
+            {
+                "case_id": case.get("case_id"),
+                "feedback_label": feedback.get("feedback_label"),
+                "llm_adaptation_decision": {
+                    "retrain_lightgbm_risk": False,
+                    "call_lightgbm_update_tool": False,
+                    "reason": "LLM-only arm updates LLMPolicyRiskTool instead of LightGBM tools.",
+                    "expected_update_focus": "llm_policy_tool",
+                    "confidence": 1.0,
+                    "source": "llm_only_policy_tool_path",
+                },
+                "llm_policy_update_result": llm_policy_update_result,
+                "training_result": None,
+                "update_result": None,
+                "validation": {"valid": True, "violations": []},
+                "operation": None,
+            }
+        )
+        write_json(output_dir / "lightgbm_update_logs.json", update_logs)
+        return None
+    review = review_update_with_llm(
+        args=args,
+        feedback=feedback,
+        case=case,
+        action=action,
+        context=context,
+        reflection_rule=reflection_rule,
+        experiment_kg_dir=experiment_kg_dir,
+        active_risk_model_path=active_risk_model_path,
+    )
+    llm_policy_update_result = maybe_update_llm_policy_tool(
+        args=args,
+        feedback=feedback,
+        case=case,
+        action=action,
+        context=context,
+        reflection_rule=reflection_rule,
+        experiment_kg_dir=experiment_kg_dir,
+        online_model_dir=online_model_dir,
+    )
+    training_result = None
+    new_model_path = None
+    if review.get("retrain_lightgbm_risk", False):
+        training_result = maybe_train_online_lightgbm(
+            reflection_rules_path=experiment_kg_dir / "reflection_rules.csv",
+            online_model_dir=online_model_dir,
+            min_rows=max(int(args.online_train_min_rows), int(review.get("min_training_rows", args.online_train_min_rows))),
+        )
+        risk_model = training_result.get("models", {}).get("risk", {}) if isinstance(training_result, dict) else {}
+        if risk_model.get("path"):
+            new_model_path = Path(risk_model["path"])
+
+    if args.disable_update_tool or not review.get("call_lightgbm_update_tool", False):
+        update_logs.append(
+            {
+                "case_id": case.get("case_id"),
+                "feedback_label": feedback.get("feedback_label"),
+                "llm_adaptation_decision": review,
+                "llm_policy_update_result": llm_policy_update_result,
+                "training_result": training_result,
+                "update_result": None,
+                "validation": {"valid": True, "violations": []},
+                "operation": None,
+            }
+        )
+        write_json(output_dir / "lightgbm_update_logs.json", update_logs)
+        return new_model_path
+    tool_model_dir = online_model_dir if _has_update_models(online_model_dir) else args.update_model_dir
+    tool = LightGBMUpdateTool(model_dir=tool_model_dir)
+    update_result = tool.predict(
+        case=case,
+        action=action,
+        feedback=feedback,
+        context=context,
+        lightgbm_risk=context.get("lightgbm_risk"),
+    )
+    validation = validate_update(update_result, feedback, context=context)
+    operation = build_update_operation(update_result) if validation["valid"] else None
+    record = {
+        "case_id": case.get("case_id"),
+        "feedback_label": feedback.get("feedback_label"),
+        "llm_adaptation_decision": review,
+        "llm_policy_update_result": llm_policy_update_result,
+        "training_result": training_result,
+        "update_result": update_result,
+        "validation": validation,
+        "operation": operation,
+    }
+    update_logs.append(record)
+    write_json(output_dir / "lightgbm_update_logs.json", update_logs)
+    if operation is not None:
+        append_update_operation(output_dir / "lightgbm_update_operations.jsonl", record)
+    return new_model_path
+
+
+def maybe_update_llm_policy_tool(
+    args: argparse.Namespace,
+    feedback: dict[str, Any],
+    case: dict[str, Any],
+    action: dict[str, Any],
+    context: dict[str, Any],
+    reflection_rule: dict[str, Any] | None,
+    experiment_kg_dir: Path,
+    online_model_dir: Path,
+) -> dict[str, Any] | None:
+    if args.risk_policy_mode not in {"llm_only", "hybrid"}:
+        return None
+    policy_path = online_model_dir / "llm_policy_tool.json"
+    current_policy = load_policy(policy_path)
+    if current_policy is None:
+        return {
+            "update_policy": False,
+            "reason": "No LLMPolicyRiskTool exists yet for this experiment.",
+            "source": "missing_llm_policy_tool",
+        }
+    result = llm_update_policy_tool(
+        current_policy=current_policy,
+        feedback=feedback,
+        case=case,
+        action=action,
+        context=context,
+        reflection_rule=reflection_rule,
+        reflection_rules_path=experiment_kg_dir / "reflection_rules.csv",
+        model=args.model,
+        ollama_url=args.ollama_url,
+        temperature=args.temperature,
+        timeout=args.timeout,
+        num_predict=512,
+        format_json=not args.disable_ollama_json_format,
+        dry_run=args.dry_run,
+        disable_llm=args.disable_update_review_llm,
+    )
+    if result.get("update_policy") and isinstance(result.get("updated_policy"), dict):
+        tool = LLMPolicyRiskTool(policy_path=policy_path, theta_low=args.risk_theta_low, theta_conf=args.risk_theta_conf)
+        tool.save(result["updated_policy"])
+        result["policy_path"] = str(policy_path)
+    return result
+
+
+def maybe_train_online_lightgbm(
+    reflection_rules_path: Path,
+    online_model_dir: Path,
+    min_rows: int,
+) -> dict[str, Any]:
+    try:
+        summary = train_lightgbm_models(
+            reflection_rules=reflection_rules_path,
+            output_dir=online_model_dir,
+            min_rows=min_rows,
+        )
+    except SystemExit as exc:
+        return {"error": str(exc), "models": {}}
+    except Exception as exc:
+        return {"error": str(exc), "models": {}}
+    summary["online_training"] = {
+        "reflection_rules_path": str(reflection_rules_path),
+        "online_model_dir": str(online_model_dir),
+        "min_rows": int(min_rows),
+    }
+    return summary
+
+
+def _has_update_models(model_dir: Path) -> bool:
+    return (model_dir / "lightgbm_update_threshold.pkl").exists() or (
+        model_dir / "lightgbm_update_timing.pkl"
+    ).exists()
+
+
+def apply_latest_threshold_operation(
+    update_logs: list[dict[str, Any]],
+    adaptive_risk_thresholds: dict[str, dict[str, float]],
+    fd_name: str,
+) -> None:
+    if not update_logs:
+        return
+    operation = update_logs[-1].get("operation")
+    if not operation:
+        return
+    delta = operation.get("threshold_delta") or {}
+    if not delta:
+        return
+    current = adaptive_risk_thresholds.setdefault(
+        fd_name,
+        {"q95_excess_min": 0.35, "q99_excess_min": 0.25, "persistent_duration_min": 10.0},
+    )
+    current["q95_excess_min"] = max(0.0, float(current["q95_excess_min"]) + float(delta.get("q95_excess_min", 0.0)))
+    current["q99_excess_min"] = max(0.0, float(current["q99_excess_min"]) + float(delta.get("q99_excess_min", 0.0)))
+    current["persistent_duration_min"] = max(
+        1.0,
+        float(current["persistent_duration_min"]) + float(delta.get("persistent_duration_min", 0.0)),
+    )
+
+
+def review_update_with_llm(
+    args: argparse.Namespace,
+    feedback: dict[str, Any],
+    case: dict[str, Any],
+    action: dict[str, Any],
+    context: dict[str, Any],
+    reflection_rule: dict[str, Any] | None,
+    experiment_kg_dir: Path,
+    active_risk_model_path: Path | None,
+) -> dict[str, Any]:
+    return llm_decide_adaptation(
+        feedback=feedback,
+        case=case,
+        action=action,
+        context=context,
+        reflection_rule=reflection_rule,
+        reflection_rules_path=experiment_kg_dir / "reflection_rules.csv",
+        active_risk_model_path=active_risk_model_path,
+        model=args.model,
+        ollama_url=args.ollama_url,
+        temperature=args.temperature,
+        timeout=args.timeout,
+        num_predict=384,
+        format_json=not args.disable_ollama_json_format,
+        dry_run=args.dry_run,
+        disable_llm=args.disable_update_review_llm,
+    )
 
 
 def action_relative_cycle(action: dict[str, Any], default: int) -> int:

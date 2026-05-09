@@ -325,6 +325,173 @@ Outputs:
 - `card_sensor_details.csv`: per-sensor CARD components and reference counts.
 - `plots/*_card.png`: CARD curves for selected units.
 
+## Agentic Layer-3 PredM Experiments
+
+The Layer-3 predictive-maintenance agent lives under `src/RAG_cmapss/`. It
+consumes Layer-2 `ForecastCase` evidence from an LHI directory, retrieves
+component/action evidence from the C-MAPSS knowledge graph, asks an Ollama LLM
+for maintenance reasoning, simulates maintenance/breakdown feedback, and writes
+reflection/update memory for later adaptation.
+
+Use the local conda environment named `default`:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.RAG_cmapss.joint_simulation --help
+```
+
+Recommended LHI input for current experiments:
+
+```text
+outputs/CMAPSS/cluster_20/lhi_fix
+```
+
+### Reflection Memory Role
+
+Reflection memory has two different roles:
+
+- Action reasoning: reflection memory is not passed to the Graph RAG +
+  maintenance-action prompt. The action prompt uses current forecast evidence,
+  graph/component evidence, dataset rules, and the current risk tool output.
+- Policy/adaptation: reflection memory may be used by the risk-policy controller
+  to calibrate the experiment-local `LLMPolicyRiskTool`, and by feedback-time
+  adaptation to update that policy tool or train/update LightGBM tools.
+
+### Risk Policy Modes
+
+`joint_simulation` supports three risk-policy modes:
+
+- `initial_or_lightgbm`: use a deterministic initial cold-start risk policy
+  until a LightGBM risk model is available; then use `lightgbm_risk.pkl`.
+- `llm_only`: ignore LightGBM risk models and use an experiment-local
+  `models/llm_policy_tool.json`. If the tool does not exist, the LLM designs
+  its parameters once; later decision points call the deterministic tool.
+- `hybrid`: use LightGBM when available; otherwise use the experiment-local
+  `LLMPolicyRiskTool`.
+
+The two main experiment arms are:
+
+```text
+Arm A: initial_or_lightgbm
+Arm B: llm_only
+```
+
+### Smoke Tests
+
+Run the initial/LightGBM arm:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.RAG_cmapss.joint_simulation \
+  --lhi_dir outputs/CMAPSS/cluster_20/lhi_fix \
+  --output_dir outputs/CMAPSS/RAG/smoke_initial_or_lightgbm \
+  --fds FD001 \
+  --max_engines 2 \
+  --risk_policy_mode initial_or_lightgbm \
+  --model qwen3.5:9b \
+  --timeout 60 \
+  --ollama_num_predict 512 \
+  --save_recent_ollama_outputs 8
+```
+
+Run the LLM-only policy arm:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.RAG_cmapss.joint_simulation \
+  --lhi_dir outputs/CMAPSS/cluster_20/lhi_fix \
+  --output_dir outputs/CMAPSS/RAG/smoke_llm_only \
+  --fds FD001 \
+  --max_engines 2 \
+  --risk_policy_mode llm_only \
+  --model qwen3.5:9b \
+  --timeout 60 \
+  --ollama_num_predict 512 \
+  --save_recent_ollama_outputs 8
+```
+
+### Full FD001 Runs
+
+Initial policy with optional online LightGBM:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.RAG_cmapss.joint_simulation \
+  --lhi_dir outputs/CMAPSS/cluster_20/lhi_fix \
+  --output_dir outputs/CMAPSS/RAG/agentic_initial_or_lightgbm_fd001 \
+  --fds FD001 \
+  --risk_policy_mode initial_or_lightgbm \
+  --model qwen3.5:9b \
+  --timeout 90 \
+  --ollama_num_predict 512 \
+  --save_recent_ollama_outputs 20
+```
+
+LLM-only policy tool:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.RAG_cmapss.joint_simulation \
+  --lhi_dir outputs/CMAPSS/cluster_20/lhi_fix \
+  --output_dir outputs/CMAPSS/RAG/agentic_llm_only_fd001 \
+  --fds FD001 \
+  --risk_policy_mode llm_only \
+  --model qwen3.5:9b \
+  --timeout 90 \
+  --ollama_num_predict 512 \
+  --save_recent_ollama_outputs 20
+```
+
+### Optional Seed Models
+
+If you already trained LightGBM models, pass them explicitly:
+
+```bash
+--risk_model_path outputs/CMAPSS/RAG/some_run/models/lightgbm_risk.pkl \
+--update_model_dir outputs/CMAPSS/RAG/some_run/models
+```
+
+In `llm_only` mode, `lightgbm_risk.pkl` is ignored by design. The LLM designs
+or updates `models/llm_policy_tool.json`, while scoring is performed by the
+tool. In `initial_or_lightgbm` and `hybrid`, the risk model is used when
+present.
+
+You can train LightGBM tools manually from reflection memory:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.RAG_cmapss.lightgbm_train \
+  --reflection_rules outputs/CMAPSS/RAG/agentic_llm_only_fd001/kg_memory/reflection_rules.csv \
+  --output_dir outputs/CMAPSS/RAG/agentic_llm_only_fd001/models \
+  --min_rows 4
+```
+
+`lightgbm_risk.pkl` requires at least two risk label classes. A run containing
+only `correct_maintenance` and `missed_*` labels may train update models but
+skip the risk classifier because it has no negative risk examples such as
+`too_early` or `over_maintenance`.
+
+### Main Outputs
+
+Each run writes:
+
+- `joint_simulation_summary.json`: aggregate action/terminal counts, output
+  paths, active model path, and adaptive risk thresholds.
+- `engine_summary.csv` / `engine_summary.json`: terminal outcome per engine.
+- `action_hypotheses.json`: validated action records and context used for each
+  decision point.
+- `zero_shot_risk_scores.json`: risk-tool scores, formula, components,
+  threshold policy, and policy source.
+- `recent_ollama_outputs.json`: recent prompt/output audit records.
+- `feedback_logs.json`: simulated maintenance/breakdown feedback.
+- `kg_memory/reflection_rules.csv`: reflection memory generated from feedback.
+- `lightgbm_update_logs.json`: feedback-time adaptation decisions, training
+  summaries, update tool outputs, validation, and operations.
+- `lightgbm_update_operations.jsonl`: append-only threshold/timing/component
+  update operations.
+- `models/llm_policy_tool.json`: experiment-local deterministic policy tool
+  designed/updated by the LLM in `llm_only` or cold-start `hybrid` mode.
+- `models/*.pkl`: online-trained LightGBM update/risk models when training
+  conditions are satisfied.
+
+`correct_maintenance` feedback does not trigger policy or threshold-update
+review. It is recorded as feedback/reflection memory, but `lightgbm_update_logs`
+marks adaptation as `skipped_correct_maintenance`.
+
 ## Model Design
 
 - Text input: dataset/task description plus the current vehicle specification profile, encoded with Qwen's original embedding layer.

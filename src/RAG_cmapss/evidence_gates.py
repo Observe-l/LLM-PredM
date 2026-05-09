@@ -14,7 +14,11 @@ WARMUP_DURATION_MIN = 10.0
 MIN_CORRECT_ONLY_ANCHORS = 3
 
 
-def build_risk_gate(case: dict[str, Any], reflection_rules: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def build_risk_gate(
+    case: dict[str, Any],
+    reflection_rules: list[dict[str, Any]] | None = None,
+    threshold_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     risk = case.get("risk_statistics", {})
     trend = case.get("trend_statistics", {})
     peak = _to_float(risk.get("peak_score"))
@@ -25,6 +29,10 @@ def build_risk_gate(case: dict[str, Any], reflection_rules: list[dict[str, Any]]
     slope = _to_float(trend.get("slope"))
     consistency = case.get("multi_score_statistics", {}).get("d_rmse_lhi_consistency")
     reliable = bool(risk.get("unit_past_context_reliable"))
+    threshold_overrides = threshold_overrides or {}
+    warmup_q95_gap_min = _override_float(threshold_overrides, "q95_excess_min", WARMUP_Q95_GAP_MIN)
+    warmup_q99_gap_min = _override_float(threshold_overrides, "q99_excess_min", WARMUP_Q99_GAP_MIN)
+    warmup_duration_min = _override_float(threshold_overrides, "persistent_duration_min", WARMUP_DURATION_MIN)
 
     duration_q95_value = duration_q95 or 0.0
     duration_q99_value = duration_q99 or 0.0
@@ -36,25 +44,25 @@ def build_risk_gate(case: dict[str, Any], reflection_rules: list[dict[str, Any]]
         current_value=q95_gap,
         reflection_rules=reflection_rules,
         field="peak_minus_unit_q95",
-        warmup_min=WARMUP_Q95_GAP_MIN,
+        warmup_min=warmup_q95_gap_min,
     )
     q99_gap_calibration = _reflection_lower_bound_calibration(
         current_value=q99_gap,
         reflection_rules=reflection_rules,
         field="peak_minus_unit_q99",
-        warmup_min=WARMUP_Q99_GAP_MIN,
+        warmup_min=warmup_q99_gap_min,
     )
     q95_duration_calibration = _reflection_lower_bound_calibration(
         current_value=duration_q95,
         reflection_rules=reflection_rules,
         field="duration_above_unit_q95",
-        warmup_min=WARMUP_DURATION_MIN,
+        warmup_min=warmup_duration_min,
     )
     q99_duration_calibration = _reflection_lower_bound_calibration(
         current_value=duration_q99,
         reflection_rules=reflection_rules,
         field="duration_above_unit_q99",
-        warmup_min=WARMUP_DURATION_MIN,
+        warmup_min=warmup_duration_min,
     )
     strong_q95_excess = q95_gap_calibration["decision"] == "supports_maintenance"
     strong_q99_excess = q99_gap_calibration["decision"] == "supports_maintenance"
@@ -113,7 +121,8 @@ def build_risk_gate(case: dict[str, Any], reflection_rules: list[dict[str, Any]]
             ),
             "requires_increasing_trend": True,
             "absolute_peak_source": "learned_online_from_reflection_memory",
-            "gap_duration_source": "reflection_memory_with_warmup_prior",
+            "gap_duration_source": "online_update_override" if threshold_overrides else "reflection_memory_with_warmup_prior",
+            "runtime_threshold_overrides": threshold_overrides,
         },
         "reason": _risk_reason(level, reliable, q95_gap, q99_gap, duration_q95, duration_q99, consistency),
     }
@@ -188,6 +197,16 @@ def _reflection_peak_calibration(current_peak: float | None, reflection_rules: l
         "missed_anchor_count": len(missed_peaks),
         "early_anchor_count": len(early_peaks),
     }
+
+
+def _override_float(overrides: dict[str, Any], key: str, default: float) -> float:
+    try:
+        value = float(overrides.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    if key == "persistent_duration_min":
+        return max(1.0, value)
+    return max(0.0, value)
 
 
 def _reflection_lower_bound_calibration(

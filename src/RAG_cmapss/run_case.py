@@ -27,6 +27,9 @@ def parse_args() -> argparse.Namespace:
         help="Disable Ollama format=json. By default Ollama is asked to return a JSON object.",
     )
     parser.add_argument("--dry_run", action="store_true", help="Skip Ollama and use deterministic rule-based action.")
+    parser.add_argument("--risk_model_path", type=Path, default=None)
+    parser.add_argument("--risk_theta_low", type=float, default=0.4)
+    parser.add_argument("--risk_theta_conf", type=float, default=0.3)
     parser.add_argument(
         "--save_recent_ollama_outputs",
         type=int,
@@ -53,6 +56,9 @@ def main() -> None:
         num_predict=args.ollama_num_predict,
         format_json=not args.disable_ollama_json_format,
         dry_run=args.dry_run,
+        risk_model_path=str(args.risk_model_path) if args.risk_model_path else None,
+        risk_theta_low=args.risk_theta_low,
+        risk_theta_conf=args.risk_theta_conf,
     )
     result["latency_sec"] = round(time.time() - started, 3)
     decision_record = action_decision_record(result)
