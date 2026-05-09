@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compute a leakage-free log-ratio health indicator from condition-matched "
-            "min-max drift. Min-max ranges are computed from each forecast window's past context."
+            "min-max drift."
         )
     )
     parser.add_argument("--data_dir", type=Path, default=Path("dataset/CMAPSSData"))
@@ -49,7 +49,17 @@ def parse_args() -> argparse.Namespace:
         "--range_epsilon",
         type=float,
         default=1e-6,
-        help="Minimum past-context min-max range required for a sensor to be used.",
+        help="Minimum min-max range required for a sensor to be used.",
+    )
+    parser.add_argument(
+        "--minmax_scope",
+        choices=["past_context", "past_and_forecast"],
+        default="past_and_forecast",
+        help=(
+            "Values used to compute each window's min-max normalization. past_context uses only "
+            "observed history up to cutoff_cycle. past_and_forecast uses observed history plus "
+            "the current forecast/raw target horizon values."
+        ),
     )
     parser.add_argument(
         "--lhi_epsilon",
@@ -64,6 +74,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Number of initial monitor target cycles used to calibrate B. "
             "0 means use the first forecast block after --healthy_cycles."
+        ),
+    )
+    parser.add_argument(
+        "--baseline_source",
+        choices=["raw_healthy_cycles", "initial_forecast_block"],
+        default="raw_healthy_cycles",
+        help=(
+            "Source used to calibrate B. raw_healthy_cycles uses observed raw cycles "
+            "1..--healthy_cycles and is independent of forecast outputs. "
+            "initial_forecast_block uses the original forecast-derived monitor baseline."
         ),
     )
     parser.add_argument("--rolling_window", type=int, default=5)
@@ -191,13 +211,22 @@ def compute_past_sensor_ranges(
     forecasts: pd.DataFrame,
     sensors: Sequence[str],
     range_epsilon: float,
+    minmax_scope: str = "past_and_forecast",
 ) -> pd.DataFrame:
+    if minmax_scope not in {"past_context", "past_and_forecast"}:
+        raise ValueError("--minmax_scope must be one of: past_context, past_and_forecast.")
     rows = []
+    mode_cols = ["covariate_mode"] if "covariate_mode" in forecasts.columns else []
+    key_cols = [*mode_cols, "fd", "unit_id", "context_start_cycle", "cutoff_cycle"]
     window_keys = (
-        forecasts[["fd", "unit_id", "context_start_cycle", "cutoff_cycle"]]
+        forecasts[key_cols]
         .drop_duplicates()
-        .sort_values(["fd", "unit_id", "context_start_cycle", "cutoff_cycle"])
+        .sort_values(key_cols)
     )
+    forecast_unit_groups = {
+        (str(fd_name), int(unit_id)): group
+        for (fd_name, unit_id), group in forecasts.groupby(["fd", "unit_id"], sort=False)
+    }
     for (fd_name, unit_id), key_group in window_keys.groupby(["fd", "unit_id"], sort=True):
         unit_frame = (
             frames[str(fd_name)][frames[str(fd_name)]["unit_id"] == int(unit_id)]
@@ -208,7 +237,7 @@ def compute_past_sensor_ranges(
             raise ValueError(f"No rows for {fd_name} unit {unit_id}.")
 
         sensor_values = unit_frame.loc[:, sensors]
-        uses_expanding_context = (
+        uses_expanding_context = minmax_scope == "past_context" and (
             key_group["context_start_cycle"].nunique() == 1
             and int(key_group["context_start_cycle"].iloc[0]) == int(unit_frame["cycle"].min())
         )
@@ -216,9 +245,13 @@ def compute_past_sensor_ranges(
             expanding_min = sensor_values.expanding().min()
             expanding_max = sensor_values.expanding().max()
 
-        for key in key_group.itertuples(index=False):
-            context_start_cycle = int(key.context_start_cycle)
-            cutoff_cycle = int(key.cutoff_cycle)
+        unit_forecasts = forecast_unit_groups[(str(fd_name), int(unit_id))]
+        for key_values, forecast_group in unit_forecasts.groupby(key_cols, sort=True):
+            if not isinstance(key_values, tuple):
+                key_values = (key_values,)
+            key = dict(zip(key_cols, key_values))
+            context_start_cycle = int(key["context_start_cycle"])
+            cutoff_cycle = int(key["cutoff_cycle"])
             if cutoff_cycle not in unit_frame.index:
                 raise ValueError(f"Missing cutoff cycle {cutoff_cycle} for {fd_name} unit {unit_id}.")
             if uses_expanding_context:
@@ -239,21 +272,31 @@ def compute_past_sensor_ranges(
             for sensor in sensors:
                 minimum = float(minimums[sensor])
                 maximum = float(maximums[sensor])
+                forecast_n = 0
+                if minmax_scope == "past_and_forecast":
+                    sensor_forecast = forecast_group[forecast_group["sensor"] == sensor]["y_pred"]
+                    forecast_n = int(sensor_forecast.notna().sum())
+                    if forecast_n > 0:
+                        minimum = min(minimum, float(sensor_forecast.min()))
+                        maximum = max(maximum, float(sensor_forecast.max()))
                 value_range = maximum - minimum
-                rows.append(
-                    {
-                        "fd": fd_name,
-                        "unit_id": int(unit_id),
-                        "context_start_cycle": context_start_cycle,
-                        "cutoff_cycle": cutoff_cycle,
-                        "sensor": sensor,
-                        "past_min": minimum,
-                        "past_max": maximum,
-                        "past_range": value_range,
-                        "range_usable": bool(np.isfinite(value_range) and value_range > range_epsilon),
-                        "past_n": past_n,
-                    }
-                )
+                row = {
+                    "fd": fd_name,
+                    "unit_id": int(unit_id),
+                    "context_start_cycle": context_start_cycle,
+                    "cutoff_cycle": cutoff_cycle,
+                    "sensor": sensor,
+                    "past_min": minimum,
+                    "past_max": maximum,
+                    "past_range": value_range,
+                    "range_usable": bool(np.isfinite(value_range) and value_range > range_epsilon),
+                    "past_n": past_n,
+                    "forecast_n": forecast_n,
+                    "minmax_scope": minmax_scope,
+                }
+                for col in mode_cols:
+                    row[col] = key[col]
+                rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -262,14 +305,17 @@ def compute_lhi_scores(
     past_ranges: pd.DataFrame,
     condition_means: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    range_key_cols = ["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"]
+    if "covariate_mode" in past_ranges.columns:
+        range_key_cols = ["covariate_mode", *range_key_cols]
     keyed = forecasts.merge(
         past_ranges,
-        on=["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"],
+        on=range_key_cols,
         how="left",
         validate="many_to_one",
     )
     if keyed["past_min"].isna().any() or keyed["past_range"].isna().any():
-        raise ValueError("Missing past-context min-max ranges for some forecast rows.")
+        raise ValueError("Missing min-max ranges for some forecast rows.")
     keyed = keyed[keyed["range_usable"]].copy()
     keyed["y_pred_minmax"] = (keyed["y_pred"] - keyed["past_min"]) / keyed["past_range"]
     keyed = keyed.merge(
@@ -317,14 +363,17 @@ def aggregate_lhi_chunk(
     past_ranges: pd.DataFrame,
     condition_means: pd.DataFrame,
 ) -> pd.DataFrame:
+    range_key_cols = ["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"]
+    if "covariate_mode" in past_ranges.columns:
+        range_key_cols = ["covariate_mode", *range_key_cols]
     keyed = forecasts.merge(
         past_ranges,
-        on=["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"],
+        on=range_key_cols,
         how="left",
         validate="many_to_one",
     )
     if keyed["past_min"].isna().any() or keyed["past_range"].isna().any():
-        raise ValueError("Missing past-context min-max ranges for some forecast rows.")
+        raise ValueError("Missing min-max ranges for some forecast rows.")
     keyed = keyed[keyed["range_usable"]].copy()
     keyed["y_pred_minmax"] = (keyed["y_pred"] - keyed["past_min"]) / keyed["past_range"]
     keyed = keyed.merge(
@@ -432,7 +481,13 @@ def compute_lhi_scores_streaming(
                 )
         if missing_keys:
             missing_frame = pd.DataFrame(missing_keys).drop_duplicates()
-            ranges = compute_past_sensor_ranges(frames, missing_frame, args.sensors, args.range_epsilon)
+            ranges = compute_past_sensor_ranges(
+                frames,
+                missing_frame,
+                args.sensors,
+                args.range_epsilon,
+                minmax_scope=args.minmax_scope,
+            )
             for cache_key, range_group in ranges.groupby(
                 ["fd", "unit_id", "context_start_cycle", "cutoff_cycle"], sort=False
             ):
@@ -457,13 +512,16 @@ def compute_lhi_scores_streaming(
     if total_rows == 0:
         raise ValueError("No forecast rows left after filtering window_forecasts.csv.")
     print(f"Streamed LHI rows: forecast rows={total_rows:,}, usable drift rows={kept_rows:,}", flush=True)
-    past_ranges = (
-        pd.concat(range_partials, ignore_index=True)
-        .drop_duplicates(["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"])
-        .reset_index(drop=True)
-        if range_partials
-        else pd.DataFrame()
-    )
+    if range_partials:
+        past_ranges = pd.concat(range_partials, ignore_index=True)
+        range_key_cols = [
+            col
+            for col in ["covariate_mode", "fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"]
+            if col in past_ranges.columns
+        ]
+        past_ranges = past_ranges.drop_duplicates(range_key_cols).reset_index(drop=True)
+    else:
+        past_ranges = pd.DataFrame()
     scores, sensor_scores = finalize_lhi_partials(lhi_partials)
     return scores, sensor_scores, past_ranges
 
@@ -483,9 +541,12 @@ def compute_initial_forecast_baselines(
         if monitor.empty:
             monitor = group.copy()
         if baseline_cycles == 0:
-            first_start = int(monitor["forecast_start_cycle"].min())
-            baseline_group = monitor[monitor["forecast_start_cycle"] == first_start].copy()
-            baseline_source = f"first_monitor_forecast_block_start_{first_start}"
+            full_monitor = group[group["forecast_start_cycle"] > healthy_cycles].copy()
+            if full_monitor.empty:
+                full_monitor = monitor
+            first_start = int(full_monitor["forecast_start_cycle"].min())
+            baseline_group = full_monitor[full_monitor["forecast_start_cycle"] == first_start].copy()
+            baseline_source = f"first_full_monitor_forecast_block_start_{first_start}"
         else:
             first_cycle = int(monitor["cycle"].min())
             last_cycle = first_cycle + int(baseline_cycles) - 1
@@ -522,6 +583,116 @@ def compute_initial_forecast_baselines(
         )
     baseline_points = pd.concat(baseline_point_rows, ignore_index=True) if baseline_point_rows else pd.DataFrame()
     return baseline_points, pd.DataFrame(rows)
+
+
+def compute_raw_healthy_cycle_baselines(
+    frames: dict[str, pd.DataFrame],
+    condition_means: pd.DataFrame,
+    sensors: Sequence[str],
+    healthy_cycles: int,
+    range_epsilon: float,
+    score_index: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    baseline_rows = []
+    baseline_point_rows = []
+    required_units = score_index[["covariate_mode", "fd", "unit_id"]].drop_duplicates()
+    for (fd_name, unit_id), mode_group in required_units.groupby(["fd", "unit_id"], sort=True):
+        frame = frames[str(fd_name)]
+        unit_df = frame[
+            (frame["unit_id"] == int(unit_id)) & (frame["cycle"] <= int(healthy_cycles))
+        ].sort_values("cycle")
+        if unit_df.empty:
+            continue
+
+        sensor_values = unit_df.loc[:, sensors]
+        sensor_min = sensor_values.min()
+        sensor_range = sensor_values.max() - sensor_min
+        melted = unit_df.melt(
+            id_vars=["unit_id", "cycle", "op_condition_key"],
+            value_vars=list(sensors),
+            var_name="sensor",
+            value_name="y_pred",
+        )
+        melted["fd"] = fd_name
+        keyed = melted.merge(
+            condition_means,
+            on=["fd", "unit_id", "op_condition_key", "sensor"],
+            how="left",
+            validate="many_to_one",
+        )
+        keyed["past_min"] = keyed["sensor"].map(sensor_min.to_dict())
+        keyed["past_range"] = keyed["sensor"].map(sensor_range.to_dict())
+        keyed = keyed[
+            keyed["healthy_condition_mean_raw"].notna()
+            & keyed["past_range"].notna()
+            & (keyed["past_range"] > float(range_epsilon))
+        ].copy()
+        if keyed.empty:
+            continue
+
+        keyed["y_pred_minmax"] = (keyed["y_pred"] - keyed["past_min"]) / keyed["past_range"]
+        keyed["healthy_condition_mean_minmax"] = (
+            keyed["healthy_condition_mean_raw"] - keyed["past_min"]
+        ) / keyed["past_range"]
+        keyed["drift"] = (keyed["y_pred_minmax"] - keyed["healthy_condition_mean_minmax"]).abs()
+        keyed["drift_sq"] = keyed["drift"] ** 2
+        healthy_scores = (
+            keyed.groupby(["fd", "unit_id", "cycle"], sort=True)
+            .agg(
+                d_mae=("drift", "mean"),
+                d_rmse=("drift_sq", lambda s: float(np.sqrt(np.mean(s)))),
+                sensor_count=("sensor", "nunique"),
+                row_count=("drift", "size"),
+            )
+            .reset_index()
+        )
+
+        for mode in sorted(mode_group["covariate_mode"].unique()):
+            mode_scores = healthy_scores.copy()
+            mode_scores["covariate_mode"] = mode
+            mode_scores["cutoff_cycle"] = int(healthy_cycles)
+            mode_scores["forecast_start_cycle"] = 1
+            baseline_source = f"raw_observed_cycles_1_to_{int(healthy_cycles)}"
+            baseline_point_rows.append(
+                mode_scores[
+                    [
+                        "covariate_mode",
+                        "fd",
+                        "unit_id",
+                        "cutoff_cycle",
+                        "forecast_start_cycle",
+                        "cycle",
+                        "d_mae",
+                        "d_rmse",
+                        "sensor_count",
+                        "row_count",
+                    ]
+                ].assign(baseline_source=baseline_source)
+            )
+            baseline_rows.append(
+                {
+                    "covariate_mode": mode,
+                    "fd": fd_name,
+                    "unit_id": int(unit_id),
+                    "b_mae": float(mode_scores["d_mae"].mean()),
+                    "b_rmse": float(mode_scores["d_rmse"].mean()),
+                    "baseline_start_cycle": int(mode_scores["cycle"].min()),
+                    "baseline_end_cycle": int(mode_scores["cycle"].max()),
+                    "baseline_rows": int(len(mode_scores)),
+                    "baseline_source": baseline_source,
+                }
+            )
+
+    if not baseline_rows:
+        raise ValueError(f"No raw healthy-cycle baselines were computed from cycles 1..{healthy_cycles}.")
+    baseline_points = pd.concat(baseline_point_rows, ignore_index=True)
+    baselines = pd.DataFrame(baseline_rows)
+    expected = required_units.set_index(["covariate_mode", "fd", "unit_id"]).index
+    actual = baselines.set_index(["covariate_mode", "fd", "unit_id"]).index
+    if len(expected.difference(actual)) > 0:
+        missing = list(expected.difference(actual))[:5]
+        raise ValueError(f"Missing raw healthy-cycle baseline for forecast units, examples: {missing}")
+    return baseline_points, baselines
 
 
 def add_lhi_columns(scores: pd.DataFrame, baselines: pd.DataFrame, lhi_epsilon: float) -> pd.DataFrame:
@@ -660,7 +831,14 @@ def main() -> None:
     eval_split = str(run_config.get("eval_split", "train"))
     frames = load_eval_frames(args.data_dir, eval_split, args.fds)
     condition_means = build_condition_means(frames, args.sensors, args.healthy_cycles)
-    if args.chunksize and args.chunksize > 0:
+    use_streaming = bool(args.chunksize and args.chunksize > 0 and args.minmax_scope == "past_context")
+    if args.chunksize and args.chunksize > 0 and args.minmax_scope == "past_and_forecast":
+        print(
+            "Using in-memory LHI path because --minmax_scope past_and_forecast requires forecast values "
+            "from complete windows when computing min-max ranges.",
+            flush=True,
+        )
+    if use_streaming:
         all_scores, sensor_scores, past_ranges = compute_lhi_scores_streaming(
             args=args,
             frames=frames,
@@ -668,20 +846,36 @@ def main() -> None:
         )
     else:
         forecasts = load_window_forecasts(args)
-        past_ranges = compute_past_sensor_ranges(frames, forecasts, args.sensors, args.range_epsilon)
+        past_ranges = compute_past_sensor_ranges(
+            frames,
+            forecasts,
+            args.sensors,
+            args.range_epsilon,
+            minmax_scope=args.minmax_scope,
+        )
         all_scores, sensor_scores = compute_lhi_scores(
             forecasts=forecasts,
             past_ranges=past_ranges,
             condition_means=condition_means,
         )
-    baseline_points, baselines = compute_initial_forecast_baselines(
-        all_scores,
-        healthy_cycles=args.healthy_cycles,
-        baseline_cycles=args.baseline_cycles,
-    )
     scores = all_scores.copy()
     if scores.empty:
         raise ValueError("No LHI score rows were computed.")
+    if args.baseline_source == "raw_healthy_cycles":
+        baseline_points, baselines = compute_raw_healthy_cycle_baselines(
+            frames=frames,
+            condition_means=condition_means,
+            sensors=args.sensors,
+            healthy_cycles=args.healthy_cycles,
+            range_epsilon=args.range_epsilon,
+            score_index=scores,
+        )
+    else:
+        baseline_points, baselines = compute_initial_forecast_baselines(
+            scores,
+            healthy_cycles=args.healthy_cycles,
+            baseline_cycles=args.baseline_cycles,
+        )
     scores = add_lhi_columns(scores, baselines, args.lhi_epsilon)
     scores, top_drift_sensors = add_top_drift_sensors(scores, sensor_scores, args.top_k_sensors)
     scores = add_rolling_scores(scores, args.rolling_window)
