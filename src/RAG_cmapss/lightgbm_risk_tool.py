@@ -4,7 +4,7 @@ import pickle
 from pathlib import Path
 from typing import Any
 
-from .lightgbm_features import extract_lightgbm_features, feature_frame, top_feature_names
+from .lightgbm_features import RISK_FEATURE_COLUMNS, extract_lightgbm_features, feature_frame, top_feature_names
 
 
 DEFAULT_RISK_MODEL_PATH = Path("models/lightgbm_risk.pkl")
@@ -13,9 +13,8 @@ DEFAULT_RISK_MODEL_PATH = Path("models/lightgbm_risk.pkl")
 class LightGBMRiskTool:
     """Learned risk perception tool.
 
-    When no LightGBM model exists, the initial_or_lightgbm arm may provide a
-    deterministic cold-start policy in ``context["llm_risk_policy"]``. The
-    neutral fallback below is only for infrastructure failures.
+    In hybrid mode this tool is used only when a LightGBM risk model exists.
+    The neutral fallback below is kept only for infrastructure failures.
     """
 
     def __init__(
@@ -55,6 +54,7 @@ class LightGBMRiskTool:
             "tool_name": "LightGBMRiskTool",
             "model_path": str(self.model_path),
             "model_source": source,
+            "feature_schema": self.payload.get("feature_schema") if self.payload else None,
             "maintenance_risk_score": round(float(score), 6),
             "predicted_risk_stage": stage,
             "confidence": confidence,
@@ -69,7 +69,7 @@ class LightGBMRiskTool:
         assert self.payload is not None
         model = self.payload["model"]
         columns = self.payload.get("feature_columns")
-        frame = feature_frame([features])
+        frame = feature_frame([features], columns=columns or RISK_FEATURE_COLUMNS)
         if columns:
             frame = frame.reindex(columns=columns, fill_value=0.0)
         probabilities = model.predict_proba(frame)

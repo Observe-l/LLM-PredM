@@ -9,6 +9,7 @@ from typing import Any
 from .config import DEFAULT_KG_DIR
 from .lightgbm_features import (
     FEATURE_COLUMNS,
+    RISK_FEATURE_COLUMNS,
     filter_risk_training_rows,
     filter_update_training_rows,
     read_reflection_training_rows,
@@ -58,12 +59,24 @@ def train_lightgbm_models(
     risk_rows = filter_risk_training_rows(rows)
     if len(risk_rows) >= min_rows and len(set(risk_labels_from_reflection_rows(risk_rows))) >= 2:
         model = _new_classifier(LGBMClassifier)
-        x = training_features_from_reflection_rows(risk_rows)
+        x = training_features_from_reflection_rows(risk_rows, columns=RISK_FEATURE_COLUMNS)
         y = risk_labels_from_reflection_rows(risk_rows)
         model.fit(x, y)
         path = output_dir / "lightgbm_risk.pkl"
-        _save_model(path, model)
-        summary["models"]["risk"] = {"path": str(path), "rows": len(risk_rows), "classes": list(map(int, model.classes_))}
+        _save_model(path, model, feature_columns=RISK_FEATURE_COLUMNS, feature_schema="risk_v2_no_feedback_or_action_result")
+        summary["models"]["risk"] = {
+            "path": str(path),
+            "rows": len(risk_rows),
+            "classes": list(map(int, model.classes_)),
+            "feature_schema": "risk_v2_no_feedback_or_action_result",
+            "excluded_features": [
+                "action_to_peak_gap",
+                "action_to_warning_gap",
+                "action_to_persistence_gap",
+                "previous_action_type_code",
+                "feedback_label_code",
+            ],
+        }
     else:
         summary["models"]["risk"] = {"skipped": "not enough labeled rows or only one class", "rows": len(risk_rows)}
 
@@ -78,7 +91,7 @@ def train_lightgbm_models(
             x = training_features_from_reflection_rows(update_rows)
             model.fit(x, labels)
             path = output_dir / filename
-            _save_model(path, model)
+            _save_model(path, model, feature_columns=FEATURE_COLUMNS, feature_schema=f"update_{target}_v1")
             summary["models"][target] = {"path": str(path), "rows": len(update_rows), "classes": list(model.classes_)}
         else:
             summary["models"][target] = {
@@ -91,8 +104,18 @@ def train_lightgbm_models(
     return summary
 
 
-def _save_model(path: Path, model: Any) -> None:
-    payload = {"model": model, "feature_columns": FEATURE_COLUMNS, "classes": list(model.classes_)}
+def _save_model(
+    path: Path,
+    model: Any,
+    feature_columns: list[str],
+    feature_schema: str,
+) -> None:
+    payload = {
+        "model": model,
+        "feature_columns": feature_columns,
+        "feature_schema": feature_schema,
+        "classes": list(model.classes_),
+    }
     with path.open("wb") as f:
         pickle.dump(payload, f)
 

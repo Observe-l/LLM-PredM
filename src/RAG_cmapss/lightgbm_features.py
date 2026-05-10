@@ -76,6 +76,18 @@ CATEGORICAL_FEATURES = [
 
 FEATURE_COLUMNS = [*NUMERIC_FEATURES, *CATEGORICAL_FEATURES]
 
+# Risk prediction runs before an action has been executed and before feedback exists.
+# Keep this schema limited to features that are available both at online inference
+# time and when rebuilding the same forecast state from reflection rows.
+RISK_EXCLUDED_FEATURES = {
+    "action_to_peak_gap",
+    "action_to_warning_gap",
+    "action_to_persistence_gap",
+    "previous_action_type_code",
+    "feedback_label_code",
+}
+RISK_FEATURE_COLUMNS = [name for name in FEATURE_COLUMNS if name not in RISK_EXCLUDED_FEATURES]
+
 ACTION_CODES = {
     "": 0,
     "continue_normal_operation": 1,
@@ -184,14 +196,15 @@ def extract_lightgbm_features(
     return {name: features.get(name, 0.0) for name in FEATURE_COLUMNS}
 
 
-def feature_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
+def feature_frame(rows: Iterable[dict[str, Any]], columns: list[str] | None = None) -> pd.DataFrame:
+    columns = columns or FEATURE_COLUMNS
     frame = pd.DataFrame(rows)
     if frame.empty:
-        return pd.DataFrame(columns=FEATURE_COLUMNS)
-    for col in FEATURE_COLUMNS:
+        return pd.DataFrame(columns=columns)
+    for col in columns:
         if col not in frame:
             frame[col] = 0.0
-    return frame[FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    return frame[columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
 
 def read_reflection_training_rows(path: str | Path) -> list[dict[str, Any]]:
@@ -205,9 +218,12 @@ def read_reflection_training_rows(path: str | Path) -> list[dict[str, Any]]:
         return [row for row in reader if any(str(value).strip() for value in row.values())]
 
 
-def training_features_from_reflection_rows(rows: list[dict[str, Any]]) -> pd.DataFrame:
+def training_features_from_reflection_rows(
+    rows: list[dict[str, Any]],
+    columns: list[str] | None = None,
+) -> pd.DataFrame:
     feature_rows = [_features_from_reflection_row(row) for row in rows]
-    return feature_frame(feature_rows)
+    return feature_frame(feature_rows, columns=columns)
 
 
 def risk_labels_from_reflection_rows(rows: list[dict[str, Any]]) -> list[int]:

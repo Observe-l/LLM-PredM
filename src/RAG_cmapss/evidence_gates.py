@@ -30,9 +30,9 @@ def build_risk_gate(
     consistency = case.get("multi_score_statistics", {}).get("d_rmse_lhi_consistency")
     reliable = bool(risk.get("unit_past_context_reliable"))
     threshold_overrides = threshold_overrides or {}
-    warmup_q95_gap_min = _override_float(threshold_overrides, "q95_excess_min", WARMUP_Q95_GAP_MIN)
-    warmup_q99_gap_min = _override_float(threshold_overrides, "q99_excess_min", WARMUP_Q99_GAP_MIN)
-    warmup_duration_min = _override_float(threshold_overrides, "persistent_duration_min", WARMUP_DURATION_MIN)
+    prior_q95_gap_min = _override_float(threshold_overrides, "q95_excess_min", WARMUP_Q95_GAP_MIN)
+    prior_q99_gap_min = _override_float(threshold_overrides, "q99_excess_min", WARMUP_Q99_GAP_MIN)
+    prior_duration_min = _override_float(threshold_overrides, "persistent_duration_min", WARMUP_DURATION_MIN)
 
     duration_q95_value = duration_q95 or 0.0
     duration_q99_value = duration_q99 or 0.0
@@ -44,25 +44,25 @@ def build_risk_gate(
         current_value=q95_gap,
         reflection_rules=reflection_rules,
         field="peak_minus_unit_q95",
-        warmup_min=warmup_q95_gap_min,
+        prior_min=prior_q95_gap_min,
     )
     q99_gap_calibration = _reflection_lower_bound_calibration(
         current_value=q99_gap,
         reflection_rules=reflection_rules,
         field="peak_minus_unit_q99",
-        warmup_min=warmup_q99_gap_min,
+        prior_min=prior_q99_gap_min,
     )
     q95_duration_calibration = _reflection_lower_bound_calibration(
         current_value=duration_q95,
         reflection_rules=reflection_rules,
         field="duration_above_unit_q95",
-        warmup_min=warmup_duration_min,
+        prior_min=prior_duration_min,
     )
     q99_duration_calibration = _reflection_lower_bound_calibration(
         current_value=duration_q99,
         reflection_rules=reflection_rules,
         field="duration_above_unit_q99",
-        warmup_min=warmup_duration_min,
+        prior_min=prior_duration_min,
     )
     strong_q95_excess = q95_gap_calibration["decision"] == "supports_maintenance"
     strong_q99_excess = q99_gap_calibration["decision"] == "supports_maintenance"
@@ -121,7 +121,7 @@ def build_risk_gate(
             ),
             "requires_increasing_trend": True,
             "absolute_peak_source": "learned_online_from_reflection_memory",
-            "gap_duration_source": "online_update_override" if threshold_overrides else "reflection_memory_with_warmup_prior",
+            "gap_duration_source": "online_update_override" if threshold_overrides else "reflection_memory_with_prior",
             "runtime_threshold_overrides": threshold_overrides,
         },
         "reason": _risk_reason(level, reliable, q95_gap, q99_gap, duration_q95, duration_q99, consistency),
@@ -213,7 +213,7 @@ def _reflection_lower_bound_calibration(
     current_value: float | None,
     reflection_rules: list[dict[str, Any]],
     field: str,
-    warmup_min: float,
+    prior_min: float,
 ) -> dict[str, Any]:
     correct_values: list[float] = []
     missed_values: list[float] = []
@@ -234,13 +234,13 @@ def _reflection_lower_bound_calibration(
     positive_boundary = _robust_lower_boundary(positive_values)
     positive_min = min(positive_values) if positive_values else None
     early_max = max(early_values) if early_values else None
-    learned_min = warmup_min
-    source = "warmup_prior"
+    learned_min = prior_min
+    source = "prior"
     separability = "unknown"
 
     if positive_boundary is not None and not missed_values and not early_values and len(correct_values) < MIN_CORRECT_ONLY_ANCHORS:
-        learned_min = warmup_min
-        source = "exploration_required_correct_only_memory_with_warmup_prior"
+        learned_min = prior_min
+        source = "exploration_required_correct_only_memory_with_prior"
     elif positive_boundary is not None and early_max is not None:
         if early_max < positive_boundary:
             learned_min = (early_max + positive_boundary) / 2.0
@@ -252,14 +252,14 @@ def _reflection_lower_bound_calibration(
             separability = "overlap"
     elif positive_boundary is not None:
         if missed_values and not correct_values:
-            learned_min = min(warmup_min, positive_boundary)
-            source = "missed_anchor_boundary_with_warmup_prior"
+            learned_min = min(prior_min, positive_boundary)
+            source = "missed_anchor_boundary_with_prior"
         else:
-            learned_min = min(warmup_min, positive_boundary)
-            source = "robust_positive_anchor_boundary_with_warmup_prior"
+            learned_min = min(prior_min, positive_boundary)
+            source = "robust_positive_anchor_boundary_with_prior"
     elif early_max is not None:
-        learned_min = max(warmup_min, early_max)
-        source = "above_early_anchor_max_with_warmup_prior"
+        learned_min = max(prior_min, early_max)
+        source = "above_early_anchor_max_with_prior"
 
     if current_value is None:
         decision = "blocks_maintenance"
@@ -273,7 +273,7 @@ def _reflection_lower_bound_calibration(
         "decision": decision,
         "current_value": current_value,
         "learned_min": round(learned_min, 6),
-        "warmup_min": warmup_min,
+        "prior_min": prior_min,
         "boundary_source": source,
         "separability": separability,
         "positive_min": round(positive_min, 6) if positive_min is not None else None,

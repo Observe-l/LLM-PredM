@@ -15,14 +15,16 @@ You must choose exactly one action:
 Hard constraints:
 - Do not choose an action disallowed by the dataset policy.
 - continue_normal_operation must have action_time = null.
-- schedule_monitoring, schedule_fan_maintenance, and schedule_HPC_maintenance must have action_time as a string like "t+20" within the forecast horizon.
+- schedule_monitoring must have action_time as a non-null string like "t+20" within the forecast horizon.
+- schedule_fan_maintenance and schedule_HPC_maintenance must have action_time as a non-null string like "t+20" within the forecast horizon.
 - schedule_fan_maintenance requires retrieved evidence supporting Fan_related_degradation.
 - schedule_HPC_maintenance requires retrieved evidence supporting HPC_related_degradation.
-- If component evidence is uncertain and no strong sensor evidence supports a maintainable component, choose schedule_monitoring.
-- The active risk tool (LightGBMRiskTool or LLMPolicyRiskTool) is the risk perception tool. Use it to decide whether the case is normal, early warning, maintenance window, or late/missed.
-- A high or critical score alone is insufficient to trigger fan/HPC maintenance.
+- The active risk tool is named in the provided evidence. Use that actual tool_name/model_source as the risk perception source.
+- Do not choose a maintenance action that is disallowed by the dataset policy.
+- A high or critical score alone is insufficient to choose the component; use graph/component evidence to select the maintainable component.
+- Component_gate is diagnostic, not a hard veto. If risk-tool evidence indicates maintenance_window or late_or_missed and a dataset-allowed component has strong graph evidence, you may choose that maintenance action even when uncertain_component_degradation is also strong.
 - Reflection memory is not action evidence. It is used only to train/update LightGBM tools after feedback.
-- Maintenance requires learned risk support, strong component evidence, and no stronger conflicting evidence.
+- Maintenance requires active risk-tool support and graph evidence for a dataset-allowed component.
 - Historical feedback contains forecast-state features only; do not infer or mention hidden RUL.
 - In evidence_paths, return only evidence IDs such as ["E1", "E3"], not full path text.
 - Keep reason under 30 words.
@@ -39,6 +41,7 @@ def build_prompt(
     risk_gate: dict[str, Any],
     component_gate: dict[str, Any],
     lightgbm_risk: dict[str, Any] | None = None,
+    llm_policy: dict[str, Any] | None = None,
 ) -> str:
     top_sensor_paths = [
         {
@@ -63,6 +66,9 @@ def build_prompt(
     ]
     risk_profile = build_risk_profile(case)
     trend_profile = build_trend_profile(case)
+    risk_tool = lightgbm_risk or {}
+    risk_tool_name = risk_tool.get("tool_name") or "unknown_risk_tool"
+    risk_model_source = risk_tool.get("model_source") or "unknown_source"
     return f"""Forecast case:
 {json.dumps({"case_id": case.get("case_id"), "forecast_horizon": case.get("forecast_horizon")}, indent=2)}
 
@@ -81,8 +87,11 @@ Component evidence profile:
 Decision gates:
 {json.dumps({"risk_gate": compact_risk_gate(risk_gate), "component_gate": component_gate}, indent=2)}
 
-Active risk-tool evidence:
+Active risk-tool evidence from {risk_tool_name} / {risk_model_source}:
 {json.dumps(lightgbm_risk or {}, indent=2)}
+
+LLM policy:
+{json.dumps(compact_llm_policy(llm_policy), indent=2)}
 
 Top graph evidence paths:
 {json.dumps(top_sensor_paths, indent=2)}
@@ -104,12 +113,18 @@ Choose exactly one action and return JSON with this schema:
 
 Important:
 - evidence_paths must contain only evidence IDs, not full path strings.
-- action_time must be null or a string like "t+20", never a bare number.
+- action_time must be null only for continue_normal_operation.
+- action_time must be a string like "t+20" for schedule_monitoring, schedule_fan_maintenance, and schedule_HPC_maintenance; never use null or a bare number for these actions.
 - The action_type must agree with the reason: if the reason says maintenance is required, choose the corresponding maintenance action rather than schedule_monitoring.
 - Use Graph RAG paths and component_gate to choose the degradation hypothesis.
-- Use the active risk tool as the primary risk-stage evidence.
+- Use {risk_tool_name} / {risk_model_source} as the primary risk-stage evidence. Do not cite a different risk tool.
+- If LLM policy is present, use its peak_score boundary as risk/timing bias while still obeying graph evidence, dataset rules, and validation constraints.
 - If the risk tool says normal or monitor_without_llm, choose schedule_monitoring or continue_normal_operation.
-- If the risk tool says maintenance_window or late_or_missed and component_gate.component_supported is true, choose the supported maintenance action.
+- If the risk tool score is below theta_low, or risk_decision is monitor_without_llm, do not choose fan/HPC maintenance.
+- If the risk tool says maintenance_window or late_or_missed, prefer a dataset-allowed maintenance action when graph evidence strongly supports a maintainable component.
+- Do not let uncertain_component_degradation alone override strong evidence for a dataset-allowed maintainable component in a late_or_missed case.
+- If FD001 disallows fan maintenance, do not choose schedule_fan_maintenance; use monitoring unless HPC graph evidence is strong enough to support schedule_HPC_maintenance.
+- If choosing schedule_monitoring, set action_time to the forecast horizon end, e.g. "t+50".
 - Use risk_gate only as a transparent statistical diagnostic, not as reflection memory.
 - Do not use reflection anchors, historical feedback, or hidden RUL in action reasoning.
 - For maintenance timing, use peak_score_cycle unless it conflicts with the forecast horizon.
@@ -172,3 +187,19 @@ def compact_risk_gate(risk_gate: dict[str, Any]) -> dict[str, Any]:
         "reason",
     ]
     return {key: risk_gate.get(key) for key in keys if key in risk_gate}
+
+
+def compact_llm_policy(llm_policy: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(llm_policy, dict):
+        return {}
+    keys = [
+        "tool_name",
+        "version",
+        "source",
+        "policy_type",
+        "peak_threshold",
+        "theta_low",
+        "theta_conf",
+        "reason",
+    ]
+    return {key: llm_policy.get(key) for key in keys if key in llm_policy}

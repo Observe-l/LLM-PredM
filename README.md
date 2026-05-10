@@ -352,45 +352,38 @@ Reflection memory has two different roles:
 - Action reasoning: reflection memory is not passed to the Graph RAG +
   maintenance-action prompt. The action prompt uses current forecast evidence,
   graph/component evidence, dataset rules, and the current risk tool output.
-- Policy/adaptation: reflection memory may be used by the risk-policy controller
-  to calibrate the experiment-local `LLMPolicyRiskTool`, and by feedback-time
-  adaptation to update that policy tool or train/update LightGBM tools.
+- Policy/adaptation: in `llm_only`, initial policy design is strict zero-shot
+  and does not receive reflection memory, default numeric weights, or example
+  thresholds. After non-correct feedback, `LLMPolicyUpdateTool` may use
+  reflection memory as an update buffer. In `hybrid`, feedback may also
+  train/update LightGBM tools.
 
 ### Risk Policy Modes
 
-`joint_simulation` supports three risk-policy modes:
+`joint_simulation` supports two risk-policy modes:
 
-- `initial_or_lightgbm`: use a deterministic initial cold-start risk policy
-  until a LightGBM risk model is available; then use `lightgbm_risk.pkl`.
 - `llm_only`: ignore LightGBM risk models and use an experiment-local
   `models/llm_policy_tool.json`. If the tool does not exist, the LLM designs
-  its parameters once; later decision points call the deterministic tool.
+  its parameters once without default numeric weights or threshold ranges; later
+  decision points call the deterministic tool. Non-correct feedback is reviewed
+  by `LLMPolicyUpdateTool`.
 - `hybrid`: use LightGBM when available; otherwise use the experiment-local
-  `LLMPolicyRiskTool`.
+  `LLMPolicyRiskTool`. Before a risk model exists, hybrid uses a fixed
+  LightGBM warm-up protocol based on `documents/lightgbm_agentic.md`: the first
+  `--hybrid_warmup_engines` engines, default 5, are assigned
+  aggressive/balanced/conservative warm-up variants to collect diverse
+  reflection labels. After warm-up, training is attempted after every feedback;
+  as soon as the reflection labels satisfy LightGBM training requirements,
+  `lightgbm_risk.pkl` takes over subsequent risk scoring.
 
 The two main experiment arms are:
 
 ```text
-Arm A: initial_or_lightgbm
-Arm B: llm_only
+Arm A: llm_only
+Arm B: hybrid
 ```
 
 ### Smoke Tests
-
-Run the initial/LightGBM arm:
-
-```bash
-/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.RAG_cmapss.joint_simulation \
-  --lhi_dir outputs/CMAPSS/cluster_20/lhi_fix \
-  --output_dir outputs/CMAPSS/RAG/smoke_initial_or_lightgbm \
-  --fds FD001 \
-  --max_engines 2 \
-  --risk_policy_mode initial_or_lightgbm \
-  --model qwen3.5:9b \
-  --timeout 60 \
-  --ollama_num_predict 512 \
-  --save_recent_ollama_outputs 8
-```
 
 Run the LLM-only policy arm:
 
@@ -407,21 +400,22 @@ Run the LLM-only policy arm:
   --save_recent_ollama_outputs 8
 ```
 
-### Full FD001 Runs
-
-Initial policy with optional online LightGBM:
+Run the hybrid arm:
 
 ```bash
 /home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.RAG_cmapss.joint_simulation \
   --lhi_dir outputs/CMAPSS/cluster_20/lhi_fix \
-  --output_dir outputs/CMAPSS/RAG/agentic_initial_or_lightgbm_fd001 \
+  --output_dir outputs/CMAPSS/RAG/smoke_hybrid \
   --fds FD001 \
-  --risk_policy_mode initial_or_lightgbm \
+  --max_engines 2 \
+  --risk_policy_mode hybrid \
   --model qwen3.5:9b \
-  --timeout 90 \
+  --timeout 60 \
   --ollama_num_predict 512 \
-  --save_recent_ollama_outputs 20
+  --save_recent_ollama_outputs 8
 ```
+
+### Full FD001 Runs
 
 LLM-only policy tool:
 
@@ -431,6 +425,20 @@ LLM-only policy tool:
   --output_dir outputs/CMAPSS/RAG/agentic_llm_only_fd001 \
   --fds FD001 \
   --risk_policy_mode llm_only \
+  --model qwen3.5:9b \
+  --timeout 90 \
+  --ollama_num_predict 512 \
+  --save_recent_ollama_outputs 20
+```
+
+Hybrid with optional online LightGBM:
+
+```bash
+/home/lwh/anaconda3/bin/conda run --no-capture-output -n default python -m src.RAG_cmapss.joint_simulation \
+  --lhi_dir outputs/CMAPSS/cluster_20/lhi_fix \
+  --output_dir outputs/CMAPSS/RAG/agentic_hybrid_fd001 \
+  --fds FD001 \
+  --risk_policy_mode hybrid \
   --model qwen3.5:9b \
   --timeout 90 \
   --ollama_num_predict 512 \
@@ -448,8 +456,7 @@ If you already trained LightGBM models, pass them explicitly:
 
 In `llm_only` mode, `lightgbm_risk.pkl` is ignored by design. The LLM designs
 or updates `models/llm_policy_tool.json`, while scoring is performed by the
-tool. In `initial_or_lightgbm` and `hybrid`, the risk model is used when
-present.
+tool. In `hybrid`, the risk model is used when present.
 
 You can train LightGBM tools manually from reflection memory:
 
@@ -479,17 +486,21 @@ Each run writes:
 - `recent_ollama_outputs.json`: recent prompt/output audit records.
 - `feedback_logs.json`: simulated maintenance/breakdown feedback.
 - `kg_memory/reflection_rules.csv`: reflection memory generated from feedback.
-- `lightgbm_update_logs.json`: feedback-time adaptation decisions, training
-  summaries, update tool outputs, validation, and operations.
+- `llm_policy_update_logs.json`: LLM-only policy-update review records,
+  including skipped `correct_maintenance` rows and `LLMPolicyUpdateTool`
+  outputs after non-correct feedback.
+- `lightgbm_update_logs.json`: hybrid/LightGBM feedback-time adaptation
+  decisions, training summaries, update tool outputs, validation, and
+  operations. This file is not written by `llm_only` runs.
 - `lightgbm_update_operations.jsonl`: append-only threshold/timing/component
-  update operations.
+  update operations for hybrid/LightGBM runs.
 - `models/llm_policy_tool.json`: experiment-local deterministic policy tool
   designed/updated by the LLM in `llm_only` or cold-start `hybrid` mode.
 - `models/*.pkl`: online-trained LightGBM update/risk models when training
   conditions are satisfied.
 
 `correct_maintenance` feedback does not trigger policy or threshold-update
-review. It is recorded as feedback/reflection memory, but `lightgbm_update_logs`
+review. It is recorded as feedback/reflection memory; the relevant update log
 marks adaptation as `skipped_correct_maintenance`.
 
 ## Model Design
