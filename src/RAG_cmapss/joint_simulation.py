@@ -59,6 +59,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lhi_col", default="lhi_rmse_roll_mean")
     parser.add_argument("--lhi_trigger", type=float, default=1.0)
     parser.add_argument(
+        "--min_predm_cycle",
+        type=int,
+        default=None,
+        help=(
+            "Earliest forecast_start_cycle allowed into Layer-3 PredM. "
+            "Defaults to lhi_dir/run_config.json healthy_cycles + 1 when available."
+        ),
+    )
+    parser.add_argument(
         "--maintenance_rul_threshold",
         type=float,
         default=0.25,
@@ -155,6 +164,7 @@ def main() -> None:
     )
 
     scores, top_drift = load_lhi_frames(args.lhi_dir, load_top_drift_detail=args.load_top_drift_detail)
+    min_predm_cycle = resolve_min_predm_cycle(args)
     threshold_config = load_threshold_config(args.threshold_config)
     kg = KGStore(experiment_kg_dir)
     online_model_dir = args.online_model_dir or (args.output_dir / "models")
@@ -211,6 +221,9 @@ def main() -> None:
 
         for window in engine_windows:
             cutoff = int(window.iloc[0]["cutoff_cycle"])
+            forecast_start = int(window.iloc[0].get("forecast_start_cycle", cutoff + 1))
+            if min_predm_cycle is not None and forecast_start < min_predm_cycle:
+                continue
             if state.next_due_cutoff is not None and cutoff < state.next_due_cutoff:
                 continue
             peak_lhi = case_peak_lhi(window, args.lhi_col)
@@ -391,6 +404,7 @@ def main() -> None:
         "terminal_counts": count_values(item["terminal_reason"] for item in engine_summaries),
         "dry_run": bool(args.dry_run),
         "risk_policy_mode": args.risk_policy_mode,
+        "min_predm_cycle": min_predm_cycle,
         "outputs": {
             "action_hypotheses": str(action_log_path),
             "forecast_cases": str(cases_path),
@@ -450,6 +464,23 @@ def group_engine_windows(scores: pd.DataFrame, fds: list[str] | None):
         current_windows.append(window)
     if current_key is not None:
         yield current_key, current_windows
+
+
+def resolve_min_predm_cycle(args: argparse.Namespace) -> int | None:
+    if args.min_predm_cycle is not None:
+        return int(args.min_predm_cycle)
+    run_config_path = args.lhi_dir / "run_config.json"
+    if not run_config_path.exists():
+        return None
+    try:
+        config = json.loads(run_config_path.read_text())
+    except Exception:
+        return None
+    healthy_cycles = config.get("healthy_cycles")
+    try:
+        return int(healthy_cycles) + 1
+    except (TypeError, ValueError):
+        return None
 
 
 def current_llm_policy(args: argparse.Namespace, policy_path: Path) -> dict[str, Any]:
