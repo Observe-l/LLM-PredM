@@ -23,6 +23,7 @@ Hard constraints:
 - Do not choose a maintenance action that is disallowed by the dataset policy.
 - A high or critical score alone is insufficient to choose the component; use graph/component evidence to select the maintainable component.
 - Component_gate is diagnostic, not a hard veto. If risk-tool evidence indicates maintenance_window or late_or_missed and a dataset-allowed component has strong graph evidence, you may choose that maintenance action even when uncertain_component_degradation is also strong.
+- In late_or_missed cases, strong graph evidence for a dataset-allowed maintainable component should outweigh uncertain_component_degradation unless there is stronger conflicting maintainable-component evidence.
 - Reflection memory is not action evidence. It is used only to train/update LightGBM tools after feedback.
 - Maintenance requires active risk-tool support and graph evidence for a dataset-allowed component.
 - Historical feedback contains forecast-state features only; do not infer or mention hidden RUL.
@@ -123,6 +124,7 @@ Important:
 - If the risk tool score is below theta_low, or risk_decision is monitor_without_llm, do not choose fan/HPC maintenance.
 - If the risk tool says maintenance_window or late_or_missed, prefer a dataset-allowed maintenance action when graph evidence strongly supports a maintainable component.
 - Do not let uncertain_component_degradation alone override strong evidence for a dataset-allowed maintainable component in a late_or_missed case.
+- For FD001, schedule_HPC_maintenance is allowed; if late_or_missed and HPC graph evidence is strong, choose schedule_HPC_maintenance even if uncertain_component_degradation has a higher path score.
 - If FD001 disallows fan maintenance, do not choose schedule_fan_maintenance; use monitoring unless HPC graph evidence is strong enough to support schedule_HPC_maintenance.
 - If choosing schedule_monitoring, set action_time to the forecast horizon end, e.g. "t+50".
 - Use risk_gate only as a transparent statistical diagnostic, not as reflection memory.
