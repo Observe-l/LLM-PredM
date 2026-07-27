@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,8 @@ LHI_SCORE_USECOLS = [
     "top_drift_sensors",
     "top_drift_sensor_rmse_values",
     "top_drift_sensor_mae_values",
+    "window_top_drift_sensors",
+    "window_top_sensor_rmse_values",
     "d_mae_roll_mean",
     "d_rmse_roll_mean",
     "lhi_mae_roll_mean",
@@ -66,6 +69,13 @@ def load_lhi_frames(lhi_dir: str | Path, load_top_drift_detail: bool = True) -> 
     if load_top_drift_detail and not top_path.exists():
         raise FileNotFoundError(top_path)
     available_cols = list(pd.read_csv(scores_path, nrows=0).columns)
+    if "window_top_drift_sensors" not in available_cols:
+        warnings.warn(
+            f"{scores_path} predates window-level sensor RMSE ranking; "
+            "dominant_top_sensors will use the legacy per-cycle top-sensor aggregation.",
+            UserWarning,
+            stacklevel=2,
+        )
     usecols = [col for col in LHI_SCORE_USECOLS if col in available_cols]
     scores = pd.read_csv(scores_path, usecols=usecols)
     if load_top_drift_detail:
@@ -446,6 +456,12 @@ def _window_top_rows(top_drift: pd.DataFrame, first_row: pd.Series) -> pd.DataFr
 
 
 def _dominant_top_sensors(top_rows: pd.DataFrame, window: pd.DataFrame, limit: int = 3) -> list[str]:
+    window_ranked_sensors = _window_ranked_sensors(window, limit)
+    if window_ranked_sensors:
+        return window_ranked_sensors
+
+    # Backward compatibility for LHI outputs created before window-level sensor
+    # RMSE was persisted. New LHI outputs always take the branch above.
     if top_rows.empty:
         counter: Counter[str] = Counter()
         for value in window.get("top_drift_sensors", []):
@@ -460,6 +476,22 @@ def _dominant_top_sensors(top_rows: pd.DataFrame, window: pd.DataFrame, limit: i
         rmse = float(getattr(row, "sensor_d_rmse", 0.0))
         scores[str(row.sensor)] += 0.5 + 0.3 * (1.0 / max(rank, 1.0)) + 0.2 * (rmse / max_rmse)
     return [sensor for sensor, _ in sorted(scores.items(), key=lambda item: item[1], reverse=True)[:limit]]
+
+
+def _window_ranked_sensors(window: pd.DataFrame, limit: int) -> list[str]:
+    if "window_top_drift_sensors" not in window:
+        return []
+
+    rankings = {
+        tuple(_parse_sensor_list(str(value)))
+        for value in window["window_top_drift_sensors"]
+        if _parse_sensor_list(str(value))
+    }
+    if not rankings:
+        return []
+    if len(rankings) != 1:
+        raise ValueError("Forecast window contains inconsistent window_top_drift_sensors rankings.")
+    return list(next(iter(rankings)))[:limit]
 
 
 def _top_sensors_at_cycle(top_rows: pd.DataFrame, abs_cycle: int) -> list[str]:

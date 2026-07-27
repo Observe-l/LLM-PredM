@@ -17,6 +17,7 @@ from .kg_store import KGStore
 from .lightgbm_risk_tool import LightGBMRiskTool
 from .llm_policy_risk_tool import LLMPolicyRiskTool
 from .ollama_client import extract_json, ollama_chat
+from .kg_prompt_ablation import NO_KG_SYSTEM_PROMPT, build_no_kg_prompt
 from .prompt_builder import SYSTEM_PROMPT, build_prompt
 
 
@@ -83,6 +84,43 @@ def prepare_context(
     return context
 
 
+def prepare_no_kg_context(
+    case: dict[str, Any],
+    risk_threshold_overrides: dict[str, Any] | None = None,
+    llm_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    case = normalize_case(case)
+    risk_gate = build_risk_gate(case, reflection_rules=[], threshold_overrides=risk_threshold_overrides)
+    context = {
+        "case": case,
+        "dataset_rules": {
+            "dataset_subset": case.get("dataset_subset"),
+            "allowed_hypotheses": ["unspecified_component_degradation"],
+            "allowed_actions": [
+                "continue_normal_operation",
+                "schedule_monitoring",
+                "schedule_maintenance",
+            ],
+            "disallowed_actions": [
+                "schedule_fan_maintenance",
+                "schedule_HPC_maintenance",
+            ],
+        },
+        "sensor_paths": [],
+        "action_paths": [],
+        "candidate_action": None,
+        "reflection_rules": [],
+        "component_evidence_statistics": {},
+        "risk_gate": risk_gate,
+        "component_gate": {},
+        "reflection_memory_usage": "training_only_non_component",
+        "risk_threshold_overrides": risk_threshold_overrides or {},
+    }
+    if llm_policy:
+        context["llm_policy"] = llm_policy
+    return context
+
+
 def run_agent(
     case: dict[str, Any],
     kg_dir: str,
@@ -101,14 +139,24 @@ def run_agent(
     risk_policy_mode: str = "hybrid",
     llm_policy_tool_path: str | None = None,
     llm_policy: dict[str, Any] | None = None,
+    prompt_variant: str = "kg",
 ) -> dict[str, Any]:
-    context = prepare_context(
-        case,
-        kg_dir,
-        kg_store,
-        risk_threshold_overrides=risk_threshold_overrides,
-        llm_policy=llm_policy,
-    )
+    if prompt_variant not in {"kg", "no_kg_evidence"}:
+        raise ValueError(f"Unknown prompt_variant: {prompt_variant}")
+    if prompt_variant == "no_kg_evidence":
+        context = prepare_no_kg_context(
+            case,
+            risk_threshold_overrides=risk_threshold_overrides,
+            llm_policy=llm_policy,
+        )
+    else:
+        context = prepare_context(
+            case,
+            kg_dir,
+            kg_store,
+            risk_threshold_overrides=risk_threshold_overrides,
+            llm_policy=llm_policy,
+        )
     risk_policy_mode = str(risk_policy_mode or "hybrid")
     controller_raw_outputs = []
     risk_tool = None
@@ -143,26 +191,46 @@ def run_agent(
     llm_fallback_used = False
     llm_errors: list[str] = []
     if dry_run:
-        action = rule_based_action(context)
-        raw_outputs: list[dict[str, Any] | str] = [*controller_raw_outputs, "<dry_run rule_based_action>"]
+        action = _fallback_action(context, prompt_variant)
+        raw_outputs: list[dict[str, Any] | str] = [
+            *controller_raw_outputs,
+            f"<dry_run {prompt_variant} fallback_action>",
+        ]
     elif not _should_activate_llm(context):
-        action = low_risk_action(context)
+        action = low_risk_action(context, prompt_variant=prompt_variant)
         raw_outputs = [*controller_raw_outputs, "<lightgbm_low_risk_monitoring>"]
     else:
-        prompt = build_prompt(
-            case=context["case"],
-            dataset_rules=context["dataset_rules"],
-            sensor_paths=context["sensor_paths"],
-            action_paths=context["action_paths"],
-            component_evidence_statistics=context["component_evidence_statistics"],
-            risk_gate=context["risk_gate"],
-            component_gate=context["component_gate"],
-            lightgbm_risk=context["lightgbm_risk"],
-            llm_policy=context.get("llm_policy"),
-        )
+        if prompt_variant == "no_kg_evidence":
+            prompt = build_no_kg_prompt(
+                case=context["case"],
+                risk_gate=context["risk_gate"],
+                lightgbm_risk=context["lightgbm_risk"],
+                llm_policy=context.get("llm_policy"),
+            )
+            system_prompt = NO_KG_SYSTEM_PROMPT
+        else:
+            prompt = build_prompt(
+                case=context["case"],
+                dataset_rules=context["dataset_rules"],
+                sensor_paths=context["sensor_paths"],
+                action_paths=context["action_paths"],
+                component_evidence_statistics=context["component_evidence_statistics"],
+                risk_gate=context["risk_gate"],
+                component_gate=context["component_gate"],
+                lightgbm_risk=context["lightgbm_risk"],
+                llm_policy=context.get("llm_policy"),
+            )
+            system_prompt = SYSTEM_PROMPT
         raw_outputs = list(controller_raw_outputs)
         action = None
-        for attempt in _llm_attempts(prompt, context, num_predict=num_predict, format_json=format_json):
+        for attempt in _llm_attempts(
+            prompt,
+            context,
+            num_predict=num_predict,
+            format_json=format_json,
+            system_prompt=system_prompt,
+            prompt_variant=prompt_variant,
+        ):
             try:
                 raw = ollama_chat(
                     attempt["messages"],
@@ -211,36 +279,27 @@ def run_agent(
 
         if action is None:
             llm_fallback_used = True
-            action = rule_based_action(context)
+            action = _fallback_action(context, prompt_variant)
             action["reason"] = (
-                "LLM did not return parseable JSON after retry; used deterministic KG rule fallback. "
+                f"LLM did not return parseable JSON after retry; used {prompt_variant} fallback. "
                 + action.get("reason", "")
             )
 
-    validation = validate_action(
-        action,
-        context["case"],
-        context["dataset_rules"],
-        context["sensor_paths"],
-        risk_gate=context["risk_gate"],
-        lightgbm_risk=context["lightgbm_risk"],
-    )
+    validation = _validate_action_for_variant(action, context, prompt_variant)
 
     if not validation["valid"] and not dry_run and not llm_fallback_used:
         local_action = _local_validation_repair(action, validation, context)
         if local_action is not None:
             action = local_action
             action["local_validation_repair_used"] = True
-            validation = validate_action(
-                action,
-                context["case"],
-                context["dataset_rules"],
-                context["sensor_paths"],
-                risk_gate=context["risk_gate"],
-                lightgbm_risk=context["lightgbm_risk"],
-            )
+            validation = _validate_action_for_variant(action, context, prompt_variant)
 
     if not validation["valid"] and not dry_run and not llm_fallback_used:
+        evidence_instruction = (
+            "Revise the action using only the same forecast, raw sensor-error, and risk-tool evidence."
+            if prompt_variant == "no_kg_evidence"
+            else "Revise the action using the same forecast case, dataset rules, and graph evidence."
+        )
         repair_prompt = f"""The previous action is invalid.
 
 Previous action:
@@ -249,18 +308,19 @@ Previous action:
 Validation errors:
 {json.dumps(validation, indent=2)}
 
-Revise the action using the same forecast case, dataset rules, and graph evidence.
+{evidence_instruction}
 Return exactly one JSON object.
 Mandatory output rules:
 - continue_normal_operation must use "action_time": null.
 - schedule_monitoring must use a non-null "action_time" string like "t+20" within the forecast horizon.
+- schedule_maintenance must use a non-null "action_time" string like "t+20" within the forecast horizon.
 - schedule_HPC_maintenance and schedule_fan_maintenance must use a non-null "action_time" string like "t+20" within the forecast horizon.
 - If choosing schedule_monitoring, set action_time to the forecast horizon end.
 Return only valid JSON.
 """
         try:
             raw2 = ollama_chat(
-                [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt + "\n\n" + repair_prompt}],
+                [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt + "\n\n" + repair_prompt}],
                 model=model,
                 url=ollama_url,
                 temperature=temperature,
@@ -275,7 +335,7 @@ Return only valid JSON.
                 "format_json": format_json,
                 "num_predict": num_predict,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt + "\n\n" + repair_prompt},
                 ],
                 "raw_output": raw2,
@@ -284,85 +344,43 @@ Return only valid JSON.
                 repaired_action = extract_json(raw2)
                 repair_entry["parse_ok"] = True
                 action = repaired_action
-                validation = validate_action(
-                    action,
-                    context["case"],
-                    context["dataset_rules"],
-                    context["sensor_paths"],
-                    risk_gate=context["risk_gate"],
-                    lightgbm_risk=context["lightgbm_risk"],
-                )
+                validation = _validate_action_for_variant(action, context, prompt_variant)
                 if not validation["valid"]:
                     local_action = _local_validation_repair(action, validation, context)
                     if local_action is not None:
                         action = local_action
                         action["local_validation_repair_used"] = True
-                        validation = validate_action(
-                            action,
-                            context["case"],
-                            context["dataset_rules"],
-                            context["sensor_paths"],
-                            risk_gate=context["risk_gate"],
-                            lightgbm_risk=context["lightgbm_risk"],
-                        )
+                        validation = _validate_action_for_variant(action, context, prompt_variant)
                     if not validation["valid"]:
                         repair_entry["post_repair_validation"] = validation
                         llm_errors.append(f"repair_invalid: {validation['violations']}")
                         llm_fallback_used = True
-                        action = rule_based_action(context)
-                        action["reason"] = "Repair output was still invalid; used deterministic KG rule fallback."
-                        validation = validate_action(
-                            action,
-                            context["case"],
-                            context["dataset_rules"],
-                            context["sensor_paths"],
-                            risk_gate=context["risk_gate"],
-                            lightgbm_risk=context["lightgbm_risk"],
-                        )
+                        action = _fallback_action(context, prompt_variant)
+                        action["reason"] = f"Repair output was still invalid; used {prompt_variant} fallback."
+                        validation = _validate_action_for_variant(action, context, prompt_variant)
             except Exception as exc:
                 repair_entry["parse_ok"] = False
                 repair_entry["error"] = str(exc)
                 llm_errors.append(f"repair: {exc}")
                 llm_fallback_used = True
-                action = rule_based_action(context)
-                action["reason"] = "Repair output was not parseable; used deterministic KG rule fallback."
-                validation = validate_action(
-                    action,
-                    context["case"],
-                    context["dataset_rules"],
-                    context["sensor_paths"],
-                    risk_gate=context["risk_gate"],
-                    lightgbm_risk=context["lightgbm_risk"],
-                )
+                action = _fallback_action(context, prompt_variant)
+                action["reason"] = f"Repair output was not parseable; used {prompt_variant} fallback."
+                validation = _validate_action_for_variant(action, context, prompt_variant)
             raw_outputs.append(repair_entry)
         except Exception as exc:
             llm_errors.append(f"repair: {exc}")
             raw_outputs.append({"stage": "repair", "raw_output": "", "parse_ok": False, "error": str(exc)})
             llm_fallback_used = True
-            action = rule_based_action(context)
-            action["reason"] = "Repair call failed; used deterministic KG rule fallback."
-            validation = validate_action(
-                action,
-                context["case"],
-                context["dataset_rules"],
-                context["sensor_paths"],
-                risk_gate=context["risk_gate"],
-                lightgbm_risk=context["lightgbm_risk"],
-            )
+            action = _fallback_action(context, prompt_variant)
+            action["reason"] = f"Repair call failed; used {prompt_variant} fallback."
+            validation = _validate_action_for_variant(action, context, prompt_variant)
 
     if not validation["valid"]:
         llm_errors.append(f"final_invalid: {validation['violations']}")
         llm_fallback_used = True
-        action = rule_based_action(context)
-        action["reason"] = "Final action was invalid; used deterministic KG rule fallback."
-        validation = validate_action(
-            action,
-            context["case"],
-            context["dataset_rules"],
-            context["sensor_paths"],
-            risk_gate=context["risk_gate"],
-            lightgbm_risk=context["lightgbm_risk"],
-        )
+        action = _fallback_action(context, prompt_variant)
+        action["reason"] = f"Final action was invalid; used {prompt_variant} fallback."
+        validation = _validate_action_for_variant(action, context, prompt_variant)
 
     action["validation"] = validation
     action["validation_status"] = "valid" if validation["valid"] else "invalid"
@@ -373,6 +391,7 @@ Return only valid JSON.
     return {
         "case_id": context["case"].get("case_id"),
         "action": action,
+        "prompt_variant": prompt_variant,
         "context": {
             "dataset_rules": context["dataset_rules"],
             "candidate_action": context["candidate_action"],
@@ -398,19 +417,31 @@ def _llm_attempts(
     context: dict[str, Any],
     num_predict: int,
     format_json: bool,
+    system_prompt: str = SYSTEM_PROMPT,
+    prompt_variant: str = "kg",
 ) -> list[dict[str, Any]]:
+    retry_prompt = (
+        build_no_kg_prompt(
+            case=context["case"],
+            risk_gate=context["risk_gate"],
+            lightgbm_risk=context.get("lightgbm_risk"),
+            llm_policy=context.get("llm_policy"),
+        )
+        if prompt_variant == "no_kg_evidence"
+        else _minimal_json_prompt(context)
+    )
     return [
         {
             "stage": "initial",
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
             "format_json": format_json,
             "num_predict": num_predict,
         },
         {
             "stage": "minimal_retry",
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _minimal_json_prompt(context)},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": retry_prompt},
             ],
             "format_json": True,
             "num_predict": 384,
@@ -418,8 +449,8 @@ def _llm_attempts(
         {
             "stage": "plain_retry",
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _minimal_json_prompt(context)},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": retry_prompt},
             ],
             "format_json": False,
             "num_predict": 384,
@@ -458,7 +489,12 @@ def _local_validation_repair(
     context: dict[str, Any],
 ) -> dict[str, Any] | None:
     violations = list(validation.get("violations", []))
-    if action.get("action_type") in {"schedule_monitoring", "schedule_HPC_maintenance", "schedule_fan_maintenance"} and any(
+    if action.get("action_type") in {
+        "schedule_monitoring",
+        "schedule_maintenance",
+        "schedule_HPC_maintenance",
+        "schedule_fan_maintenance",
+    } and any(
         item in violations
         for item in [
             f"{action.get('action_type')} must have non-null action_time",
@@ -483,6 +519,21 @@ def _local_validation_repair(
         return repaired
 
     return None
+
+
+def _validate_action_for_variant(
+    action: dict[str, Any],
+    context: dict[str, Any],
+    prompt_variant: str,
+) -> dict[str, Any]:
+    return validate_action(
+        action,
+        context["case"],
+        context["dataset_rules"],
+        context["sensor_paths"],
+        risk_gate=context["risk_gate"],
+        lightgbm_risk=context["lightgbm_risk"],
+    )
 
 
 def _minimal_json_prompt(context: dict[str, Any]) -> str:
@@ -582,7 +633,35 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def low_risk_action(context: dict[str, Any]) -> dict[str, Any]:
+def no_kg_fallback_action(context: dict[str, Any]) -> dict[str, Any]:
+    case = context["case"]
+    horizon = case.get("forecast_horizon", {})
+    risk = context.get("lightgbm_risk", {})
+    return {
+        "action_type": "schedule_monitoring",
+        "action_time": f"t+{int(horizon.get('end', 20))}",
+        "risk_hypothesis": risk.get("predicted_risk_stage", "uncertain_risk"),
+        "degradation_hypothesis": "unspecified_component_degradation",
+        "confidence": float(risk.get("confidence", 0.5)),
+        "evidence_paths": [],
+        "reason": "No component evidence is available; scheduled conservative monitoring.",
+        "validation_status": "pending",
+    }
+
+
+def _fallback_action(context: dict[str, Any], prompt_variant: str) -> dict[str, Any]:
+    if prompt_variant == "no_kg_evidence":
+        return no_kg_fallback_action(context)
+    return rule_based_action(context)
+
+
+def low_risk_action(context: dict[str, Any], prompt_variant: str = "kg") -> dict[str, Any]:
+    if prompt_variant == "no_kg_evidence":
+        action = no_kg_fallback_action(context)
+        action["reason"] = (
+            "Active risk tool judged this case below the maintenance-reasoning activation threshold."
+        )
+        return action
     action = rule_based_action(context)
     if action["action_type"] in {"schedule_HPC_maintenance", "schedule_fan_maintenance"}:
         action["action_type"] = "schedule_monitoring"

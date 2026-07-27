@@ -238,7 +238,9 @@ LHI = log((D_RMSE + eps) / (B_RMSE + eps))
 Outputs:
 
 - `lhi_scores.csv`: per forecast cycle `D_MAE`, `D_RMSE`, `LHI_MAE`, `LHI_RMSE`,
-  `top_drift_sensors`, and top sensor drift values.
+  per-cycle `top_drift_sensors`, and one forecast-window sensor ranking in
+  `window_top_drift_sensors`. The window ranking computes one RMSE per sensor
+  across the complete forecast horizon and supplies the Graph RAG top-3 seeds.
 - `top_drift_sensors.csv`: long-format ranked sensor contributors for each forecast cycle.
 - `sensor_lhi_components.csv`: all sensor-level drift components before top-k filtering.
 - `lhi_baselines.csv`: unit-specific `B_MAE` and `B_RMSE`.

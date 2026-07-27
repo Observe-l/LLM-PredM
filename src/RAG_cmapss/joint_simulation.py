@@ -33,7 +33,11 @@ from .update_operator import append_update_operation, build_update_operation
 from .update_validator import validate_update
 
 
-MAINTENANCE_ACTIONS = {"schedule_HPC_maintenance", "schedule_fan_maintenance"}
+MAINTENANCE_ACTIONS = {
+    "schedule_maintenance",
+    "schedule_HPC_maintenance",
+    "schedule_fan_maintenance",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -78,6 +82,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--ollama_url", default=DEFAULT_OLLAMA_URL)
     parser.add_argument("--temperature", type=float, default=0)
+    parser.add_argument(
+        "--prompt_variant",
+        choices=["kg", "no_kg_evidence"],
+        default="kg",
+        help="Decision-LLM prompt arm. no_kg_evidence removes graph-derived evidence only.",
+    )
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--ollama_num_predict", type=int, default=512)
     parser.add_argument(
@@ -267,6 +277,7 @@ def main() -> None:
                     args=args,
                     policy_path=llm_policy_path,
                 ),
+                prompt_variant=args.prompt_variant,
             )
             result["latency_sec"] = round(time.time() - started, 3)
             result["lhi_gate"] = {"column": args.lhi_col, "peak_lhi": peak_lhi, "trigger": args.lhi_trigger}
@@ -304,7 +315,12 @@ def main() -> None:
                     action,
                     feedback_logs,
                     experiment_kg_dir,
-                    component_stats=result.get("context", {}).get("component_evidence_statistics"),
+                    component_stats=(
+                        None
+                        if args.prompt_variant == "no_kg_evidence"
+                        else result.get("context", {}).get("component_evidence_statistics")
+                    ),
+                    component_aware=args.prompt_variant != "no_kg_evidence",
                 )
                 new_model_path = maybe_run_update_tool(
                     args=args,
@@ -353,7 +369,12 @@ def main() -> None:
                 last_component_stats = None
                 last_context = {}
             assert last_action is not None
-            feedback = breakdown_feedback(last_case, last_action, engine_failure_cycle(engine_windows))
+            feedback = breakdown_feedback(
+                last_case,
+                last_action,
+                engine_failure_cycle(engine_windows),
+                component_aware=args.prompt_variant != "no_kg_evidence",
+            )
             reflection_rule = append_feedback_and_rule(
                 feedback,
                 last_case,
@@ -361,6 +382,7 @@ def main() -> None:
                 feedback_logs,
                 experiment_kg_dir,
                 component_stats=last_component_stats,
+                component_aware=args.prompt_variant != "no_kg_evidence",
             )
             new_model_path = maybe_run_update_tool(
                 args=args,
@@ -404,6 +426,7 @@ def main() -> None:
         "terminal_counts": count_values(item["terminal_reason"] for item in engine_summaries),
         "dry_run": bool(args.dry_run),
         "risk_policy_mode": args.risk_policy_mode,
+        "prompt_variant": args.prompt_variant,
         "min_predm_cycle": min_predm_cycle,
         "outputs": {
             "action_hypotheses": str(action_log_path),
@@ -631,7 +654,11 @@ def maintenance_feedback(
         "action_id": f"ActionHypothesis_{case['case_id']}",
         "feedback_label": feedback_label,
         "maintenance_needed": bool(is_reasonable),
-        "component_feedback": "correct" if is_reasonable else "unknown",
+        "component_feedback": (
+            "not_evaluated"
+            if action.get("action_type") == "schedule_maintenance"
+            else "correct" if is_reasonable else "unknown"
+        ),
         "feedback_time": action.get("action_time"),
         "action_abs_cycle": action_abs_cycle,
         "failure_cycle": failure_cycle,
@@ -645,8 +672,9 @@ def breakdown_feedback(
     case: dict[str, Any],
     action: dict[str, Any],
     failure_cycle: int,
+    component_aware: bool = True,
 ) -> dict[str, Any]:
-    likely_component = likely_component_from_case(case)
+    likely_component = likely_component_from_case(case) if component_aware else None
     fd_name = str(case["dataset_subset"])
     unit_id = int(case["unit_id"])
     label = {
@@ -676,9 +704,16 @@ def append_feedback_and_rule(
     feedback_logs: list[dict[str, Any]],
     experiment_kg_dir: Path,
     component_stats: dict[str, Any] | None = None,
+    component_aware: bool = True,
 ) -> dict[str, Any] | None:
     feedback_logs.append(feedback)
-    rule = feedback_to_rule(feedback, case, action, component_stats=component_stats)
+    rule = feedback_to_rule(
+        feedback,
+        case,
+        action,
+        component_stats=component_stats,
+        component_aware=component_aware,
+    )
     if rule is not None:
         append_reflection_rule(experiment_kg_dir, rule)
     return rule

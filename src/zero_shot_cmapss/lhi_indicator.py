@@ -713,11 +713,15 @@ def add_top_drift_sensors(
     scores: pd.DataFrame,
     sensor_scores: pd.DataFrame,
     top_k: int,
+    window_top_k: int = 3,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if top_k < 1:
         raise ValueError("--top_k_sensors must be >= 1.")
+    if window_top_k < 1:
+        raise ValueError("window_top_k must be >= 1.")
 
     key_cols = ["covariate_mode", "fd", "unit_id", "cutoff_cycle", "forecast_start_cycle", "cycle"]
+    window_key_cols = [col for col in key_cols if col != "cycle"]
     ranked = sensor_scores.merge(scores[key_cols], on=key_cols, how="inner").copy()
     if ranked.empty:
         empty_cols = key_cols + [
@@ -733,7 +737,50 @@ def add_top_drift_sensors(
             top_drift_sensors="",
             top_drift_sensor_rmse_values="",
             top_drift_sensor_mae_values="",
+            window_top_drift_sensors="",
+            window_top_sensor_rmse_values="",
         ), pd.DataFrame(columns=empty_cols)
+
+    # Compute one RMSE per sensor over the complete forecast window.  The
+    # sensor-level rows may already aggregate more than one drift observation,
+    # so reconstruct the squared-error numerator before combining cycles.
+    ranked["_sensor_d_squared_sum"] = ranked["sensor_d_rmse"].pow(2) * ranked["n"]
+    window_sensor_scores = (
+        ranked.groupby(window_key_cols + ["sensor"], sort=True)
+        .agg(
+            sensor_d_squared_sum=("_sensor_d_squared_sum", "sum"),
+            window_sensor_n=("n", "sum"),
+        )
+        .reset_index()
+    )
+    window_sensor_scores["window_sensor_d_rmse"] = np.sqrt(
+        window_sensor_scores["sensor_d_squared_sum"] / window_sensor_scores["window_sensor_n"]
+    )
+    window_sensor_scores = window_sensor_scores.sort_values(
+        window_key_cols + ["window_sensor_d_rmse", "sensor"],
+        ascending=[True] * len(window_key_cols) + [False, True],
+    )
+    window_sensor_scores["window_sensor_rank"] = (
+        window_sensor_scores.groupby(window_key_cols, sort=False).cumcount() + 1
+    )
+    window_top_rows = window_sensor_scores[
+        window_sensor_scores["window_sensor_rank"] <= window_top_k
+    ].copy()
+
+    window_summary_rows = []
+    for key, group in window_top_rows.groupby(window_key_cols, sort=True):
+        key_values = key if isinstance(key, tuple) else (key,)
+        row = dict(zip(window_key_cols, key_values))
+        group = group.sort_values("window_sensor_rank")
+        row["window_top_drift_sensors"] = ",".join(group["sensor"].astype(str))
+        row["window_top_sensor_rmse_values"] = ";".join(
+            f"{r.sensor}:{float(r.window_sensor_d_rmse):.6g}" for r in group.itertuples(index=False)
+        )
+        window_summary_rows.append(row)
+
+    window_summary = pd.DataFrame(window_summary_rows)
+    scores = scores.merge(window_summary, on=window_key_cols, how="left", validate="many_to_one")
+    ranked = ranked.drop(columns=["_sensor_d_squared_sum"])
 
     ranked = ranked.sort_values(
         key_cols + ["sensor_d_rmse", "sensor_d_mae", "sensor"],
@@ -758,7 +805,13 @@ def add_top_drift_sensors(
 
     summary = pd.DataFrame(summary_rows)
     scores = scores.merge(summary, on=key_cols, how="left", validate="one_to_one")
-    for col in ["top_drift_sensors", "top_drift_sensor_rmse_values", "top_drift_sensor_mae_values"]:
+    for col in [
+        "top_drift_sensors",
+        "top_drift_sensor_rmse_values",
+        "top_drift_sensor_mae_values",
+        "window_top_drift_sensors",
+        "window_top_sensor_rmse_values",
+    ]:
         scores[col] = scores[col].fillna("")
 
     ordered_cols = key_cols + [

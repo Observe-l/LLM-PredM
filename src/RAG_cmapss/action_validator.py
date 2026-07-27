@@ -7,6 +7,7 @@ from typing import Any
 ALLOWED_ACTIONS = {
     "continue_normal_operation",
     "schedule_monitoring",
+    "schedule_maintenance",
     "schedule_fan_maintenance",
     "schedule_HPC_maintenance",
 }

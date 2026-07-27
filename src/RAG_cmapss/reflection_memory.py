@@ -136,13 +136,19 @@ def feedback_to_rule(
     case: dict[str, Any],
     action: dict[str, Any],
     component_stats: dict[str, Any] | None = None,
+    component_aware: bool = True,
 ) -> dict[str, str] | None:
     dataset = str(case["dataset_subset"])
     pattern = infer_forecast_pattern(case["forecast_summary"])
     previous_action = str(action.get("action_type", ""))
     label = str(feedback["feedback_label"])
     feedback_id = str(feedback.get("feedback_id") or feedback.get("case_id") or "unknown")
-    features = reflection_features(case, action, component_stats=component_stats)
+    features = reflection_features(
+        case,
+        action,
+        component_stats=component_stats,
+        component_aware=component_aware,
+    )
 
     base = {
         "applies_to_dataset": dataset,
@@ -260,6 +266,7 @@ def reflection_features(
     case: dict[str, Any],
     action: dict[str, Any],
     component_stats: dict[str, Any] | None = None,
+    component_aware: bool = True,
 ) -> dict[str, Any]:
     summary = case.get("forecast_summary", {})
     risk = case.get("risk_statistics", {})
@@ -274,8 +281,19 @@ def reflection_features(
     score_at_action, sensors_at_action = _score_and_sensors_at_relative_cycle(case, action_time)
     dominant_sensors = [str(s).upper() for s in sensor.get("dominant_top_sensors") or summary.get("dominant_top_sensors", [])]
     peak_sensors = [str(s).upper() for s in sensor.get("top_sensor_at_peak_cycle") or summary.get("top_sensor_at_peak_cycle", [])]
-    component_evidence = _component_evidence_strength(previous_action=str(action.get("action_type", "")), sensors=dominant_sensors + peak_sensors + sensors_at_action)
-    component_stats = component_stats or case.get("component_evidence_statistics", {})
+    component_evidence = (
+        _component_evidence_strength(
+            previous_action=str(action.get("action_type", "")),
+            sensors=dominant_sensors + peak_sensors + sensors_at_action,
+        )
+        if component_aware
+        else "not_available"
+    )
+    component_stats = (
+        component_stats or case.get("component_evidence_statistics", {})
+        if component_aware
+        else {}
+    )
     lhi_stats = multi.get("lhi_rmse_roll_mean") or multi.get(case.get("score_source", {}).get("lhi_name", ""), {})
     d_stats = multi.get("d_rmse") or multi.get(case.get("score_source", {}).get("raw_score_name", ""), {})
     return {
@@ -313,9 +331,9 @@ def reflection_features(
         "top_sensor_at_action_time": "|".join(sensors_at_action),
         "top_sensor_at_peak_cycle": "|".join(peak_sensors),
         "sensor_pattern_stability": _csv_value(sensor.get("sensor_pattern_stability")),
-        "hpc_sensor_presence_ratio": _csv_value(sensor.get("hpc_sensor_presence_ratio")),
-        "fan_sensor_presence_ratio": _csv_value(sensor.get("fan_sensor_presence_ratio")),
-        "conflict_sensor_presence_ratio": _csv_value(sensor.get("conflict_sensor_presence_ratio")),
+        "hpc_sensor_presence_ratio": _csv_value(sensor.get("hpc_sensor_presence_ratio")) if component_aware else "",
+        "fan_sensor_presence_ratio": _csv_value(sensor.get("fan_sensor_presence_ratio")) if component_aware else "",
+        "conflict_sensor_presence_ratio": _csv_value(sensor.get("conflict_sensor_presence_ratio")) if component_aware else "",
         "component_evidence_strength": component_evidence,
         "hpc_path_score": _csv_value(component_stats.get("hpc_path_score")),
         "fan_path_score": _csv_value(component_stats.get("fan_path_score")),
