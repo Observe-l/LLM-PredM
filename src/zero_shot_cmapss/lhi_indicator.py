@@ -117,6 +117,9 @@ def load_window_forecasts(args: argparse.Namespace) -> pd.DataFrame:
         "y_pred",
         "op_condition_key",
         "prediction_length",
+        "n_condition_forecast_tasks",
+        "condition_prediction_points",
+        "condition_source",
     }
     forecasts = pd.read_csv(path, usecols=sorted(required))
     missing = required - set(forecasts.columns)
@@ -131,6 +134,12 @@ def load_window_forecasts(args: argparse.Namespace) -> pd.DataFrame:
     ].copy()
     if forecasts.empty:
         raise ValueError(f"No forecast rows left after filtering {path}.")
+    invalid_sources = set(forecasts["condition_source"].dropna().astype(str)) - {"past_context_only"}
+    if invalid_sources:
+        raise ValueError(
+            "LHI requires leakage-free past-context operating conditions; "
+            f"found condition_source values: {sorted(invalid_sources)}"
+        )
     return forecasts
 
 
@@ -148,6 +157,9 @@ def iter_window_forecast_chunks(args: argparse.Namespace):
         "y_pred",
         "op_condition_key",
         "prediction_length",
+        "n_condition_forecast_tasks",
+        "condition_prediction_points",
+        "condition_source",
     }
     reader = pd.read_csv(path, usecols=sorted(required), chunksize=args.chunksize)
     for chunk in reader:
@@ -160,6 +172,12 @@ def iter_window_forecast_chunks(args: argparse.Namespace):
             & mode_filter
             & chunk["sensor"].isin(args.sensors)
         ].copy()
+        invalid_sources = set(chunk["condition_source"].dropna().astype(str)) - {"past_context_only"}
+        if invalid_sources:
+            raise ValueError(
+                "LHI requires leakage-free past-context operating conditions; "
+                f"found condition_source values: {sorted(invalid_sources)}"
+            )
         if not chunk.empty:
             yield chunk
 
@@ -305,6 +323,7 @@ def compute_lhi_scores(
     past_ranges: pd.DataFrame,
     condition_means: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    forecasts = ensure_condition_forecast_metadata(forecasts)
     range_key_cols = ["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"]
     if "covariate_mode" in past_ranges.columns:
         range_key_cols = ["covariate_mode", *range_key_cols]
@@ -352,6 +371,8 @@ def compute_lhi_scores(
             sensor_count=("sensor", "nunique"),
             row_count=("drift", "size"),
             prediction_length=("prediction_length", "max"),
+            condition_count=("n_condition_forecast_tasks", "max"),
+            condition_prediction_points=("condition_prediction_points", "max"),
         )
         .reset_index()
     )
@@ -363,6 +384,7 @@ def aggregate_lhi_chunk(
     past_ranges: pd.DataFrame,
     condition_means: pd.DataFrame,
 ) -> pd.DataFrame:
+    forecasts = ensure_condition_forecast_metadata(forecasts)
     range_key_cols = ["fd", "unit_id", "context_start_cycle", "cutoff_cycle", "sensor"]
     if "covariate_mode" in past_ranges.columns:
         range_key_cols = ["covariate_mode", *range_key_cols]
@@ -399,9 +421,34 @@ def aggregate_lhi_chunk(
             healthy_condition_n=("healthy_condition_n", "min"),
             past_range=("past_range", "first"),
             prediction_length=("prediction_length", "max"),
+            condition_count=("n_condition_forecast_tasks", "max"),
+            condition_prediction_points=("condition_prediction_points", "max"),
         )
         .reset_index()
     )
+
+
+def ensure_condition_forecast_metadata(forecasts: pd.DataFrame) -> pd.DataFrame:
+    """Keep raw-observed/legacy direct callers compatible with the new aggregates."""
+    if {
+        "n_condition_forecast_tasks",
+        "condition_prediction_points",
+    }.issubset(forecasts.columns):
+        return forecasts
+    result = forecasts.copy()
+    if "n_condition_forecast_tasks" not in result.columns:
+        result["n_condition_forecast_tasks"] = 1
+    if "condition_prediction_points" not in result.columns:
+        prediction_length = (
+            result["prediction_length"]
+            if "prediction_length" in result.columns
+            else pd.Series(1, index=result.index)
+        )
+        result["condition_prediction_points"] = (
+            result["n_condition_forecast_tasks"].astype(int)
+            * prediction_length.astype(int)
+        )
+    return result
 
 
 def finalize_lhi_partials(partials: Sequence[pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -418,6 +465,8 @@ def finalize_lhi_partials(partials: Sequence[pd.DataFrame]) -> Tuple[pd.DataFram
             healthy_condition_n=("healthy_condition_n", "min"),
             past_range=("past_range", "first"),
             prediction_length=("prediction_length", "max"),
+            condition_count=("condition_count", "max"),
+            condition_prediction_points=("condition_prediction_points", "max"),
         )
         .reset_index()
     )
@@ -432,13 +481,24 @@ def finalize_lhi_partials(partials: Sequence[pd.DataFrame]) -> Tuple[pd.DataFram
             row_count=("n", "sum"),
             sensor_count=("sensor", "nunique"),
             prediction_length=("prediction_length", "max"),
+            condition_count=("condition_count", "max"),
+            condition_prediction_points=("condition_prediction_points", "max"),
         )
         .reset_index()
     )
     score_partials["d_mae"] = score_partials["drift_sum"] / score_partials["row_count"]
     score_partials["d_rmse"] = np.sqrt(score_partials["drift_sq_sum"] / score_partials["row_count"])
     scores = score_partials[
-        [*score_cols, "d_mae", "d_rmse", "sensor_count", "row_count", "prediction_length"]
+        [
+            *score_cols,
+            "d_mae",
+            "d_rmse",
+            "sensor_count",
+            "row_count",
+            "prediction_length",
+            "condition_count",
+            "condition_prediction_points",
+        ]
     ].copy()
     sensor_scores = sensor_scores[
         [

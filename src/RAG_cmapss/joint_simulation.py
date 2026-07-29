@@ -104,8 +104,8 @@ def parse_args() -> argparse.Namespace:
         choices=["llm_only", "hybrid"],
         default="llm_only",
         help=(
-            "Risk policy arm: llm_only uses only experiment-local LLMPolicyRiskTool and LLMPolicyUpdateTool; "
-            "hybrid uses LightGBM when available and otherwise uses the LLM policy tools."
+            "Risk policy arm: llm_only sends every upstream-LHI-qualified case to the LLM; "
+            "hybrid uses LightGBM when available and otherwise follows the same LHI-qualified policy."
         ),
     )
     parser.add_argument("--update_model_dir", type=Path, default=Path("models"))
@@ -126,15 +126,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Minimum number of engines before hybrid LightGBM handoff is attempted aggressively.",
-    )
-    parser.add_argument(
-        "--llm_policy_initial_peak_threshold",
-        type=float,
-        default=0.5,
-        help=(
-            "Initial peak_score boundary for LLMPolicyRiskTool exploration. "
-            "It is updated online only from this experiment's maintenance feedback."
-        ),
     )
     parser.add_argument(
         "--disable_update_tool",
@@ -187,6 +178,7 @@ def main() -> None:
 
     action_log_path = args.output_dir / "action_hypotheses.json"
     feedback_log_path = args.output_dir / "feedback_logs.json"
+    feedback_statistics_path = args.output_dir / "feedback_statistics.json"
     cases_path = args.output_dir / "forecast_cases.json"
     engine_summary_path = args.output_dir / "engine_summary.json"
     engine_summary_csv_path = args.output_dir / "engine_summary.csv"
@@ -227,6 +219,8 @@ def main() -> None:
         last_action: dict[str, Any] | None = None
         last_component_stats: dict[str, Any] | None = None
         last_context: dict[str, Any] | None = None
+        engine_action_history: list[dict[str, Any]] = []
+        terminal_feedback: dict[str, Any] | None = None
         terminal_reason = "breakdown"
 
         for window in engine_windows:
@@ -295,6 +289,25 @@ def main() -> None:
 
             action = result["action"]
             action_type = str(action.get("action_type"))
+            risk_decision = str(
+                result.get("context", {}).get("lightgbm_risk", {}).get("risk_decision", "")
+            )
+            if risk_decision == "monitor_without_llm":
+                action_selection_source = "policy_gate"
+            elif int(result.get("llm_calls", 0)) > 0:
+                action_selection_source = "llm"
+            else:
+                action_selection_source = "fallback"
+            engine_action_history.append(
+                {
+                    "case_id": case.get("case_id"),
+                    "cutoff_cycle": int(case.get("cutoff_cycle", cutoff)),
+                    "action_type": action_type,
+                    "action_time": action.get("action_time"),
+                    "risk_decision": risk_decision,
+                    "action_selection_source": action_selection_source,
+                }
+            )
             action_counts[action_type] = action_counts.get(action_type, 0) + 1
             llm_call_count += int(result.get("llm_calls", 0)) if not args.dry_run else 1
             last_case = case
@@ -308,7 +321,10 @@ def main() -> None:
                     action=action,
                     rul_threshold=args.maintenance_rul_threshold,
                     failure_cycle=engine_failure_cycle(engine_windows),
+                    component_aware=args.prompt_variant != "no_kg_evidence",
+                    action_history=engine_action_history,
                 )
+                terminal_feedback = feedback
                 reflection_rule = append_feedback_and_rule(
                     feedback,
                     case,
@@ -374,7 +390,9 @@ def main() -> None:
                 last_action,
                 engine_failure_cycle(engine_windows),
                 component_aware=args.prompt_variant != "no_kg_evidence",
+                action_history=engine_action_history,
             )
+            terminal_feedback = feedback
             reflection_rule = append_feedback_and_rule(
                 feedback,
                 last_case,
@@ -411,6 +429,10 @@ def main() -> None:
                 "terminal_reason": terminal_reason,
                 "last_case_id": last_case.get("case_id") if last_case else None,
                 "last_action_type": last_action.get("action_type") if last_action else None,
+                "feedback_label": terminal_feedback.get("feedback_label") if terminal_feedback else None,
+                "missed_maintenance_cause": (
+                    terminal_feedback.get("missed_maintenance_cause") if terminal_feedback else None
+                ),
             }
         )
         write_json(engine_summary_path, engine_summaries)
@@ -424,6 +446,7 @@ def main() -> None:
         "llm_decision_points": sum(action_counts.values()),
         "action_counts": action_counts,
         "terminal_counts": count_values(item["terminal_reason"] for item in engine_summaries),
+        "feedback_statistics": summarize_feedback(feedback_logs),
         "dry_run": bool(args.dry_run),
         "risk_policy_mode": args.risk_policy_mode,
         "prompt_variant": args.prompt_variant,
@@ -432,6 +455,7 @@ def main() -> None:
             "action_hypotheses": str(action_log_path),
             "forecast_cases": str(cases_path),
             "feedback_logs": str(feedback_log_path),
+            "feedback_statistics": str(feedback_statistics_path),
             "lightgbm_update_logs": str(lightgbm_update_log_path) if args.risk_policy_mode == "hybrid" else None,
             "llm_policy_update_logs": str(llm_policy_update_log_path),
             "engine_summary": str(engine_summary_path),
@@ -455,6 +479,7 @@ def main() -> None:
     write_json(zero_shot_score_log_path, zero_shot_score_logs)
     write_json(cases_path, forecast_cases)
     write_json(feedback_log_path, feedback_logs)
+    write_json(feedback_statistics_path, summarize_feedback(feedback_logs))
     if args.risk_policy_mode == "hybrid":
         write_json(lightgbm_update_log_path, lightgbm_update_logs)
     write_json(llm_policy_update_log_path, llm_policy_update_logs)
@@ -510,11 +535,7 @@ def current_llm_policy(args: argparse.Namespace, policy_path: Path) -> dict[str,
     policy = load_policy(policy_path)
     if policy is not None:
         return policy
-    return initial_policy(
-        peak_threshold=float(args.llm_policy_initial_peak_threshold),
-        theta_low=args.risk_theta_low,
-        theta_conf=args.risk_theta_conf,
-    )
+    return initial_policy(theta_conf=args.risk_theta_conf)
 
 
 def engine_history_frame(engine_windows: list[pd.DataFrame], cutoff_cycle: int) -> pd.DataFrame:
@@ -547,6 +568,7 @@ def clean_experiment_outputs(output_dir: Path) -> None:
         "action_hypotheses.json",
         "feedback_logs.jsonl",
         "feedback_logs.json",
+        "feedback_statistics.json",
         "forecast_cases.jsonl",
         "forecast_cases.json",
         "recent_ollama_outputs.jsonl",
@@ -607,14 +629,12 @@ def record_zero_shot_score(
             "maintenance_risk_score": risk.get("maintenance_risk_score"),
             "predicted_risk_stage": risk.get("predicted_risk_stage"),
             "risk_decision": risk.get("risk_decision"),
-            "theta_low": risk.get("theta_low"),
             "theta_conf": risk.get("theta_conf"),
             "tool_name": risk.get("tool_name"),
             "model_path": risk.get("model_path"),
             "top_features": risk.get("top_features"),
             "policy_source": policy.get("source"),
             "policy_type": policy.get("policy_type"),
-            "peak_threshold": policy.get("peak_threshold"),
             "positive_peak_min": policy.get("positive_peak_min"),
             "early_peak_max": policy.get("early_peak_max"),
             "correct_anchor_count": policy.get("correct_anchor_count"),
@@ -632,11 +652,14 @@ def maintenance_feedback(
     action: dict[str, Any],
     rul_threshold: float,
     failure_cycle: int,
+    component_aware: bool = True,
+    action_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     fd_name = str(case["dataset_subset"])
     unit_id = int(case["unit_id"])
     action_abs_cycle = int(case["cutoff_cycle"]) + action_relative_cycle(action, default=0)
-    remaining_rul = max(int(failure_cycle) - action_abs_cycle, 0)
+    signed_cycle_margin = int(failure_cycle) - action_abs_cycle
+    remaining_rul = max(signed_cycle_margin, 0)
     normalized_remaining_rul = (
         float(remaining_rul) / float(failure_cycle) if failure_cycle and failure_cycle > 0 else None
     )
@@ -645,15 +668,34 @@ def maintenance_feedback(
             f"Cannot compute maintenance feedback for {fd_name} unit {unit_id}: "
             "missing failure cycle from engine lifetimes and fallback."
         )
-    is_reasonable = normalized_remaining_rul < float(rul_threshold)
-    feedback_label = "correct_maintenance" if is_reasonable else "too_early"
+    missed_due_to_timing = action_abs_cycle >= int(failure_cycle)
+    is_reasonable = not missed_due_to_timing and normalized_remaining_rul < float(rul_threshold)
+    feedback_label = (
+        _missed_maintenance_label(case, action, component_aware=component_aware)
+        if missed_due_to_timing
+        else "correct_maintenance"
+        if is_reasonable
+        else "too_early"
+    )
+    timing_status = (
+        "after_failure"
+        if action_abs_cycle > int(failure_cycle)
+        else "at_failure"
+        if action_abs_cycle == int(failure_cycle)
+        else "timely"
+        if is_reasonable
+        else "too_early"
+    )
+    prior_monitoring_count = sum(
+        str(item.get("action_type")) == "schedule_monitoring" for item in (action_history or [])[:-1]
+    )
     return {
         "feedback_id": f"Feedback_{case['case_id']}_maintenance",
         "feedback_type": "maintenance_execution",
         "case_id": case["case_id"],
         "action_id": f"ActionHypothesis_{case['case_id']}",
         "feedback_label": feedback_label,
-        "maintenance_needed": bool(is_reasonable),
+        "maintenance_needed": bool(is_reasonable or missed_due_to_timing),
         "component_feedback": (
             "not_evaluated"
             if action.get("action_type") == "schedule_maintenance"
@@ -663,8 +705,15 @@ def maintenance_feedback(
         "action_abs_cycle": action_abs_cycle,
         "failure_cycle": failure_cycle,
         "remaining_rul": remaining_rul,
+        "signed_cycle_margin": signed_cycle_margin,
         "normalized_remaining_rul": normalized_remaining_rul,
         "maintenance_rul_threshold": rul_threshold,
+        "maintenance_timing_status": timing_status,
+        "missed_maintenance_cause": (
+            "maintenance_scheduled_at_or_after_failure" if missed_due_to_timing else None
+        ),
+        "lateness_cycles": max(action_abs_cycle - int(failure_cycle), 0),
+        "prior_monitoring_count": prior_monitoring_count,
     }
 
 
@@ -673,6 +722,7 @@ def breakdown_feedback(
     action: dict[str, Any],
     failure_cycle: int,
     component_aware: bool = True,
+    action_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     likely_component = likely_component_from_case(case) if component_aware else None
     fd_name = str(case["dataset_subset"])
@@ -681,6 +731,28 @@ def breakdown_feedback(
         "HPC": "missed_HPC_maintenance",
         "FAN": "missed_fan_maintenance",
     }.get(likely_component, "missed_maintenance_unknown")
+    previous_action_type = str(action.get("action_type", ""))
+    previous_history = (action_history or [])[-1] if action_history else {}
+    selection_source = str(previous_history.get("action_selection_source", ""))
+    if previous_action_type == "schedule_monitoring":
+        missed_cause = (
+            "monitoring_due_to_policy_gate"
+            if selection_source == "policy_gate"
+            else "monitoring_without_maintenance"
+        )
+    elif previous_action_type in MAINTENANCE_ACTIONS:
+        missed_cause = "maintenance_scheduled_at_or_after_failure"
+    elif action_history:
+        missed_cause = (
+            "continued_operation_due_to_policy_gate"
+            if selection_source == "policy_gate"
+            else "continued_operation_without_maintenance"
+        )
+    else:
+        missed_cause = "lhi_gate_not_triggered_before_failure"
+    prior_monitoring_count = sum(
+        str(item.get("action_type")) == "schedule_monitoring" for item in (action_history or [])
+    )
     return {
         "feedback_id": f"Feedback_{case['case_id']}_breakdown",
         "feedback_type": "breakdown",
@@ -690,10 +762,54 @@ def breakdown_feedback(
         "breakdown_time": f"cycle_{int(failure_cycle)}",
         "failure_cycle": int(failure_cycle),
         "scheduled_action_time": action.get("action_time"),
-        "timing_issue": "no_maintenance_scheduled"
-        if action.get("action_type") in {"continue_normal_operation", "schedule_monitoring"}
-        else "too_late",
+        "timing_issue": missed_cause,
+        "missed_maintenance_cause": missed_cause,
+        "maintenance_timing_status": "not_scheduled_before_failure",
+        "prior_action_type": previous_action_type,
+        "prior_action_selection_source": selection_source or None,
+        "prior_monitoring_count": prior_monitoring_count,
         "likely_component": likely_component,
+    }
+
+
+def _missed_maintenance_label(
+    case: dict[str, Any],
+    action: dict[str, Any],
+    component_aware: bool,
+) -> str:
+    component = likely_component_from_case(case) if component_aware else "unknown"
+    if component == "unknown":
+        component = {
+            "schedule_HPC_maintenance": "HPC",
+            "schedule_fan_maintenance": "FAN",
+        }.get(str(action.get("action_type")), "unknown")
+    return {
+        "HPC": "missed_HPC_maintenance",
+        "FAN": "missed_fan_maintenance",
+    }.get(component, "missed_maintenance_unknown")
+
+
+def summarize_feedback(feedback_logs: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(feedback_logs)
+    labels = count_values(str(item.get("feedback_label", "unknown")) for item in feedback_logs)
+    causes = count_values(
+        str(item.get("missed_maintenance_cause"))
+        for item in feedback_logs
+        if item.get("missed_maintenance_cause")
+    )
+    missed_total = sum(count for label, count in labels.items() if label.startswith("missed_"))
+    return {
+        "total_engines_with_feedback": total,
+        "feedback_label_counts": labels,
+        "feedback_label_rates": {
+            label: count / total if total else 0.0 for label, count in labels.items()
+        },
+        "missed_maintenance_total": missed_total,
+        "missed_maintenance_cause_counts": causes,
+        "missed_maintenance_cause_rates_among_missed": {
+            cause: count / missed_total if missed_total else 0.0 for cause, count in causes.items()
+        },
+        "strict_timing_rule": "maintenance is timely only when action_abs_cycle < failure_cycle",
     }
 
 
@@ -895,11 +1011,7 @@ def maybe_update_llm_policy_tool(
     ):
         return None
     policy_path = online_model_dir / "llm_policy_tool.json"
-    current_policy = load_policy(policy_path) or initial_policy(
-        peak_threshold=float(args.llm_policy_initial_peak_threshold),
-        theta_low=args.risk_theta_low,
-        theta_conf=args.risk_theta_conf,
-    )
+    current_policy = load_policy(policy_path) or initial_policy(theta_conf=args.risk_theta_conf)
     tool = LLMPolicyUpdateTool(policy_path=policy_path)
     result = tool.predict(
         current_policy=current_policy,

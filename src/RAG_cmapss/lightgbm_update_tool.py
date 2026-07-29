@@ -89,7 +89,19 @@ def _fallback_threshold_update(feedback: dict[str, Any]) -> str:
     if label in {"too_early", "over_maintenance"}:
         return "higher"
     if label in {"missed_HPC_maintenance", "missed_fan_maintenance", "missed_maintenance_unknown"}:
-        return "lower"
+        if str(feedback.get("missed_maintenance_cause", "")) in {
+            "maintenance_scheduled_at_or_after_failure",
+            "monitoring_without_maintenance",
+            "continued_operation_without_maintenance",
+            "lhi_gate_not_triggered_before_failure",
+        }:
+            return "unchanged"
+        if str(feedback.get("missed_maintenance_cause", "")) in {
+            "monitoring_due_to_policy_gate",
+            "continued_operation_due_to_policy_gate",
+        }:
+            return "lower"
+        return "unchanged"
     return "unchanged"
 
 

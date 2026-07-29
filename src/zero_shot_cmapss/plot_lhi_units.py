@@ -9,6 +9,14 @@ from typing import Sequence
 import pandas as pd
 
 FD_NAMES = ("FD001", "FD002", "FD003", "FD004")
+CMAPSS_COLUMNS = [
+    "unit_id",
+    "cycle",
+    "setting1",
+    "setting2",
+    "setting3",
+    *[f"s{i}" for i in range(1, 22)],
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -16,6 +24,13 @@ def parse_args() -> argparse.Namespace:
         description="Batch plot unit-level LHI curves from lhi_indicator.py outputs."
     )
     parser.add_argument("--lhi_dir", type=Path, default=Path("outputs/cluster_20/lhi"))
+    parser.add_argument("--data_dir", type=Path, default=Path("dataset/CMAPSSData"))
+    parser.add_argument(
+        "--eval_split",
+        choices=["auto", "train", "test"],
+        default="auto",
+        help="Dataset split used to cap each curve at the engine's final observed cycle.",
+    )
     parser.add_argument("--output_dir", type=Path, default=None)
     parser.add_argument("--fd", choices=list(FD_NAMES), required=True)
     parser.add_argument("--unit_start", type=int, required=True)
@@ -114,6 +129,35 @@ def infer_plot_stride(lhi_dir: Path, requested_stride: int) -> int:
     return 1
 
 
+def infer_eval_split(lhi_dir: Path, requested_split: str) -> str:
+    if requested_split != "auto":
+        return requested_split
+    lhi_config_path = lhi_dir / "run_config.json"
+    if lhi_config_path.exists():
+        lhi_config = json.loads(lhi_config_path.read_text())
+        forecast_dir = lhi_config.get("forecast_dir")
+        if forecast_dir:
+            forecast_config_path = Path(forecast_dir) / "run_config.json"
+            if forecast_config_path.exists():
+                return str(json.loads(forecast_config_path.read_text()).get("eval_split", "train"))
+    return "train"
+
+
+def load_final_cycles(data_dir: Path, fd_name: str, eval_split: str) -> pd.Series:
+    path = data_dir / fd_name / f"{eval_split}_{fd_name}.txt"
+    frame = pd.read_csv(path, sep=r"\s+", header=None, names=CMAPSS_COLUMNS, usecols=[0, 1])
+    return frame.groupby("unit_id", sort=True)["cycle"].max()
+
+
+def cap_at_final_cycles(frame: pd.DataFrame, final_cycles: pd.Series) -> pd.DataFrame:
+    result = frame.copy()
+    result["final_observed_cycle"] = result["unit_id"].map(final_cycles)
+    if result["final_observed_cycle"].isna().any():
+        missing = sorted(result.loc[result["final_observed_cycle"].isna(), "unit_id"].unique())
+        raise ValueError(f"Missing final observed cycle for units: {missing}")
+    return result[result["cycle"] <= result["final_observed_cycle"]].copy()
+
+
 def filter_plot_windows(frame: pd.DataFrame, plot_stride: int) -> pd.DataFrame:
     if plot_stride <= 1 or "forecast_start_cycle" not in frame.columns:
         return frame
@@ -205,8 +249,11 @@ def main() -> None:
 
     scores = load_scores(args.lhi_dir, args.fd, args.unit_start, args.unit_end, args.covariate_modes)
     plot_stride = infer_plot_stride(args.lhi_dir, args.plot_stride)
+    eval_split = infer_eval_split(args.lhi_dir, args.eval_split)
+    final_cycles = load_final_cycles(args.data_dir, args.fd, eval_split)
     scores = filter_plot_windows(scores, plot_stride)
     scores = filter_monitor_cycles(scores, args.healthy_cycles)
+    scores = cap_at_final_cycles(scores, final_cycles)
     if scores.empty:
         raise ValueError(
             f"No LHI rows remain after applying plot stride {plot_stride} "

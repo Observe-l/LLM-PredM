@@ -6,7 +6,7 @@ import math
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -35,9 +35,8 @@ SELECTED_SENSORS = [
     "s20",
     "s21",
 ]
-EXPERIMENT_MODES = ("cluster_covariate", "future_covariate", "no_covariate")
+EXPERIMENT_MODES = ("cluster_covariate", "no_covariate")
 MODE_ALIASES = {
-    "known_future": "cluster_covariate",
     "none": "no_covariate",
 }
 
@@ -103,6 +102,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap for quick smoke tests. 0 means use every eligible rolling window.",
     )
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument(
+        "--task_chunk_size",
+        type=int,
+        default=1024,
+        help=(
+            "Maximum condition tasks materialized before forecasts are appended to CSV. "
+            "This bounds memory for full stride-1 FD002/FD004 experiments."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--torch_dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument(
@@ -113,13 +121,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--covariate_modes",
         nargs="+",
-        choices=["cluster_covariate", "future_covariate", "no_covariate", "known_future", "none"],
+        choices=["cluster_covariate", "no_covariate", "none"],
         default=["cluster_covariate"],
         help=(
-            "Experiment modes. cluster_covariate first groups by operating condition and passes past/future "
-            "setting1-3 covariates; future_covariate passes raw multivariate sensors plus past/future setting1-3 "
-            "without grouping; no_covariate uses only raw multivariate sensors. Deprecated aliases: "
-            "known_future=cluster_covariate, none=no_covariate."
+            "Experiment modes. cluster_covariate extracts conditions from past context only and forecasts "
+            "a full horizon independently under every observed historical condition. no_covariate uses only "
+            "raw multivariate sensors. Deprecated alias: none=no_covariate."
         ),
     )
     parser.add_argument("--cross_learning", action="store_true")
@@ -166,16 +173,13 @@ def make_condition_keys(frame: pd.DataFrame) -> pd.Series:
     return canonical.astype(str).agg("|".join, axis=1)
 
 
-def add_window_condition_labels(history_raw: pd.DataFrame, future_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
+def add_history_condition_labels(history_raw: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
     history = history_raw.copy()
-    future = future_raw.copy()
     history["op_condition_key"] = make_condition_keys(history)
-    future["op_condition_key"] = make_condition_keys(future)
-    condition_order = sorted(pd.concat([history["op_condition_key"], future["op_condition_key"]]).unique())
+    condition_order = sorted(history["op_condition_key"].unique())
     condition_to_id = {condition_key: idx for idx, condition_key in enumerate(condition_order)}
     history["op_condition"] = history["op_condition_key"].map(condition_to_id).astype(int)
-    future["op_condition"] = future["op_condition_key"].map(condition_to_id).astype(int)
-    return history, future, len(condition_to_id)
+    return history, len(condition_to_id)
 
 
 def normalize_covariate_modes(modes: Sequence[str]) -> List[str]:
@@ -192,20 +196,41 @@ def normalize_covariate_modes(modes: Sequence[str]) -> List[str]:
 def build_future_frame(unit_raw: pd.DataFrame, forecast_start: int, prediction_length: int) -> pd.DataFrame:
     rows = []
     start_cycle = int(unit_raw.loc[forecast_start, "cycle"])
-    last_row = unit_raw.iloc[-1]
     for horizon_idx in range(prediction_length):
         row_idx = forecast_start + horizon_idx
         if row_idx < len(unit_raw):
-            row = unit_raw.loc[row_idx].copy()
+            row = unit_raw.loc[row_idx, ["cycle", *SENSOR_COLUMNS]].copy()
             row["has_ground_truth"] = True
         else:
-            row = last_row.copy()
-            row["cycle"] = start_cycle + horizon_idx
-            for sensor in SENSOR_COLUMNS:
-                row[sensor] = np.nan
-            row["has_ground_truth"] = False
+            row = pd.Series(
+                {
+                    "cycle": start_cycle + horizon_idx,
+                    **{sensor: np.nan for sensor in SENSOR_COLUMNS},
+                    "has_ground_truth": False,
+                }
+            )
         rows.append(row)
     return pd.DataFrame(rows).reset_index(drop=True)
+
+
+def build_metric_condition_keys(
+    unit_raw: pd.DataFrame,
+    forecast_start: int,
+    prediction_length: int,
+) -> np.ndarray:
+    """Return realized future condition keys for retrospective metrics only.
+
+    These values must never be added to a Chronos input. They are kept separate
+    from ``build_future_frame`` so the forecasting path cannot accidentally use
+    realized future operating settings.
+    """
+    keys = np.full(prediction_length, "", dtype=object)
+    observed_end = min(forecast_start + prediction_length, len(unit_raw))
+    if observed_end > forecast_start:
+        observed_future = unit_raw.iloc[forecast_start:observed_end]
+        observed_keys = make_condition_keys(observed_future).astype(str).to_numpy()
+        keys[: len(observed_keys)] = observed_keys
+    return keys
 
 
 def iter_windows(
@@ -252,13 +277,37 @@ def iter_windows(
         if last_start < first_forecast_start:
             continue
 
+        first_complete_metric_start: int | None = None
         for forecast_start in range(first_forecast_start, last_start + 1, stride):
             context_start = 0 if context_cap is None else max(0, forecast_start - context_cap)
             history_model = unit_model.loc[context_start : forecast_start - 1].copy()
             history_raw = unit_raw.loc[context_start : forecast_start - 1].copy()
             future_raw = build_future_frame(unit_raw, forecast_start, prediction_length)
-            history_labeled, future_labeled, n_conditions = add_window_condition_labels(history_raw, future_raw)
-            cycles = future_labeled["cycle"].to_numpy(dtype=np.int64)
+            metric_condition_keys = build_metric_condition_keys(
+                unit_raw,
+                forecast_start,
+                prediction_length,
+            )
+            history_labeled, n_conditions = add_history_condition_labels(history_raw)
+            cycles = future_raw["cycle"].to_numpy(dtype=np.int64)
+            has_full_ground_truth = bool(future_raw["has_ground_truth"].astype(bool).all())
+            if covariate_mode == "cluster_covariate":
+                historical_keys = set(history_labeled["op_condition_key"].astype(str))
+                realized_keys = {str(key) for key in metric_condition_keys if str(key)}
+                has_all_realized_condition_forecasts = realized_keys.issubset(historical_keys)
+            else:
+                has_all_realized_condition_forecasts = True
+            metric_window_complete_match = (
+                has_full_ground_truth and has_all_realized_condition_forecasts
+            )
+            if metric_window_complete_match and first_complete_metric_start is None:
+                first_complete_metric_start = int(cycles[0])
+            metric_window_selected = bool(
+                metric_window_complete_match
+                and first_complete_metric_start is not None
+                and (int(cycles[0]) - first_complete_metric_start) % prediction_length == 0
+            )
+            n_condition_tasks = n_conditions if covariate_mode == "cluster_covariate" else 1
             base_meta = {
                 "covariate_mode": covariate_mode,
                 "fd": fd_name,
@@ -269,33 +318,33 @@ def iter_windows(
                 "context_length": int(len(history_raw)),
                 "total_prediction_length": int(prediction_length),
                 "n_operating_conditions": int(n_conditions),
+                "n_condition_forecast_tasks": int(n_condition_tasks),
+                "condition_prediction_points": int(n_condition_tasks * prediction_length),
+                "condition_source": "past_context_only",
+                "metric_window_complete_match": int(metric_window_complete_match),
+                "metric_window_selected": int(metric_window_selected),
             }
 
             if covariate_mode == "cluster_covariate":
-                future_groups = [
-                    (int(op_condition), future_group.copy())
-                    for op_condition, future_group in future_labeled.groupby("op_condition", sort=True)
+                history_groups = [
+                    (int(op_condition), history_group.copy())
+                    for op_condition, history_group in history_labeled.groupby("op_condition", sort=True)
                 ]
             else:
-                future_groups = [(-1, future_labeled.copy())]
+                history_groups = [(-1, history_labeled.copy())]
 
-            for op_condition, future_group in future_groups:
+            for op_condition, group_history_raw in history_groups:
                 op_condition = int(op_condition)
                 if covariate_mode == "cluster_covariate":
                     history_mask = history_labeled["op_condition"] == op_condition
                     group_history_model = history_model.loc[history_mask.to_numpy()].copy()
-                    group_history_raw = history_labeled.loc[history_mask].copy()
                 else:
                     group_history_model = history_model.copy()
-                    group_history_raw = history_labeled.copy()
-                used_full_context_fallback = False
-                if group_history_model.empty:
-                    group_history_model = history_model
-                    group_history_raw = history_labeled
-                    used_full_context_fallback = True
+                if group_history_model.empty or group_history_raw.empty:
+                    raise RuntimeError("Historical operating-condition group unexpectedly has no context rows.")
 
                 context = group_history_model.loc[:, sensors].to_numpy(dtype=np.float32)
-                truth = future_group.loc[:, sensors].to_numpy(dtype=np.float32)
+                truth = future_raw.loc[:, sensors].to_numpy(dtype=np.float32)
                 transform_offset = np.zeros(len(sensors), dtype=np.float32)
                 transform_scale = np.ones(len(sensors), dtype=np.float32)
                 model_context = context
@@ -307,32 +356,39 @@ def iter_windows(
                     col: group_history_raw.loc[:, col].to_numpy(dtype=np.float32)
                     for col in SETTING_COLUMNS
                 }
-                future_covariates = {
-                    col: future_group.loc[:, col].to_numpy(dtype=np.float32)
+                last_observed_settings = group_history_raw.iloc[-1].loc[SETTING_COLUMNS]
+                repeated_condition_covariates = {
+                    col: np.repeat(np.float32(last_observed_settings[col]), prediction_length)
                     for col in SETTING_COLUMNS
                 }
-                group_prediction_length = int(len(future_group))
+                group_prediction_length = int(prediction_length)
+                condition_key = (
+                    str(group_history_raw["op_condition_key"].iloc[-1])
+                    if covariate_mode == "cluster_covariate"
+                    else str(history_labeled["op_condition_key"].iloc[-1])
+                )
                 meta = {
                     **base_meta,
                     "op_condition": op_condition,
-                    "op_condition_key": str(future_group["op_condition_key"].iloc[0])
-                    if future_group["op_condition_key"].nunique() == 1
-                    else "mixed",
+                    "op_condition_key": condition_key,
                     "group_context_length": int(len(group_history_model)),
                     "group_prediction_length": group_prediction_length,
-                    "used_full_context_fallback": int(used_full_context_fallback),
+                    "future_condition_policy": "repeat_last_observed_settings",
                 }
                 chronos_input: Dict[str, Any] = {"target": model_context.T}
-                if covariate_mode in {"cluster_covariate", "future_covariate"}:
+                if covariate_mode == "cluster_covariate":
                     chronos_input["past_covariates"] = past_covariates
-                    chronos_input["future_covariates"] = future_covariates
+                    # "future_covariates" is the Chronos API field name.  Its
+                    # values here are hypothetical repeats of past observations.
+                    chronos_input["future_covariates"] = repeated_condition_covariates
                 transform = {
                     "offset": transform_offset,
                     "scale": transform_scale,
-                    "future_cycles": future_group["cycle"].to_numpy(dtype=np.int64),
-                    "future_horizons": future_group.index.to_numpy(dtype=np.int64) + 1,
-                    "future_has_ground_truth": future_group["has_ground_truth"].to_numpy(dtype=bool),
-                    "future_op_condition_keys": future_group["op_condition_key"].astype(str).to_numpy(),
+                    "future_cycles": future_raw["cycle"].to_numpy(dtype=np.int64),
+                    "future_horizons": np.arange(1, prediction_length + 1, dtype=np.int64),
+                    "future_has_ground_truth": future_raw["has_ground_truth"].to_numpy(dtype=bool),
+                    "future_op_condition_keys": np.repeat(condition_key, prediction_length),
+                    "metric_op_condition_keys": metric_condition_keys,
                 }
                 yield meta, chronos_input, truth.T, transform
 
@@ -380,13 +436,14 @@ def forecast_windows(
         covariate_mode = str(windows[0][0]["covariate_mode"])
         covariate_text = "no operating-condition covariates"
         if covariate_mode == "cluster_covariate":
-            covariate_text = "condition-clustered past + known-future setting1-3 covariates"
-        elif covariate_mode == "future_covariate":
-            covariate_text = "raw multivariate target with past + known-future setting1-3 covariates"
+            covariate_text = (
+                "historical-condition context + repeated last-observed setting1-3 covariates"
+            )
         print(
             f"  Chronos input: multivariate windows with shape "
             f"({n_variates} sensors, variable history {min(history_lengths)}-{max(history_lengths)} time steps), "
-            f"grouped future length {min(group_prediction_lengths)}-{max(group_prediction_lengths)}, {covariate_text}",
+            f"independent condition horizon {min(group_prediction_lengths)}-{max(group_prediction_lengths)}, "
+            f"{covariate_text}",
             flush=True,
         )
 
@@ -430,6 +487,7 @@ def forecast_windows(
                 future_horizons = transform["future_horizons"].astype(np.int64)
                 future_has_ground_truth = transform["future_has_ground_truth"].astype(bool)
                 future_op_condition_keys = transform["future_op_condition_keys"]
+                metric_op_condition_keys = transform["metric_op_condition_keys"]
                 for sensor_idx, sensor in enumerate(sensors):
                     for group_horizon_idx in range(group_prediction_length):
                         horizon = int(future_horizons[group_horizon_idx])
@@ -447,6 +505,14 @@ def forecast_windows(
                                 "group_prediction_length": group_prediction_length,
                                 "prediction_length": int(prediction_length),
                                 "has_ground_truth": int(future_has_ground_truth[group_horizon_idx]),
+                                "metric_op_condition_key": str(
+                                    metric_op_condition_keys[group_horizon_idx]
+                                ),
+                                "is_metric_condition_match": int(
+                                    covariate_mode != "cluster_covariate"
+                                    or str(future_op_condition_keys[group_horizon_idx])
+                                    == str(metric_op_condition_keys[group_horizon_idx])
+                                ),
                                 "y_true": float(truth[sensor_idx, group_horizon_idx]),
                                 "y_pred": float(pred[sensor_idx, group_horizon_idx]),
                                 "y_pred_model_scale": float(pred_model_scale[sensor_idx, group_horizon_idx]),
@@ -472,6 +538,7 @@ def forecast_windows(
             "context_length",
             "total_prediction_length",
             "n_operating_conditions",
+            "condition_prediction_points",
         ]
         for key, group in predictions.groupby(score_cols, sort=True):
             available = group[group["has_ground_truth"].astype(bool)].copy()
@@ -486,11 +553,6 @@ def forecast_windows(
                     "ground_truth_rows": int(len(available)),
                     "num_sensors": int(len(sensors)),
                     "num_condition_tasks": int(group["op_condition"].nunique()),
-                    "used_full_context_fallback_tasks": int(
-                        group[["op_condition", "used_full_context_fallback"]]
-                        .drop_duplicates()["used_full_context_fallback"]
-                        .sum()
-                    ),
                 }
             )
 
@@ -533,6 +595,68 @@ def limit_tasks_by_rolling_windows(
     ]
 
 
+def iter_task_chunks(
+    tasks: Iterable[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, Any]]],
+    task_chunk_size: int,
+    max_windows: int = 0,
+) -> Iterator[List[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, Any]]]]:
+    """Yield bounded task chunks without splitting a rolling window."""
+    if task_chunk_size < 1:
+        raise ValueError("--task_chunk_size must be >= 1.")
+
+    chunk: List[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, Any]]] = []
+    window_group: List[Tuple[Dict[str, int | str], Dict[str, Any], np.ndarray, Dict[str, Any]]] = []
+    current_key = None
+    window_count = 0
+
+    def task_key(task):
+        meta = task[0]
+        return (
+            meta["covariate_mode"],
+            meta["fd"],
+            meta["unit_id"],
+            meta["cutoff_cycle"],
+            meta["forecast_start_cycle"],
+        )
+
+    def flush_group():
+        nonlocal chunk, window_group, window_count
+        if not window_group:
+            return None
+        if max_windows > 0 and window_count >= max_windows:
+            return False
+        if chunk and len(chunk) + len(window_group) > task_chunk_size:
+            ready = chunk
+            chunk = window_group
+            window_group = []
+            window_count += 1
+            return ready
+        chunk.extend(window_group)
+        window_group = []
+        window_count += 1
+        return None
+
+    for task in tasks:
+        key = task_key(task)
+        if current_key is None:
+            current_key = key
+        if key != current_key:
+            ready = flush_group()
+            if ready is False:
+                break
+            if ready:
+                yield ready
+            current_key = key
+        window_group.append(task)
+    else:
+        ready = flush_group()
+        if ready:
+            yield ready
+
+    if chunk:
+        yield chunk
+
+
 def summarize_metrics(predictions: pd.DataFrame) -> pd.DataFrame:
     predictions = predictions[predictions["y_true"].notna()].copy()
     metric_rows: List[Dict[str, float | int | str]] = []
@@ -572,9 +696,23 @@ def summarize_metrics(predictions: pd.DataFrame) -> pd.DataFrame:
 
 
 def select_metric_windows(window_predictions: pd.DataFrame, prediction_length: int) -> pd.DataFrame:
+    if "metric_window_selected" in window_predictions.columns:
+        selected = window_predictions[
+            window_predictions["metric_window_selected"].astype(bool)
+        ].copy()
+        if "is_metric_condition_match" in selected.columns:
+            selected = selected[selected["is_metric_condition_match"].astype(bool)].copy()
+        return selected[selected["has_ground_truth"].astype(bool)].copy()
+
     key_cols = ["covariate_mode", "fd", "unit_id", "forecast_start_cycle"]
+    if "is_metric_condition_match" in window_predictions.columns:
+        metric_candidates = window_predictions[
+            window_predictions["is_metric_condition_match"].astype(bool)
+        ].copy()
+    else:
+        metric_candidates = window_predictions.copy()
     horizon_counts = (
-        window_predictions[window_predictions["has_ground_truth"].astype(bool)]
+        metric_candidates[metric_candidates["has_ground_truth"].astype(bool)]
         .groupby(key_cols, sort=True)["horizon"]
         .nunique()
         .reset_index(name="ground_truth_horizon_count")
@@ -589,7 +727,7 @@ def select_metric_windows(window_predictions: pd.DataFrame, prediction_length: i
         keep = group[(group["forecast_start_cycle"] - first_start) % prediction_length == 0]
         selected_rows.append(keep[key_cols])
     selected_keys = pd.concat(selected_rows, ignore_index=True) if selected_rows else pd.DataFrame(columns=key_cols)
-    metric_predictions = window_predictions.merge(selected_keys, on=key_cols, how="inner")
+    metric_predictions = metric_candidates.merge(selected_keys, on=key_cols, how="inner")
     metric_predictions = metric_predictions[metric_predictions["has_ground_truth"].astype(bool)].copy()
     return metric_predictions
 
@@ -634,6 +772,8 @@ def main() -> None:
     args.covariate_modes = normalize_covariate_modes(args.covariate_modes)
     if args.context_length < 0:
         raise ValueError("--context_length must be >= 0. Use 0 for all-past context.")
+    if args.task_chunk_size < 1:
+        raise ValueError("--task_chunk_size must be >= 1.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.device == "cuda" and not torch.cuda.is_available() and not args.allow_cpu:
@@ -644,9 +784,24 @@ def main() -> None:
 
     pipeline = load_pipeline(args.model_id, args.device, args.torch_dtype, args.local_files_only)
     print("Chronos-2 model loaded.", flush=True)
-    all_predictions: List[pd.DataFrame] = []
+    window_forecast_path = args.output_dir / "window_forecasts.csv"
+    for generated_name in (
+        "window_forecasts.csv",
+        "metric_window_forecasts.csv",
+        "anomaly_scores.csv",
+        "sensor_anomaly_scores.csv",
+        "metrics.csv",
+        "window_metrics.csv",
+    ):
+        generated_path = args.output_dir / generated_name
+        if generated_path.exists():
+            generated_path.unlink()
+
+    wrote_window_header = False
+    metric_prediction_parts: List[pd.DataFrame] = []
     all_anomaly_scores: List[pd.DataFrame] = []
     stats_by_fd: Dict[str, pd.DataFrame] = {}
+    total_prediction_rows = 0
 
     for fd_name in args.fds:
         print(f"\n=== {fd_name} ===", flush=True)
@@ -659,70 +814,100 @@ def main() -> None:
 
         for covariate_mode in args.covariate_modes:
             print(f"  covariate mode: {covariate_mode}", flush=True)
-            windows = list(
-                iter_windows(
-                    fd_name=fd_name,
-                    eval_df=eval_df,
-                    model_input_df=model_input_df,
-                    sensors=SELECTED_SENSORS,
-                    covariate_mode=covariate_mode,
-                    target_transform=args.target_transform,
-                    context_length=args.context_length,
-                    prediction_length=args.prediction_length,
-                    stride=args.stride,
-                    forecast_start_cycle=args.forecast_start_cycle,
-                    forecast_end_cycle=args.forecast_end_cycle,
-                )
+            task_source = iter_windows(
+                fd_name=fd_name,
+                eval_df=eval_df,
+                model_input_df=model_input_df,
+                sensors=SELECTED_SENSORS,
+                covariate_mode=covariate_mode,
+                target_transform=args.target_transform,
+                context_length=args.context_length,
+                prediction_length=args.prediction_length,
+                stride=args.stride,
+                forecast_start_cycle=args.forecast_start_cycle,
+                forecast_end_cycle=args.forecast_end_cycle,
             )
-            if args.max_windows_per_fd > 0:
-                windows = limit_tasks_by_rolling_windows(windows, args.max_windows_per_fd)
-            if not windows:
+            mode_metric_parts: List[pd.DataFrame] = []
+            mode_window_count = 0
+            mode_task_count = 0
+            for chunk_index, windows in enumerate(
+                iter_task_chunks(
+                    task_source,
+                    task_chunk_size=args.task_chunk_size,
+                    max_windows=args.max_windows_per_fd,
+                ),
+                start=1,
+            ):
+                chunk_window_count = len(
+                    {
+                        (
+                            task[0]["unit_id"],
+                            task[0]["cutoff_cycle"],
+                            task[0]["forecast_start_cycle"],
+                        )
+                        for task in windows
+                    }
+                )
+                mode_window_count += chunk_window_count
+                mode_task_count += len(windows)
+                print(
+                    f"  task chunk {chunk_index}: {chunk_window_count} rolling windows, "
+                    f"{len(windows)} condition tasks",
+                    flush=True,
+                )
+                fd_predictions, fd_anomaly_scores = forecast_windows(
+                    pipeline=pipeline,
+                    windows=windows,
+                    sensors=SELECTED_SENSORS,
+                    stats=stats,
+                    prediction_length=args.prediction_length,
+                    batch_size=args.batch_size,
+                    cross_learning=args.cross_learning,
+                    target_transform=args.target_transform,
+                    anomaly_eps=args.anomaly_eps,
+                )
+                fd_predictions.to_csv(
+                    window_forecast_path,
+                    mode="a",
+                    header=not wrote_window_header,
+                    index=False,
+                )
+                wrote_window_header = True
+                total_prediction_rows += len(fd_predictions)
+                all_anomaly_scores.append(fd_anomaly_scores)
+                metric_part = select_metric_windows(
+                    fd_predictions,
+                    args.prediction_length,
+                )
+                if not metric_part.empty:
+                    metric_prediction_parts.append(metric_part)
+                    mode_metric_parts.append(metric_part)
+
+            if mode_window_count == 0:
                 print("  no eligible windows, skipped", flush=True)
                 continue
-
-            num_rolling_windows = len(
-                {
-                    (
-                        task[0]["fd"],
-                        task[0]["unit_id"],
-                        task[0]["cutoff_cycle"],
-                        task[0]["forecast_start_cycle"],
-                    )
-                    for task in windows
-                }
-            )
             print(
-                f"  forecasting {num_rolling_windows} rolling windows as {len(windows)} condition-grouped tasks",
+                f"  completed {mode_window_count} rolling windows as "
+                f"{mode_task_count} condition tasks",
                 flush=True,
             )
-            fd_predictions, fd_anomaly_scores = forecast_windows(
-                pipeline=pipeline,
-                windows=windows,
-                sensors=SELECTED_SENSORS,
-                stats=stats,
-                prediction_length=args.prediction_length,
-                batch_size=args.batch_size,
-                cross_learning=args.cross_learning,
-                target_transform=args.target_transform,
-                anomaly_eps=args.anomaly_eps,
-            )
-            all_predictions.append(fd_predictions)
-            all_anomaly_scores.append(fd_anomaly_scores)
+            if mode_metric_parts:
+                fd_metrics = summarize_metrics(pd.concat(mode_metric_parts, ignore_index=True))
+                fd_all = fd_metrics[fd_metrics["sensor"] == "ALL"].iloc[0]
+                print(
+                    f"  condition-matched MAE={fd_all['mae']:.6f} "
+                    f"RMSE={fd_all['rmse']:.6f} n={int(fd_all['n'])}",
+                    flush=True,
+                )
 
-            fd_metrics = summarize_metrics(fd_predictions)
-            fd_all = fd_metrics[fd_metrics["sensor"] == "ALL"].iloc[0]
-            print(f"  MAE={fd_all['mae']:.6f} RMSE={fd_all['rmse']:.6f}", flush=True)
-
-    if not all_predictions:
+    if not wrote_window_header or not metric_prediction_parts:
         raise RuntimeError("No forecasts were produced.")
 
-    window_predictions = pd.concat(all_predictions, ignore_index=True)
     anomaly_scores = pd.concat(all_anomaly_scores, ignore_index=True)
-    metric_window_predictions = select_metric_windows(window_predictions, args.prediction_length)
+    metric_window_predictions = pd.concat(metric_prediction_parts, ignore_index=True)
     sensor_anomaly_scores = summarize_sensor_anomaly_scores(metric_window_predictions)
     metrics = summarize_metrics(metric_window_predictions)
     window_metrics = summarize_metrics(metric_window_predictions)
-    window_predictions.to_csv(args.output_dir / "window_forecasts.csv", index=False)
     metric_window_predictions.to_csv(args.output_dir / "metric_window_forecasts.csv", index=False)
     anomaly_scores.to_csv(args.output_dir / "anomaly_scores.csv", index=False)
     sensor_anomaly_scores.to_csv(args.output_dir / "sensor_anomaly_scores.csv", index=False)
@@ -731,7 +916,19 @@ def main() -> None:
     save_stats(stats_by_fd, args.output_dir)
     with open(args.output_dir / "run_config.json", "w", encoding="utf-8") as f:
         json.dump(
-            vars(args) | {"selected_sensors": SELECTED_SENSORS, "condition_group_forecasting": True},
+            vars(args)
+            | {
+                "selected_sensors": SELECTED_SENSORS,
+                "condition_group_forecasting": True,
+                "operating_condition_source": "past_context_only",
+                "condition_forecast_policy": "full_horizon_per_historical_condition",
+                "future_operating_condition_used": False,
+                "future_operating_condition_used_for_forecasting": False,
+                "future_operating_condition_used_for_retrospective_metrics": True,
+                "metric_condition_policy": "realized_future_condition_match",
+                "streamed_forecast_output": True,
+                "total_prediction_rows": total_prediction_rows,
+            },
             f,
             indent=2,
             default=str,

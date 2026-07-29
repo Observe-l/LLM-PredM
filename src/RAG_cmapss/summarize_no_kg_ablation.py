@@ -50,9 +50,6 @@ def summarize_arm(fd_dir: Path) -> dict[str, Any]:
         },
         "action_counts": run_summary.get("action_counts", {}),
         "terminal_counts": run_summary.get("terminal_counts", {}),
-        "final_peak_threshold": (
-            run_summary.get("outputs", {}).get("llm_policy") or {}
-        ).get("peak_threshold"),
         "llm_fallback_count": sum(
             bool(item.get("action", {}).get("llm_fallback_used")) for item in actions
         ),
@@ -111,7 +108,6 @@ def main() -> None:
             "early_rate",
             "missed_count",
             "missed_rate",
-            "final_peak_threshold",
         ]
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -129,7 +125,6 @@ def main() -> None:
                         "early_rate": item["class_rates"]["early"],
                         "missed_count": item["class_counts"]["missed"],
                         "missed_rate": item["class_rates"]["missed"],
-                        "final_peak_threshold": item["final_peak_threshold"],
                     }
                 )
     print(json.dumps(payload, indent=2))

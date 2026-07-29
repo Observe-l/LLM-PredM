@@ -154,6 +154,22 @@ def load_lhi_series(
     return sorted(by_cycle.items())
 
 
+def align_lhi_series(
+    *series: list[tuple[int, float]],
+) -> tuple[list[tuple[int, float]], ...]:
+    """Restrict every comparison series to the same observed cycle support."""
+    if not series:
+        return ()
+    cycle_sets = [{cycle for cycle, _ in values} for values in series]
+    common_cycles = set.intersection(*cycle_sets)
+    if not common_cycles:
+        raise ValueError("LHI comparison series have no common cycles.")
+    return tuple(
+        [(cycle, value) for cycle, value in values if cycle in common_cycles]
+        for values in series
+    )
+
+
 def save_lhi_plot(
     output_dir: Path,
     fd_name: str,
@@ -243,6 +259,11 @@ def main() -> None:
             args.lhi_column,
             args.healthy_cycles,
             plot_stride,
+        )
+        raw_series, chronos_series, occ_series = align_lhi_series(
+            raw_series,
+            chronos_series,
+            occ_series,
         )
         saved.append(save_lhi_plot(args.output_dir, fd_name, unit_id, raw_series, chronos_series, occ_series, args.dpi))
 

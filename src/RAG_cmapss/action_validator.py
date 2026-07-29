@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .timing_policy import recommended_maintenance_time
+
 
 ALLOWED_ACTIONS = {
     "continue_normal_operation",
@@ -60,6 +62,17 @@ def validate_action(
                     violations.append("action_time is outside forecast_horizon")
             except ValueError as exc:
                 violations.append(str(exc))
+
+    if action_type in {
+        "schedule_maintenance",
+        "schedule_HPC_maintenance",
+        "schedule_fan_maintenance",
+    } and action_time is not None:
+        recommended = recommended_maintenance_time(case)
+        if action_time != recommended:
+            violations.append(
+                f"maintenance action_time must equal recommended_maintenance_time={recommended}"
+            )
 
     if action_type in set(dataset_rules.get("disallowed_actions", [])):
         violations.append(f"{action_type} is disallowed by dataset policy")

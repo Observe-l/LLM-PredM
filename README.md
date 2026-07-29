@@ -45,12 +45,16 @@ setting1, setting2, setting3
 
 Covariate modes:
 
-- `cluster_covariate`: first split each forecast window by operating-condition
-  cluster, then pass setting1-3 as past and future covariates. This is the
-  default experiment mode and replaces the old `known_future` name.
-- `future_covariate`: do not split by operating-condition cluster; pass raw
-  multivariate sensor history plus setting1-3 as past and future covariates.
+- `cluster_covariate`: extract operating conditions from the observed history
+  only. For every historical condition, forecast the complete horizon
+  independently. The condition's last observed `setting1-3` vector is repeated
+  over the hypothetical horizon; the real future operating-condition sequence
+  is never read by the model.
 - `no_covariate`: pass only the multivariate sensor history.
+
+The removed `future_covariate`/future-condition stitching workflow must not be
+used because it exposed the real future `setting1-3` sequence and its
+condition-run lengths to forecasting.
 
 The first Chronos run downloads `amazon/chronos-2` into the Hugging Face cache.
 The forecasting script disables Hugging Face Xet by default because partial Xet
@@ -83,6 +87,21 @@ observed sequence are saved with `y_true` empty, so LHI/decision signals can
 still use the forecast state. MAE/MSE/RMSE metrics are computed separately using
 only full-ground-truth, non-overlapping starts, equivalent to metric stride
 `prediction_length`.
+
+For `cluster_covariate`, a rolling window with \(K_t\) operating conditions
+observed before its cutoff produces \(K_t\) independent tasks of length \(H\).
+For example, \(K_t=6\) and \(H=20\) produce 120 condition-horizon predictions
+per sensor, or \(6\times20\times14=1680\) rows for the 14 selected sensors.
+`window_forecasts.csv` records `condition_source=past_context_only`,
+`n_condition_forecast_tasks`, and `condition_prediction_points` so this
+invariant can be audited.
+
+The saved `y_true` sensor targets and realized future condition keys are used
+only for retrospective evaluation and are never passed to Chronos. At each
+horizon, MAE/MSE/RMSE retain only the forecast whose historical-condition key
+matches the realized condition key. LHI remains prospective: it does not use
+`y_true` or realized future conditions and combines all historical-condition
+scenarios.
 
 Useful options:
 
@@ -157,8 +176,7 @@ cycle-level metrics:
 
 By default, the script evaluates all covariate modes present in
 `window_forecasts.csv`. Use `--covariate_modes cluster_covariate`,
-`--covariate_modes future_covariate`, or `--covariate_modes no_covariate` to
-restrict the comparison.
+or `--covariate_modes no_covariate` to restrict the comparison.
 
 Outputs:
 
@@ -198,10 +216,79 @@ forecast drift immediately after the healthy reference interval.
   --top_k_sensors 5
 ```
 
-For each forecast window and sensor:
+### Leakage-free historical-condition forecasting formulation
+
+Let the cutoff be \(c\), the forecast horizon be \(H\), the selected sensors be
+\(\mathcal S\), and the observed history be
+\(\mathcal H_c=\{(\mathbf y_\tau,\mathbf z_\tau):\tau\le c\}\), where
+\(\mathbf z_\tau=(setting1,setting2,setting3)\). The condition-key function
+\(g(\mathbf z)\) uses the existing C-MAPSS setting quantization. Only history is
+used to construct:
 
 ```text
-y_pred_norm = (y_pred - min_past_context) / (max_past_context - min_past_context)
+C_c = unique{g(z_tau) : tau <= c}
+K_c = |C_c|
+H_c,k = {(y_tau, z_tau) : tau <= c and g(z_tau) = k}
+```
+
+For every historical condition \(k\in C_c\), let
+\(\mathbf z^{last}_{c,k}\) be its last observed setting vector. The model input
+for that task is:
+
+```text
+past target      = sensor history from H_c,k
+past covariates  = observed setting1-3 from H_c,k
+future covariate = repeat(z_last_c,k, H)
+prediction       = y_hat_c,k,1:H
+```
+
+Therefore:
+
+```text
+y_hat_c,k,1:H = Chronos2(H_c,k, repeat(z_last_c,k, H))
+k in C_c
+```
+
+No term depends on \(g(\mathbf z_{c+h})\), no future condition run length is
+computed, and no condition-specific forecasts are stitched according to the
+real future trajectory. The forecast tensor has shape:
+
+```text
+K_c x H x |S|
+```
+
+For \(K_c=6,H=20\), each sensor contributes \(6\times20=120\) forecast values
+to the complete LHI window.
+
+### Retrospective condition-matched forecast metrics
+
+Realized future conditions are not model inputs. They are read only after all
+scenario forecasts have been generated, to evaluate the forecast corresponding
+to the observed condition at each horizon:
+
+```text
+M(c,k,h) = 1[g(z_(c+h)) = k]
+
+MAE(c,s) =
+    (1 / H) * sum_h sum_k M(c,k,h) * abs(y_hat(c,k,h,s) - y(c+h,s))
+
+MSE(c,s) =
+    (1 / H) * sum_h sum_k M(c,k,h) * (y_hat(c,k,h,s) - y(c+h,s))^2
+```
+
+Because exactly one condition can match each realized horizon, each complete
+metric window contributes \(H\) rows per sensor, not \(K_cH\). If a realized
+future condition was not observed in the past and therefore has no scenario
+forecast, that whole window is excluded from `metrics.csv`. The unfiltered
+scenario forecasts remain available to LHI in `window_forecasts.csv`.
+
+### Multi-condition LHI formulation
+
+For each forecast window, condition, horizon, and sensor:
+
+```text
+y_hat_norm(c,k,h,s) =
+    (y_hat(c,k,h,s) - min_context(c,s)) / range_context(c,s)
 ```
 
 For each unit, sensor, and operating condition, the raw healthy mean is computed
@@ -209,14 +296,36 @@ from `cycle <= --healthy_cycles`, then transformed with the same forecast-window
 past min-max range:
 
 ```text
-mean_healthy_norm = (mean_healthy_raw - min_past_context) / (max_past_context - min_past_context)
+mu_norm(k,s) =
+    (mu_healthy_raw(k,s) - min_context(c,s)) / range_context(c,s)
 ```
 
-The forecast drift is:
+The condition-matched drift is:
 
 ```text
-D_RMSE = sqrt(mean_s (y_pred_norm(t,s) - mean_healthy_norm(condition(t),s))^2)
+d(c,k,h,s) = abs(y_hat_norm(c,k,h,s) - mu_norm(k,s))
 ```
+
+At horizon \(h\), the LHI drift combines every historical-condition forecast
+and every usable sensor:
+
+```text
+D_RMSE(c,h) =
+    sqrt((1 / (K_c * |S|)) * sum_k sum_s d(c,k,h,s)^2)
+```
+
+Thus the complete \(H\)-point LHI trajectory uses
+\(K_c\times H\) predictions per sensor. The single window-level RMSE used to
+rank Graph RAG sensor seeds is:
+
+```text
+D_window_RMSE(c,s) =
+    sqrt((1 / (K_c * H)) * sum_k sum_h d(c,k,h,s)^2)
+```
+
+With six conditions and a 20-step horizon, this sensor ranking uses all 120
+condition-horizon drift values, rather than only 20 values from a
+future-condition-stitched trajectory.
 
 The red drift baseline in the plots is calibrated per unit and covariate mode:
 
@@ -240,7 +349,9 @@ Outputs:
 - `lhi_scores.csv`: per forecast cycle `D_MAE`, `D_RMSE`, `LHI_MAE`, `LHI_RMSE`,
   per-cycle `top_drift_sensors`, and one forecast-window sensor ranking in
   `window_top_drift_sensors`. The window ranking computes one RMSE per sensor
-  across the complete forecast horizon and supplies the Graph RAG top-3 seeds.
+  across all historical conditions and the complete forecast horizon, and
+  supplies the Graph RAG top-3 seeds. `condition_count` and
+  `condition_prediction_points` audit how many condition forecasts were used.
 - `top_drift_sensors.csv`: long-format ranked sensor contributors for each forecast cycle.
 - `sensor_lhi_components.csv`: all sensor-level drift components before top-k filtering.
 - `lhi_baselines.csv`: unit-specific `B_MAE` and `B_RMSE`.
@@ -344,8 +455,67 @@ Use the local conda environment named `default`:
 Recommended LHI input for current experiments:
 
 ```text
-outputs/CMAPSS/cluster_20/lhi_fix
+outputs/CMAPSS/history_condition_h20_fd002_fd004/lhi
 ```
+
+This LHI is built from historical operating-condition scenarios only. No real
+future operating-condition sequence is supplied to forecasting or LHI.
+
+### Strict maintenance feedback and timing
+
+For a decision at cutoff cycle \(C_c\) with relative action time \(t+k\), the
+scheduled absolute maintenance cycle is
+
+\[
+C_a=C_c+k.
+\]
+
+Let \(C_f\) be the engine failure cycle and
+\(m=C_f-C_a\) the signed cycle margin. Feedback is assigned in this order:
+
+\[
+\text{feedback}=
+\begin{cases}
+\text{missed maintenance}, & C_a \ge C_f,\\
+\text{correct maintenance}, & C_a<C_f\ \land\ (C_f-C_a)/C_f<\tau,\\
+\text{too early}, & C_a<C_f\ \land\ (C_f-C_a)/C_f\ge\tau,
+\end{cases}
+\]
+
+where \(\tau=\texttt{maintenance\_rul\_threshold}\), default 0.25. The missed
+branch is evaluated before normalized RUL, so maintenance at or after failure
+can never be labeled correct.
+
+Every missed record includes `missed_maintenance_cause`:
+
+- `maintenance_scheduled_at_or_after_failure`: a maintenance action was chosen,
+  but its execution cycle was not before failure.
+- `monitoring_without_maintenance`: monitoring was chosen and never escalated
+  to maintenance before failure.
+- `monitoring_due_to_policy_gate`: the peak policy blocked LLM reasoning and
+  the deterministic fallback monitored until failure.
+- `continued_operation_without_maintenance`: a decision opportunity existed,
+  but operation continued without maintenance.
+- `lhi_gate_not_triggered_before_failure`: the upstream LHI trigger never
+  activated a PredM decision. The redundant downstream peak-score threshold
+  has been removed; the upstream LHI trigger is now the only score gate.
+
+`LLMPolicyUpdateTool` receives label counts/rates, missed-cause counts/rates,
+previous-action counts, and signed timing margins from the current experiment.
+It updates action escalation and maintenance timing only; it does not update a
+score threshold. A `monitoring_without_maintenance` or
+`continued_operation_without_maintenance` result instead updates
+`action_escalation_policy` to prefer a dataset-allowed maintenance action when
+the risk agent is activated and graph component evidence is strong. A late
+scheduled maintenance result reinforces `maintenance_timing_policy =
+peak_score_cycle`.
+
+Maintenance timing is not a free-form LLM choice. The prompt supplies
+`recommended_maintenance_time`, normally `peak_score_cycle`, and validation
+requires component or generic maintenance actions to use that value.
+The forecast-horizon end is reserved for the next monitoring review. If the
+risk peak itself is at the horizon end, maintenance may still legitimately be
+scheduled there.
 
 ### Reflection Memory Role
 
@@ -356,19 +526,20 @@ Reflection memory has two different roles:
   graph/component evidence, dataset rules, and the current risk tool output.
 - Policy/adaptation: in `llm_only`, initial policy design is strict zero-shot
   and does not receive reflection memory, default numeric weights, or example
-  thresholds. After non-correct feedback, `LLMPolicyUpdateTool` may use
-  reflection memory as an update buffer. In `hybrid`, feedback may also
-  train/update LightGBM tools.
+  thresholds. The fixed `lhi_trigger` is the only score gate. After non-correct
+  feedback, `LLMPolicyUpdateTool` may use reflection memory to update action
+  escalation and timing. In `hybrid`, feedback may also train/update LightGBM
+  tools.
 
 ### Risk Policy Modes
 
 `joint_simulation` supports two risk-policy modes:
 
 - `llm_only`: ignore LightGBM risk models and use an experiment-local
-  `models/llm_policy_tool.json`. If the tool does not exist, the LLM designs
-  its parameters once without default numeric weights or threshold ranges; later
-  decision points call the deterministic tool. Non-correct feedback is reviewed
-  by `LLMPolicyUpdateTool`.
+  `models/llm_policy_tool.json`. Every case that passes the upstream LHI gate
+  enters LLM reasoning. The policy file stores action-escalation and timing
+  state, not another peak-score threshold. Non-correct feedback is reviewed by
+  `LLMPolicyUpdateTool`.
 - `hybrid`: use LightGBM when available; otherwise use the experiment-local
   `LLMPolicyRiskTool`. Before a risk model exists, hybrid uses a fixed
   LightGBM warm-up protocol based on `documents/lightgbm_agentic.md`: the first
@@ -487,6 +658,8 @@ Each run writes:
   threshold policy, and policy source.
 - `recent_ollama_outputs.json`: recent prompt/output audit records.
 - `feedback_logs.json`: simulated maintenance/breakdown feedback.
+- `feedback_statistics.json`: strict outcome counts/rates plus missed-cause
+  counts and rates.
 - `kg_memory/reflection_rules.csv`: reflection memory generated from feedback.
 - `llm_policy_update_logs.json`: LLM-only policy-update review records,
   including skipped `correct_maintenance` rows and `LLMPolicyUpdateTool`
@@ -504,6 +677,16 @@ Each run writes:
 `correct_maintenance` feedback does not trigger policy or threshold-update
 review. It is recorded as feedback/reflection memory; the relevant update log
 marks adaptation as `skipped_correct_maintenance`.
+
+Audit strict labels, missed causes, policy-review coverage, and peak-grounded
+maintenance timing against a previous run:
+
+```bash
+/home/lwh/anaconda3/envs/default/bin/python -m src.RAG_cmapss.audit_joint_experiment \
+  --experiment_dir outputs/CMAPSS/RAG/history_condition_h20_kg_strict_peak_timing \
+  --baseline_dir outputs/CMAPSS/RAG/history_condition_h20_kg \
+  --fds FD002 FD004
+```
 
 ## Model Design
 

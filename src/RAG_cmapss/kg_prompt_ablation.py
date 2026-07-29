@@ -6,6 +6,7 @@ from typing import Any
 
 from .action_validator import ALLOWED_ACTIONS, validate_action
 from .prompt_builder import build_risk_profile, compact_llm_policy, compact_risk_gate
+from .timing_policy import maintenance_timing_profile
 
 
 NO_KG_SYSTEM_PROMPT = """You are a maintenance timing decision agent for zero-shot C-MAPSS predictive maintenance.
@@ -20,7 +21,8 @@ Choose exactly one action:
 
 Constraints:
 - continue_normal_operation must have action_time = null.
-- Every other action must use "t+N" within the forecast horizon.
+- schedule_monitoring must use the forecast-horizon end.
+- schedule_maintenance must use the supplied recommended_maintenance_time.
 - Use the active risk-tool result as the primary risk-stage evidence.
 - Raw sensor-error statistics can support degradation risk, persistence, and timing, but not a subsystem identity.
 - Choose schedule_maintenance when the risk and timing evidence justify maintenance; it requires no component selection.
@@ -39,6 +41,7 @@ def build_no_kg_prompt(
 ) -> str:
     sensor_profile = build_raw_sensor_profile(case)
     risk_tool = sanitize_risk_tool(lightgbm_risk)
+    timing_profile = maintenance_timing_profile(case)
     return f"""Forecast case:
 {json.dumps({"case_id": case.get("case_id"), "forecast_horizon": case.get("forecast_horizon")}, indent=2)}
 
@@ -47,6 +50,9 @@ Forecast calibrated risk profile:
 
 Trend and persistence profile:
 {json.dumps(build_non_domain_trend_profile(case), indent=2)}
+
+Maintenance timing policy:
+{json.dumps(timing_profile, indent=2)}
 
 Raw sensor-error evidence:
 {json.dumps(sensor_profile, indent=2)}
@@ -72,7 +78,8 @@ Return exactly one JSON object:
   "validation_status": "valid"
 }}
 
-Use peak_score_cycle for timing when it is inside the forecast horizon. Base the decision only on information shown."""
+For schedule_maintenance, action_time must equal {timing_profile["recommended_maintenance_time"]}.
+The horizon end is only the next-review time for schedule_monitoring. Base the decision only on information shown."""
 
 
 def build_raw_sensor_profile(case: dict[str, Any]) -> dict[str, Any]:

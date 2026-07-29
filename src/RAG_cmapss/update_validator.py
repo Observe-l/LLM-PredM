@@ -25,6 +25,13 @@ def validate_update(
         "missed_maintenance_unknown": "lower",
         "correct_maintenance": "unchanged",
     }.get(label)
+    if label.startswith("missed_") and str(feedback.get("missed_maintenance_cause", "")) in {
+        "maintenance_scheduled_at_or_after_failure",
+        "monitoring_without_maintenance",
+        "continued_operation_without_maintenance",
+        "lhi_gate_not_triggered_before_failure",
+    }:
+        expected_threshold = "unchanged"
     expected_timing = {
         "too_early": "delay",
         "over_maintenance": "delay",

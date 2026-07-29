@@ -17,6 +17,14 @@ REFLECTION_COLUMNS = [
     "previous_action_type",
     "previous_action_time",
     "feedback_label",
+    "feedback_type",
+    "missed_maintenance_cause",
+    "maintenance_timing_status",
+    "action_abs_cycle",
+    "failure_cycle",
+    "signed_cycle_margin",
+    "lateness_cycles",
+    "prior_monitoring_count",
     "feedback_reason",
     "peak_score",
     "final_score",
@@ -155,7 +163,21 @@ def feedback_to_rule(
         "if_pattern": pattern,
         "previous_action_type": previous_action,
         "feedback_label": label,
-        "feedback_reason": _feedback_reason(label, features, previous_action, str(feedback.get("component_feedback", ""))),
+        "feedback_type": feedback.get("feedback_type", ""),
+        "missed_maintenance_cause": feedback.get("missed_maintenance_cause", ""),
+        "maintenance_timing_status": feedback.get("maintenance_timing_status", ""),
+        "action_abs_cycle": feedback.get("action_abs_cycle", ""),
+        "failure_cycle": feedback.get("failure_cycle", ""),
+        "signed_cycle_margin": feedback.get("signed_cycle_margin", ""),
+        "lateness_cycles": feedback.get("lateness_cycles", ""),
+        "prior_monitoring_count": feedback.get("prior_monitoring_count", 0),
+        "feedback_reason": _feedback_reason(
+            label,
+            features,
+            previous_action,
+            str(feedback.get("component_feedback", "")),
+            str(feedback.get("missed_maintenance_cause", "")),
+        ),
         **features,
     }
 
@@ -182,8 +204,8 @@ def feedback_to_rule(
             **base,
             "rule_id": f"ReflectionRule_{dataset}_auto_missed_hpc_{feedback_id}",
             "then_revise_action_type": "schedule_HPC_maintenance",
-            "recommended_time_rule": _missed_time_rule(features),
-            "then_adjust_threshold": "lower",
+            "recommended_time_rule": _missed_time_rule(feedback),
+            "then_adjust_threshold": _missed_threshold_rule(feedback),
             "then_adjust_component_preference": "HPC",
         }
     if label == "missed_fan_maintenance":
@@ -191,8 +213,8 @@ def feedback_to_rule(
             **base,
             "rule_id": f"ReflectionRule_{dataset}_auto_missed_fan_{feedback_id}",
             "then_revise_action_type": "schedule_fan_maintenance",
-            "recommended_time_rule": _missed_time_rule(features),
-            "then_adjust_threshold": "lower",
+            "recommended_time_rule": _missed_time_rule(feedback),
+            "then_adjust_threshold": _missed_threshold_rule(feedback),
             "then_adjust_component_preference": "FAN",
         }
     if label == "missed_maintenance_unknown":
@@ -200,8 +222,8 @@ def feedback_to_rule(
             **base,
             "rule_id": f"ReflectionRule_{dataset}_auto_missed_unknown_{feedback_id}",
             "then_revise_action_type": "schedule_monitoring",
-            "recommended_time_rule": _missed_time_rule(features),
-            "then_adjust_threshold": "lower",
+            "recommended_time_rule": _missed_time_rule(feedback),
+            "then_adjust_threshold": _missed_threshold_rule(feedback),
             "then_adjust_component_preference": "unchanged",
         }
     if label == "wrong_component":
@@ -379,11 +401,40 @@ def _maintenance_still_supported(features: dict[str, Any], action_type: str) -> 
     )
 
 
-def _missed_time_rule(features: dict[str, Any]) -> str:
-    return "peak_score_cycle_minus_margin"
+def _missed_time_rule(feedback: dict[str, Any]) -> str:
+    cause = str(feedback.get("missed_maintenance_cause", ""))
+    if cause == "maintenance_scheduled_at_or_after_failure":
+        return "maintenance_at_peak_score_cycle_not_horizon_end"
+    if cause == "monitoring_without_maintenance":
+        return "escalate_to_maintenance_at_peak_score_cycle"
+    if cause == "continued_operation_without_maintenance":
+        return "choose_maintenance_at_peak_score_cycle"
+    if cause in {"monitoring_due_to_policy_gate", "continued_operation_due_to_policy_gate"}:
+        return "lower_policy_gate_then_maintain_at_peak_score_cycle"
+    return "lhi_gate_did_not_activate_no_peak_policy_change"
 
 
-def _feedback_reason(label: str, features: dict[str, Any], previous_action: str, component_feedback: str) -> str:
+def _missed_threshold_rule(feedback: dict[str, Any]) -> str:
+    cause = str(feedback.get("missed_maintenance_cause", ""))
+    if cause in {
+        "maintenance_scheduled_at_or_after_failure",
+        "monitoring_without_maintenance",
+        "continued_operation_without_maintenance",
+        "lhi_gate_not_triggered_before_failure",
+    }:
+        return "unchanged"
+    if cause in {"monitoring_due_to_policy_gate", "continued_operation_due_to_policy_gate"}:
+        return "lower"
+    return "unchanged"
+
+
+def _feedback_reason(
+    label: str,
+    features: dict[str, Any],
+    previous_action: str,
+    component_feedback: str,
+    missed_cause: str,
+) -> str:
     if label == "too_early":
         if component_feedback.lower() == "correct" and _maintenance_still_supported(features, previous_action):
             return "maintenance direction may be plausible, but timing should move closer to persistent/peak risk"
@@ -391,7 +442,15 @@ def _feedback_reason(label: str, features: dict[str, Any], previous_action: str,
     if label == "correct_maintenance":
         return "positive anchor: similar score, persistence, timing, and component evidence supported maintenance"
     if label.startswith("missed_"):
-        return "missed maintenance: similar early evidence should trigger earlier monitoring or maintenance"
+        if missed_cause == "maintenance_scheduled_at_or_after_failure":
+            return "missed maintenance: maintenance was selected but scheduled at or after failure; use forecast peak timing"
+        if missed_cause == "monitoring_without_maintenance":
+            return "missed maintenance: monitoring was selected and never escalated to maintenance before failure"
+        if missed_cause == "continued_operation_without_maintenance":
+            return "missed maintenance: normal operation continued despite a decision opportunity before failure"
+        if missed_cause in {"monitoring_due_to_policy_gate", "continued_operation_due_to_policy_gate"}:
+            return "missed maintenance: peak policy blocked LLM maintenance reasoning before failure"
+        return "missed maintenance: LHI gate never activated a PredM decision before failure"
     return "historical feedback case"
 
 
@@ -708,6 +767,14 @@ def _compact_reflection_row(row: dict[str, Any]) -> dict[str, Any]:
         "previous_action_type",
         "previous_action_time",
         "feedback_label",
+        "feedback_type",
+        "missed_maintenance_cause",
+        "maintenance_timing_status",
+        "action_abs_cycle",
+        "failure_cycle",
+        "signed_cycle_margin",
+        "lateness_cycles",
+        "prior_monitoring_count",
         "feedback_reason",
         "peak_score",
         "final_score",
