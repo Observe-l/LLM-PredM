@@ -17,7 +17,7 @@ You must choose exactly one action:
 Hard constraints:
 - Do not choose an action disallowed by the dataset policy.
 - continue_normal_operation must have action_time = null.
-- schedule_monitoring must use the forecast-horizon end as its next review time.
+- schedule_monitoring must use the supplied recommended_monitoring_time.
 - schedule_fan_maintenance and schedule_HPC_maintenance must set action_time exactly to the supplied recommended_maintenance_time.
 - schedule_fan_maintenance requires retrieved evidence supporting Fan_related_degradation.
 - schedule_HPC_maintenance requires retrieved evidence supporting HPC_related_degradation.
@@ -69,7 +69,7 @@ def build_prompt(
     ]
     risk_profile = build_risk_profile(case)
     trend_profile = build_trend_profile(case)
-    timing_profile = maintenance_timing_profile(case)
+    timing_profile = maintenance_timing_profile(case, llm_policy)
     risk_tool = lightgbm_risk or {}
     risk_tool_name = risk_tool.get("tool_name") or "unknown_risk_tool"
     risk_model_source = risk_tool.get("model_source") or "unknown_source"
@@ -121,24 +121,21 @@ Choose exactly one action and return JSON with this schema:
 Important:
 - evidence_paths must contain only evidence IDs, not full path strings.
 - action_time must be null only for continue_normal_operation.
-- For schedule_monitoring, action_time must equal the forecast-horizon end.
+- For schedule_monitoring, action_time must equal {timing_profile["recommended_monitoring_time"]}.
 - For schedule_fan_maintenance or schedule_HPC_maintenance, action_time must equal {timing_profile["recommended_maintenance_time"]}; do not default to the horizon end.
 - The action_type must agree with the reason: if the reason says maintenance is required, choose the corresponding maintenance action rather than schedule_monitoring.
 - Use Graph RAG paths and component_gate to choose the degradation hypothesis.
 - Use {risk_tool_name} / {risk_model_source} as the primary risk-stage evidence. Do not cite a different risk tool.
-- If LLM policy is present, use its peak_score boundary as risk/timing bias while still obeying graph evidence, dataset rules, and validation constraints.
 - If LLM policy action_escalation_policy is maintenance_when_risk_activated_and_component_supported, do not repeat monitoring when the risk tool activated reasoning and strong graph evidence supports an allowed component; choose that maintenance action.
-- maintenance_timing_policy=peak_score_cycle means maintenance must use the supplied recommended_maintenance_time.
-- If the risk tool says normal or monitor_without_llm, choose schedule_monitoring or continue_normal_operation.
-- If the risk tool score is below theta_low, or risk_decision is monitor_without_llm, do not choose fan/HPC maintenance.
+- The supplied maintenance_timing_policy determines recommended_maintenance_time and is mandatory.
 - If the risk tool says maintenance_window or late_or_missed, prefer a dataset-allowed maintenance action when graph evidence strongly supports a maintainable component.
 - Do not let uncertain_component_degradation alone override strong evidence for a dataset-allowed maintainable component in a late_or_missed case.
 - For FD001, schedule_HPC_maintenance is allowed; if late_or_missed and HPC graph evidence is strong, choose schedule_HPC_maintenance even if uncertain_component_degradation has a higher path score.
 - If FD001 disallows fan maintenance, do not choose schedule_fan_maintenance; use monitoring unless HPC graph evidence is strong enough to support schedule_HPC_maintenance.
-- If choosing schedule_monitoring, set action_time to the forecast horizon end, e.g. "t+50".
+- If choosing schedule_monitoring, set action_time to {timing_profile["recommended_monitoring_time"]}.
 - Use risk_gate only as a transparent statistical diagnostic, not as reflection memory.
 - Do not use reflection anchors, historical feedback, or hidden RUL in action reasoning.
-- Maintenance timing is forecast-grounded, not freely chosen: use {timing_profile["recommended_maintenance_time"]}, derived primarily from peak_score_cycle.
+- Maintenance timing is forecast-grounded, not freely chosen: use {timing_profile["recommended_maintenance_time"]}.
 """
 
 
@@ -208,9 +205,13 @@ def compact_llm_policy(llm_policy: dict[str, Any] | None) -> dict[str, Any]:
         "version",
         "source",
         "policy_type",
+        "policy_revision",
+        "effective_from_engine",
         "theta_conf",
         "action_escalation_policy",
         "maintenance_timing_policy",
+        "peak_offset_level",
+        "monitoring_interval",
         "missed_cause_counts",
         "reason",
     ]

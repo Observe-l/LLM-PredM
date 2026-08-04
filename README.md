@@ -526,10 +526,11 @@ Reflection memory has two different roles:
   graph/component evidence, dataset rules, and the current risk tool output.
 - Policy/adaptation: in `llm_only`, initial policy design is strict zero-shot
   and does not receive reflection memory, default numeric weights, or example
-  thresholds. The fixed `lhi_trigger` is the only score gate. After non-correct
-  feedback, `LLMPolicyUpdateTool` may use reflection memory to update action
-  escalation and timing. In `hybrid`, feedback may also train/update LightGBM
-  tools.
+  thresholds. The fixed `lhi_trigger` is the only score gate. With periodic
+  evaluation enabled, reflection is recorded after every engine but policy is
+  updated only at completed-engine checkpoints. This prevents one anomalous
+  engine from immediately rewriting the policy. In `hybrid`, feedback may also
+  train/update LightGBM tools.
 
 ### Risk Policy Modes
 
@@ -538,8 +539,9 @@ Reflection memory has two different roles:
 - `llm_only`: ignore LightGBM risk models and use an experiment-local
   `models/llm_policy_tool.json`. Every case that passes the upstream LHI gate
   enters LLM reasoning. The policy file stores action-escalation and timing
-  state, not another peak-score threshold. Non-correct feedback is reviewed by
-  `LLMPolicyUpdateTool`.
+  state, not another peak-score threshold. By default, `EvaluationTool` and the
+  evaluation agent review every 10 completed engines and may update the
+  adaptive policy after structural validation.
 - `hybrid`: use LightGBM when available; otherwise use the experiment-local
   `LLMPolicyRiskTool`. Before a risk model exists, hybrid uses a fixed
   LightGBM warm-up protocol based on `documents/lightgbm_agentic.md`: the first
@@ -556,6 +558,58 @@ Arm A: llm_only
 Arm B: hybrid
 ```
 
+### Periodic Evaluation
+
+Periodic evaluation is enabled by default with `--evaluation_window 10`.
+At checkpoints 10, 20, 30, ... the deterministic tool reports:
+
+- cumulative, current-window, and previous-window
+  `correct_maintenance_rate`, including a Wilson 95% interval;
+- correct, early, and missed counts plus explicit missed-maintenance causes;
+- action distribution, KG evidence coverage, fallback/repair counts, and
+  maintenance timing statistics;
+- the active adaptive-policy revision and the policy actually exposed to each
+  completed engine in both windows;
+- the correct-count change, the 10% one-engine step for W=10, Wilson-interval
+  overlap, and a deterministic evidence-strength label.
+
+The v6 timing anchor is always the raw-LHI peak cycle. The evaluation agent may
+select `peak_offset_level = none/small/median/large`, corresponding to
+delta = 0/5/10/15 cycles, and execution uses
+`t_maintenance = max(t+1, t_peak - delta)`. The agent may directly select any
+offset level at a checkpoint and may also update
+`action_escalation_policy` and `monitoring_interval`. The prompt includes the
+latest four evaluation checkpoints. Evidence strength and Wilson overlap are
+descriptive rather than hard gates, and the first checkpoint may update policy.
+The validator checks only executable fields and values; there is no adjacent-
+level, minimum-support, minimum-exposure, one-field, or cooldown restriction.
+Updates become effective for the next engine.
+
+Evaluator experiments use `score_col=lhi_rmse`, `raw_score_col=d_rmse`, and
+`lhi_col=lhi_rmse`; rolled LHI is not used. The design does not perform policy
+counterfactual evaluation and does not use a canary deployment.
+
+Use `--disable_periodic_evaluation` to reproduce the earlier per-feedback
+LLM-only update behavior.
+
+For a clean frozen-v6 no-evaluator control, disable both adaptation paths:
+
+```bash
+--disable_periodic_evaluation --disable_per_feedback_policy_update
+```
+
+Run the raw-LHI evaluator arm with:
+
+```bash
+bash scripts/run_agentic_evaluation_raw_lhi_w10.sh
+```
+
+Run the end-to-end evaluator/timing smoke test with:
+
+```bash
+/home/lwh/anaconda3/envs/default/bin/python scripts/smoke_peak_offset_evaluation.py
+```
+
 ### Smoke Tests
 
 Run the LLM-only policy arm:
@@ -567,6 +621,8 @@ Run the LLM-only policy arm:
   --fds FD001 \
   --max_engines 2 \
   --risk_policy_mode llm_only \
+  --evaluation_window 10 \
+  --evaluation_minimum_support 3 \
   --model qwen3.5:9b \
   --timeout 60 \
   --ollama_num_predict 512 \
@@ -662,8 +718,10 @@ Each run writes:
   counts and rates.
 - `kg_memory/reflection_rules.csv`: reflection memory generated from feedback.
 - `llm_policy_update_logs.json`: LLM-only policy-update review records,
-  including skipped `correct_maintenance` rows and `LLMPolicyUpdateTool`
-  outputs after non-correct feedback.
+  used by the earlier per-feedback updater when periodic evaluation is
+  disabled.
+- `evaluation_logs.json`: checkpoint metrics, evaluation-agent decisions,
+  validator results, and the policy revision effective after each checkpoint.
 - `lightgbm_update_logs.json`: hybrid/LightGBM feedback-time adaptation
   decisions, training summaries, update tool outputs, validation, and
   operations. This file is not written by `llm_only` runs.

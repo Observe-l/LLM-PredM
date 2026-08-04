@@ -135,6 +135,7 @@ def audit_run(run_dir: Path, fd: str) -> dict[str, Any]:
         ),
         "final_action_escalation_policy": policy.get("action_escalation_policy"),
         "final_maintenance_timing_policy": policy.get("maintenance_timing_policy"),
+        "final_peak_offset_level": policy.get("peak_offset_level"),
         "policy_missed_cause_counts": policy.get("missed_cause_counts", {}),
         "timing_mismatch_cases": timing_mismatches,
         "t20_nonpeak_cases": t20_nonpeak,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .timing_policy import recommended_maintenance_time
+from .timing_policy import recommended_maintenance_time, recommended_monitoring_time
 
 
 ALLOWED_ACTIONS = {
@@ -36,11 +36,15 @@ def validate_action(
     sensor_paths: list[dict[str, Any]],
     risk_gate: dict[str, Any] | None = None,
     lightgbm_risk: dict[str, Any] | None = None,
+    component_gate: dict[str, Any] | None = None,
+    llm_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     action_type = action.get("action_type")
     action_time = action.get("action_time")
     violations: list[str] = []
     warnings: list[str] = []
+    component_gate = component_gate or {}
+    llm_policy = llm_policy or {}
 
     if action_type not in ALLOWED_ACTIONS:
         violations.append(f"Unknown action_type: {action_type}")
@@ -63,12 +67,20 @@ def validate_action(
             except ValueError as exc:
                 violations.append(str(exc))
 
+    if action_type == "schedule_monitoring" and action_time is not None:
+        recommended_monitoring = recommended_monitoring_time(case, llm_policy)
+        if action_time != recommended_monitoring:
+            violations.append(
+                "schedule_monitoring action_time must equal "
+                f"recommended_monitoring_time={recommended_monitoring}"
+            )
+
     if action_type in {
         "schedule_maintenance",
         "schedule_HPC_maintenance",
         "schedule_fan_maintenance",
     } and action_time is not None:
-        recommended = recommended_maintenance_time(case)
+        recommended = recommended_maintenance_time(case, llm_policy)
         if action_time != recommended:
             violations.append(
                 f"maintenance action_time must equal recommended_maintenance_time={recommended}"
@@ -78,5 +90,26 @@ def validate_action(
         violations.append(f"{action_type} is disallowed by dataset policy")
     if action_type not in set(dataset_rules.get("allowed_actions", [])) and action_type in ALLOWED_ACTIONS:
         violations.append(f"{action_type} is not allowed by dataset policy")
+
+    escalation_active = (
+        llm_policy.get("action_escalation_policy")
+        == "maintenance_when_risk_activated_and_component_supported"
+    )
+    risk_activated = str((lightgbm_risk or {}).get("risk_decision", "")) in {
+        "activate_llm_agent",
+        "activate_llm_agent_uncertain",
+    }
+    suggested = str(component_gate.get("suggested_component_action", ""))
+    suggested_allowed = suggested in set(dataset_rules.get("allowed_actions", []))
+    if (
+        escalation_active
+        and risk_activated
+        and component_gate.get("component_supported", False)
+        and suggested_allowed
+        and action_type != suggested
+    ):
+        violations.append(
+            f"adaptive escalation policy requires {suggested} when component support is strong"
+        )
 
     return {"valid": len(violations) == 0, "violations": violations, "warnings": warnings}

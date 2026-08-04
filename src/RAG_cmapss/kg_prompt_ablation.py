@@ -21,7 +21,7 @@ Choose exactly one action:
 
 Constraints:
 - continue_normal_operation must have action_time = null.
-- schedule_monitoring must use the forecast-horizon end.
+- schedule_monitoring must use the supplied recommended_monitoring_time.
 - schedule_maintenance must use the supplied recommended_maintenance_time.
 - Use the active risk-tool result as the primary risk-stage evidence.
 - Raw sensor-error statistics can support degradation risk, persistence, and timing, but not a subsystem identity.
@@ -41,7 +41,7 @@ def build_no_kg_prompt(
 ) -> str:
     sensor_profile = build_raw_sensor_profile(case)
     risk_tool = sanitize_risk_tool(lightgbm_risk)
-    timing_profile = maintenance_timing_profile(case)
+    timing_profile = maintenance_timing_profile(case, llm_policy)
     return f"""Forecast case:
 {json.dumps({"case_id": case.get("case_id"), "forecast_horizon": case.get("forecast_horizon")}, indent=2)}
 
@@ -79,7 +79,8 @@ Return exactly one JSON object:
 }}
 
 For schedule_maintenance, action_time must equal {timing_profile["recommended_maintenance_time"]}.
-The horizon end is only the next-review time for schedule_monitoring. Base the decision only on information shown."""
+For schedule_monitoring, action_time must equal {timing_profile["recommended_monitoring_time"]}.
+Base the decision only on information shown."""
 
 
 def build_raw_sensor_profile(case: dict[str, Any]) -> dict[str, Any]:

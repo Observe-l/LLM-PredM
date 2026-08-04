@@ -13,6 +13,9 @@ import pandas as pd
 
 from .agentic_controller import llm_decide_adaptation
 from .config import DEFAULT_KG_DIR, DEFAULT_MODEL_NAME, DEFAULT_OLLAMA_URL, DEFAULT_OUTPUT_DIR
+from .evaluation_agent import run_evaluation_agent
+from .evaluation_tool import EvaluationTool, compact_evaluation_history
+from .evaluation_validator import validate_and_apply_evaluation
 from .kg_store import KGStore
 from .lightgbm_train import train_lightgbm_models
 from .lightgbm_update_tool import LightGBMUpdateTool
@@ -143,6 +146,34 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Save the latest K Ollama prompt/output audit records to recent_ollama_outputs.json. Use 0 to disable.",
     )
+    parser.add_argument(
+        "--evaluation_window",
+        type=int,
+        default=10,
+        help="Run periodic completed-engine evaluation every W engines. Default: 10.",
+    )
+    parser.add_argument(
+        "--evaluation_minimum_support",
+        type=int,
+        default=3,
+        help=(
+            "Deprecated compatibility option. The evaluation agent now decides policy "
+            "updates without a deterministic minimum-support gate."
+        ),
+    )
+    parser.add_argument(
+        "--disable_periodic_evaluation",
+        action="store_true",
+        help="Disable periodic EvaluationTool/EvaluationAgent policy adaptation.",
+    )
+    parser.add_argument(
+        "--disable_per_feedback_policy_update",
+        action="store_true",
+        help=(
+            "Disable the legacy LLM policy update after each non-correct engine. "
+            "Use with --disable_periodic_evaluation for a frozen-v6 no-evaluator control."
+        ),
+    )
     parser.add_argument("--max_engines", type=int, default=None)
     parser.add_argument("--max_llm_calls", type=int, default=None)
     return parser.parse_args()
@@ -150,6 +181,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.evaluation_window < 1:
+        raise SystemExit("--evaluation_window must be >= 1")
+    if args.evaluation_minimum_support < 1:
+        raise SystemExit("--evaluation_minimum_support must be >= 1")
     if args.risk_model_path is not None:
         raise SystemExit(
             "--risk_model_path is disabled for zero-shot online experiments; "
@@ -186,6 +221,7 @@ def main() -> None:
     zero_shot_score_log_path = args.output_dir / "zero_shot_risk_scores.json"
     lightgbm_update_log_path = args.output_dir / "lightgbm_update_logs.json"
     llm_policy_update_log_path = args.output_dir / "llm_policy_update_logs.json"
+    evaluation_log_path = args.output_dir / "evaluation_logs.json"
     recent_ollama_outputs: deque[dict[str, Any]] = deque(maxlen=max(args.save_recent_ollama_outputs, 0))
 
     engine_count = 0
@@ -196,6 +232,7 @@ def main() -> None:
     feedback_logs: list[dict[str, Any]] = []
     lightgbm_update_logs: list[dict[str, Any]] = []
     llm_policy_update_logs: list[dict[str, Any]] = []
+    evaluation_logs: list[dict[str, Any]] = []
     zero_shot_score_logs: list[dict[str, Any]] = []
     forecast_cases: list[dict[str, Any]] = []
     persist_progress(
@@ -437,9 +474,29 @@ def main() -> None:
         )
         write_json(engine_summary_path, engine_summaries)
         write_csv(engine_summary_csv_path, engine_summaries)
+        if (
+            not args.disable_periodic_evaluation
+            and len(engine_summaries) % int(args.evaluation_window) == 0
+        ):
+            evaluation_record = run_periodic_evaluation(
+                args=args,
+                fd_name=str(fd_name),
+                feedback_logs=feedback_logs,
+                action_hypotheses=action_hypotheses,
+                evaluation_logs=evaluation_logs,
+                llm_policy_path=llm_policy_path,
+            )
+            evaluation_logs.append(evaluation_record)
+            write_json(evaluation_log_path, evaluation_logs)
 
     summary = {
         "lhi_dir": str(args.lhi_dir),
+        "score_columns": {
+            "score_col": args.score_col,
+            "raw_score_col": args.raw_score_col,
+            "lhi_col": args.lhi_col,
+            "lhi_trigger": args.lhi_trigger,
+        },
         "experiment_kg_dir": str(experiment_kg_dir),
         "reflection_rules_path": str(experiment_kg_dir / "reflection_rules.csv"),
         "engines_processed": len(engine_summaries),
@@ -451,6 +508,20 @@ def main() -> None:
         "risk_policy_mode": args.risk_policy_mode,
         "prompt_variant": args.prompt_variant,
         "min_predm_cycle": min_predm_cycle,
+        "periodic_evaluation": {
+            "enabled": not args.disable_periodic_evaluation,
+            "window": args.evaluation_window,
+            "decision_authority": "evaluation_agent",
+            "validator_mode": "structural_only_no_transition_or_cooldown",
+            "policy_schema_version": 6,
+            "checkpoint_count": len(evaluation_logs),
+        },
+        "per_feedback_policy_update": {
+            "enabled": bool(
+                args.disable_periodic_evaluation
+                and not args.disable_per_feedback_policy_update
+            ),
+        },
         "outputs": {
             "action_hypotheses": str(action_log_path),
             "forecast_cases": str(cases_path),
@@ -458,6 +529,7 @@ def main() -> None:
             "feedback_statistics": str(feedback_statistics_path),
             "lightgbm_update_logs": str(lightgbm_update_log_path) if args.risk_policy_mode == "hybrid" else None,
             "llm_policy_update_logs": str(llm_policy_update_log_path),
+            "evaluation_logs": str(evaluation_log_path),
             "engine_summary": str(engine_summary_path),
             "recent_ollama_outputs": str(recent_ollama_outputs_path) if args.save_recent_ollama_outputs > 0 else None,
             "zero_shot_risk_scores": str(zero_shot_score_log_path),
@@ -483,6 +555,7 @@ def main() -> None:
     if args.risk_policy_mode == "hybrid":
         write_json(lightgbm_update_log_path, lightgbm_update_logs)
     write_json(llm_policy_update_log_path, llm_policy_update_logs)
+    write_json(evaluation_log_path, evaluation_logs)
     write_json(engine_summary_path, engine_summaries)
     write_csv(engine_summary_csv_path, engine_summaries)
     if args.save_recent_ollama_outputs > 0:
@@ -575,6 +648,7 @@ def clean_experiment_outputs(output_dir: Path) -> None:
         "recent_ollama_outputs.json",
         "lightgbm_update_logs.json",
         "llm_policy_update_logs.json",
+        "evaluation_logs.json",
         "lightgbm_update_operations.jsonl",
         "joint_simulation_summary.json",
         "engine_summary.csv",
@@ -888,6 +962,20 @@ def maybe_run_update_tool(
             lightgbm_update_logs.append(lightgbm_record)
             write_json(output_dir / "lightgbm_update_logs.json", lightgbm_update_logs)
         return handoff_model_path
+    if (
+        args.risk_policy_mode == "llm_only"
+        and not args.disable_periodic_evaluation
+    ):
+        # Reflection is still persisted for every engine, but adaptive policy
+        # changes are made only at completed-engine evaluation checkpoints.
+        return None
+    if (
+        args.risk_policy_mode == "llm_only"
+        and args.disable_per_feedback_policy_update
+    ):
+        # Frozen-policy control arm: feedback/reflection is still recorded, but
+        # neither periodic nor per-feedback adaptation may change v6 policy.
+        return None
     if args.risk_policy_mode == "llm_only":
         llm_policy_update_result = maybe_update_llm_policy_tool(
             args=args,
@@ -991,6 +1079,51 @@ def maybe_run_update_tool(
     if operation is not None:
         append_update_operation(output_dir / "lightgbm_update_operations.jsonl", record)
     return new_model_path
+
+
+def run_periodic_evaluation(
+    *,
+    args: argparse.Namespace,
+    fd_name: str,
+    feedback_logs: list[dict[str, Any]],
+    action_hypotheses: list[dict[str, Any]],
+    evaluation_logs: list[dict[str, Any]],
+    llm_policy_path: Path,
+) -> dict[str, Any]:
+    policy = load_policy(llm_policy_path) or initial_policy(theta_conf=args.risk_theta_conf)
+    report = EvaluationTool(window_size=args.evaluation_window).evaluate(
+        fd=fd_name,
+        feedback_logs=feedback_logs,
+        action_hypotheses=action_hypotheses,
+        current_policy=policy,
+        lhi_trigger=args.lhi_trigger,
+    )
+    report["recent_evaluation_history"] = compact_evaluation_history(evaluation_logs, limit=4)
+    decision = run_evaluation_agent(
+        report,
+        model=args.model,
+        ollama_url=args.ollama_url,
+        temperature=args.temperature,
+        timeout=args.timeout,
+        num_predict=args.ollama_num_predict,
+        format_json=not args.disable_ollama_json_format,
+        dry_run=args.dry_run or args.disable_update_review_llm,
+    )
+    validation = validate_and_apply_evaluation(
+        decision=decision,
+        report=report,
+        current_policy=policy,
+        minimum_support=args.evaluation_minimum_support,
+    )
+    if validation["applied"]:
+        write_json(llm_policy_path, validation["updated_policy"])
+    return {
+        "checkpoint_id": report["checkpoint_id"],
+        "evaluation_report": report,
+        "evaluation_agent_decision": decision,
+        "validation": validation,
+        "policy_path": str(llm_policy_path),
+    }
 
 
 def maybe_update_llm_policy_tool(

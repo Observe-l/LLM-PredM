@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .lightgbm_risk_tool import risk_stage
+from .timing_policy import PEAK_OFFSET_CYCLES
 
 
 DEFAULT_LLM_POLICY_PATH = Path("models/llm_policy_tool.json")
@@ -79,9 +80,11 @@ def initial_policy(
     return validate_policy(
         {
             "tool_name": "LLMPolicyRiskTool",
-            "version": 4,
+            "version": 6,
             "source": "initial_lhi_qualified_policy",
             "policy_type": "lhi_qualified_action_timing_policy",
+            "policy_revision": 0,
+            "effective_from_engine": 1,
             "theta_conf": float(theta_conf),
             "positive_peak_min": None,
             "early_peak_max": None,
@@ -91,6 +94,9 @@ def initial_policy(
             "missed_cause_counts": {},
             "action_escalation_policy": "neutral",
             "maintenance_timing_policy": "peak_score_cycle",
+            "peak_offset_level": "none",
+            "monitoring_interval": 20,
+            "evaluation_updates": [],
             "updates": [],
             "reason": "The upstream LHI trigger is the only score gate.",
         }
@@ -115,9 +121,11 @@ def validate_policy(policy: dict[str, Any]) -> dict[str, Any]:
         raise PolicyValidationError("policy must be a JSON object")
     sanitized = {
         "tool_name": "LLMPolicyRiskTool",
-        "version": 4,
+        "version": 6,
         "source": str(policy.get("source", "llm_policy_tool")),
         "policy_type": "lhi_qualified_action_timing_policy",
+        "policy_revision": int(policy.get("policy_revision", 0) or 0),
+        "effective_from_engine": int(policy.get("effective_from_engine", 1) or 1),
         "theta_conf": _bounded(policy.get("theta_conf"), 0.3, 0.0, 1.0),
         "positive_peak_min": _optional_float(policy.get("positive_peak_min")),
         "early_peak_max": _optional_float(policy.get("early_peak_max")),
@@ -141,6 +149,17 @@ def validate_policy(policy: dict[str, Any]) -> dict[str, Any]:
             else "neutral"
         ),
         "maintenance_timing_policy": "peak_score_cycle",
+        "peak_offset_level": (
+            str(policy.get("peak_offset_level"))
+            if str(policy.get("peak_offset_level")) in PEAK_OFFSET_CYCLES
+            else "none"
+        ),
+        "monitoring_interval": _monitoring_interval(policy.get("monitoring_interval")),
+        "evaluation_updates": (
+            list(policy.get("evaluation_updates", []))[-100:]
+            if isinstance(policy.get("evaluation_updates"), list)
+            else []
+        ),
         "updates": list(policy.get("updates", []))[-200:] if isinstance(policy.get("updates"), list) else [],
         "reason": str(policy.get("reason", ""))[:600],
     }
@@ -151,9 +170,16 @@ def policy_summary(policy: dict[str, Any]) -> dict[str, Any]:
     return {
         "source": policy.get("source"),
         "policy_type": policy.get("policy_type"),
+        "policy_revision": policy.get("policy_revision"),
+        "effective_from_engine": policy.get("effective_from_engine"),
         "theta_conf": policy.get("theta_conf"),
         "action_escalation_policy": policy.get("action_escalation_policy"),
         "maintenance_timing_policy": policy.get("maintenance_timing_policy"),
+        "peak_offset_level": policy.get("peak_offset_level"),
+        "peak_offset_cycles": PEAK_OFFSET_CYCLES.get(
+            str(policy.get("peak_offset_level", "none")), 0
+        ),
+        "monitoring_interval": policy.get("monitoring_interval"),
         "missed_cause_counts": policy.get("missed_cause_counts"),
         "reason": policy.get("reason"),
     }
@@ -177,6 +203,14 @@ def _optional_float(value: Any) -> float | None:
 def _bounded(value: Any, default: float, low: float, high: float) -> float:
     number = _num(value, default)
     return round(min(max(float(number), low), high), 6)
+
+
+def _monitoring_interval(value: Any) -> int:
+    try:
+        interval = int(value)
+    except (TypeError, ValueError):
+        return 20
+    return interval if interval in {5, 10, 20} else 20
 
 
 def _num(value: Any, default: float | None = 0.0) -> float | None:

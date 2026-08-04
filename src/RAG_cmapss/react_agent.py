@@ -19,7 +19,11 @@ from .llm_policy_risk_tool import LLMPolicyRiskTool
 from .ollama_client import extract_json, ollama_chat
 from .kg_prompt_ablation import NO_KG_SYSTEM_PROMPT, build_no_kg_prompt
 from .prompt_builder import SYSTEM_PROMPT, build_prompt
-from .timing_policy import maintenance_timing_profile, recommended_maintenance_time
+from .timing_policy import (
+    maintenance_timing_profile,
+    recommended_maintenance_time,
+    recommended_monitoring_time,
+)
 
 
 def normalize_case(case: dict[str, Any]) -> dict[str, Any]:
@@ -311,10 +315,11 @@ Validation errors:
 Return exactly one JSON object.
 Mandatory output rules:
 - continue_normal_operation must use "action_time": null.
-- schedule_monitoring must use the forecast-horizon end as action_time.
+- schedule_monitoring must use the adaptive recommended_monitoring_time.
 - schedule_maintenance, schedule_HPC_maintenance, and schedule_fan_maintenance must use
-  {recommended_maintenance_time(context["case"])} as action_time, the forecast risk-peak timing anchor.
-- If choosing schedule_monitoring, set action_time to the forecast horizon end.
+  {recommended_maintenance_time(context["case"], context.get("llm_policy"))} as action_time.
+- If choosing schedule_monitoring, set action_time to
+  {recommended_monitoring_time(context["case"], context.get("llm_policy"))}.
 Return only valid JSON.
 """
         try:
@@ -404,6 +409,9 @@ Return only valid JSON.
             "risk_threshold_overrides": context.get("risk_threshold_overrides", {}),
             "llm_policy": context.get("llm_policy"),
             "llm_risk_policy": context.get("llm_risk_policy"),
+            "maintenance_timing_profile": maintenance_timing_profile(
+                context["case"], context.get("llm_policy")
+            ),
             "lightgbm_risk": context["lightgbm_risk"],
         },
         "llm_calls": llm_calls,
@@ -500,14 +508,19 @@ def _local_validation_repair(
             "action_time is outside forecast_horizon",
             (
                 "maintenance action_time must equal recommended_maintenance_time="
-                f"{recommended_maintenance_time(context['case'])}"
+                f"{recommended_maintenance_time(context['case'], context.get('llm_policy'))}"
+            ),
+            (
+                "schedule_monitoring action_time must equal recommended_monitoring_time="
+                f"{recommended_monitoring_time(context['case'], context.get('llm_policy'))}"
             ),
         ]
     ):
         repaired = dict(action)
         if action.get("action_type") == "schedule_monitoring":
-            horizon = context["case"].get("forecast_horizon", {})
-            repaired["action_time"] = f"t+{int(horizon.get('end', 20))}"
+            repaired["action_time"] = recommended_monitoring_time(
+                context["case"], context.get("llm_policy")
+            )
         else:
             repaired["action_time"] = _maintenance_action_time(context)
         repaired["reason"] = "Repaired action_time format while preserving LLM action choice."
@@ -520,6 +533,26 @@ def _local_validation_repair(
         repaired["action_time"] = rule_based_action(context)["action_time"]
         repaired["reason"] = "Filled missing monitoring time from KG rule fallback."
         return repaired
+
+    escalation_errors = [
+        item for item in violations
+        if item.startswith("adaptive escalation policy requires ")
+    ]
+    if escalation_errors:
+        suggested = str(context.get("component_gate", {}).get("suggested_component_action", ""))
+        if suggested in {"schedule_HPC_maintenance", "schedule_fan_maintenance"}:
+            repaired = dict(action)
+            repaired["action_type"] = suggested
+            repaired["action_time"] = _maintenance_action_time(context)
+            repaired["degradation_hypothesis"] = (
+                "HPC_related_degradation"
+                if suggested == "schedule_HPC_maintenance"
+                else "Fan_related_degradation"
+            )
+            repaired["reason"] = (
+                "Applied validated adaptive escalation policy to strong component evidence."
+            )
+            return repaired
 
     return None
 
@@ -536,6 +569,8 @@ def _validate_action_for_variant(
         context["sensor_paths"],
         risk_gate=context["risk_gate"],
         lightgbm_risk=context["lightgbm_risk"],
+        component_gate=context.get("component_gate"),
+        llm_policy=context.get("llm_policy"),
     )
 
 
@@ -552,7 +587,9 @@ def _minimal_json_prompt(context: dict[str, Any]) -> str:
             "first_warning_crossing_cycle": summary.get("first_warning_crossing_cycle"),
             "dominant_top_sensors": summary.get("dominant_top_sensors"),
         },
-        "maintenance_timing_policy": maintenance_timing_profile(case),
+        "maintenance_timing_policy": maintenance_timing_profile(
+            case, context.get("llm_policy")
+        ),
         "risk_gate": context.get("risk_gate"),
         "component_gate": context.get("component_gate"),
         "lightgbm_risk": context.get("lightgbm_risk"),
@@ -566,8 +603,10 @@ def _minimal_json_prompt(context: dict[str, Any]) -> str:
         "Choose action_type from continue_normal_operation, schedule_monitoring, "
         "schedule_fan_maintenance, schedule_HPC_maintenance. "
         "Use action_time=null only for continue_normal_operation. "
-        "For schedule_monitoring, use the forecast-horizon end. "
-        f"For maintenance, action_time must equal {recommended_maintenance_time(case)}. "
+        "For schedule_monitoring, action_time must equal "
+        f"{recommended_monitoring_time(case, context.get('llm_policy'))}. "
+        "For maintenance, action_time must equal "
+        f"{recommended_maintenance_time(case, context.get('llm_policy'))}. "
         "Use evidence_paths as short IDs only, e.g. [\"E1\", \"E2\"]. "
         "Keep reason under 30 words.\n\n"
         + json.dumps(payload, indent=2)
@@ -621,8 +660,7 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     if action_type == "continue_normal_operation":
         action_time = None
     elif action_type == "schedule_monitoring":
-        horizon = case.get("forecast_horizon", {})
-        action_time = f"t+{int(horizon.get('end', 20))}"
+        action_time = recommended_monitoring_time(case, context.get("llm_policy"))
     else:
         action_time = _maintenance_action_time(context)
 
@@ -640,11 +678,10 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
 
 def no_kg_fallback_action(context: dict[str, Any]) -> dict[str, Any]:
     case = context["case"]
-    horizon = case.get("forecast_horizon", {})
     risk = context.get("lightgbm_risk", {})
     return {
         "action_type": "schedule_monitoring",
-        "action_time": f"t+{int(horizon.get('end', 20))}",
+        "action_time": recommended_monitoring_time(case, context.get("llm_policy")),
         "risk_hypothesis": risk.get("predicted_risk_stage", "uncertain_risk"),
         "degradation_hypothesis": "unspecified_component_degradation",
         "confidence": float(risk.get("confidence", 0.5)),
@@ -671,8 +708,9 @@ def low_risk_action(context: dict[str, Any], prompt_variant: str = "kg") -> dict
     if action["action_type"] in {"schedule_HPC_maintenance", "schedule_fan_maintenance"}:
         action["action_type"] = "schedule_monitoring"
         action["degradation_hypothesis"] = "uncertain_component_degradation"
-        horizon = context["case"].get("forecast_horizon", {})
-        action["action_time"] = f"t+{int(horizon.get('end', 20))}"
+        action["action_time"] = recommended_monitoring_time(
+            context["case"], context.get("llm_policy")
+        )
         action["risk_tool_low_risk_gate_used"] = True
     action["reason"] = (
         "Active risk tool judged this case below LLM activation threshold; scheduled conservative monitoring."
@@ -688,7 +726,7 @@ def _confidence(sensor_paths: list[dict[str, Any]], hypothesis: str) -> float:
 
 
 def _maintenance_action_time(context: dict[str, Any]) -> str:
-    return recommended_maintenance_time(context["case"])
+    return recommended_maintenance_time(context["case"], context.get("llm_policy"))
 
 
 def _learned_risk_supports_maintenance(lightgbm_risk: dict[str, Any]) -> bool:
