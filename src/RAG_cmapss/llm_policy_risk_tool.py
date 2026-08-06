@@ -76,6 +76,7 @@ class LLMPolicyRiskTool:
 def initial_policy(
     *,
     theta_conf: float = 0.3,
+    peak_threshold: float = 0.25,
 ) -> dict[str, Any]:
     return validate_policy(
         {
@@ -86,6 +87,7 @@ def initial_policy(
             "policy_revision": 0,
             "effective_from_engine": 1,
             "theta_conf": float(theta_conf),
+            "peak_threshold": float(peak_threshold),
             "positive_peak_min": None,
             "early_peak_max": None,
             "correct_anchor_count": 0,
@@ -127,6 +129,8 @@ def validate_policy(policy: dict[str, Any]) -> dict[str, Any]:
         "policy_revision": int(policy.get("policy_revision", 0) or 0),
         "effective_from_engine": int(policy.get("effective_from_engine", 1) or 1),
         "theta_conf": _bounded(policy.get("theta_conf"), 0.3, 0.0, 1.0),
+        # LHI threshold is strictly positive; there is intentionally no upper cap.
+        "peak_threshold": max(float(_num(policy.get("peak_threshold"), 0.25)), 1e-6),
         "positive_peak_min": _optional_float(policy.get("positive_peak_min")),
         "early_peak_max": _optional_float(policy.get("early_peak_max")),
         "correct_anchor_count": int(policy.get("correct_anchor_count", 0) or 0),
@@ -173,6 +177,7 @@ def policy_summary(policy: dict[str, Any]) -> dict[str, Any]:
         "policy_revision": policy.get("policy_revision"),
         "effective_from_engine": policy.get("effective_from_engine"),
         "theta_conf": policy.get("theta_conf"),
+        "peak_threshold": policy.get("peak_threshold"),
         "action_escalation_policy": policy.get("action_escalation_policy"),
         "maintenance_timing_policy": policy.get("maintenance_timing_policy"),
         "peak_offset_level": policy.get("peak_offset_level"),

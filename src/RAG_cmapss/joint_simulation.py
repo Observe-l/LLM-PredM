@@ -268,7 +268,11 @@ def main() -> None:
             if state.next_due_cutoff is not None and cutoff < state.next_due_cutoff:
                 continue
             peak_lhi = case_peak_lhi(window, args.lhi_col)
-            if not pd.notna(peak_lhi) or peak_lhi <= args.lhi_trigger:
+            active_lhi_trigger = current_lhi_trigger(
+                llm_policy_path,
+                fallback=args.lhi_trigger,
+            )
+            if not pd.notna(peak_lhi) or peak_lhi <= active_lhi_trigger:
                 continue
             if args.max_llm_calls is not None and llm_call_count >= args.max_llm_calls:
                 terminal_reason = "max_llm_calls"
@@ -311,7 +315,7 @@ def main() -> None:
                 prompt_variant=args.prompt_variant,
             )
             result["latency_sec"] = round(time.time() - started, 3)
-            result["lhi_gate"] = {"column": args.lhi_col, "peak_lhi": peak_lhi, "trigger": args.lhi_trigger}
+            result["lhi_gate"] = {"column": args.lhi_col, "peak_lhi": peak_lhi, "trigger": active_lhi_trigger}
             action_hypotheses.append(action_decision_record(result))
             record_zero_shot_score(zero_shot_score_logs, result, case)
             write_json(zero_shot_score_log_path, zero_shot_score_logs)
@@ -608,7 +612,18 @@ def current_llm_policy(args: argparse.Namespace, policy_path: Path) -> dict[str,
     policy = load_policy(policy_path)
     if policy is not None:
         return policy
-    return initial_policy(theta_conf=args.risk_theta_conf)
+    return initial_policy(theta_conf=args.risk_theta_conf, peak_threshold=args.lhi_trigger)
+
+
+def current_lhi_trigger(policy_path: Path, fallback: float) -> float:
+    """Return the current LLM-adaptive LHI gate threshold."""
+    policy = load_policy(policy_path)
+    if isinstance(policy, dict):
+        try:
+            return float(policy.get("peak_threshold", fallback))
+        except (TypeError, ValueError):
+            pass
+    return float(fallback)
 
 
 def engine_history_frame(engine_windows: list[pd.DataFrame], cutoff_cycle: int) -> pd.DataFrame:
@@ -964,13 +979,6 @@ def maybe_run_update_tool(
         return handoff_model_path
     if (
         args.risk_policy_mode == "llm_only"
-        and not args.disable_periodic_evaluation
-    ):
-        # Reflection is still persisted for every engine, but adaptive policy
-        # changes are made only at completed-engine evaluation checkpoints.
-        return None
-    if (
-        args.risk_policy_mode == "llm_only"
         and args.disable_per_feedback_policy_update
     ):
         # Frozen-policy control arm: feedback/reflection is still recorded, but
@@ -1090,13 +1098,16 @@ def run_periodic_evaluation(
     evaluation_logs: list[dict[str, Any]],
     llm_policy_path: Path,
 ) -> dict[str, Any]:
-    policy = load_policy(llm_policy_path) or initial_policy(theta_conf=args.risk_theta_conf)
+    policy = load_policy(llm_policy_path) or initial_policy(
+        theta_conf=args.risk_theta_conf,
+        peak_threshold=args.lhi_trigger,
+    )
     report = EvaluationTool(window_size=args.evaluation_window).evaluate(
         fd=fd_name,
         feedback_logs=feedback_logs,
         action_hypotheses=action_hypotheses,
         current_policy=policy,
-        lhi_trigger=args.lhi_trigger,
+        lhi_trigger=current_lhi_trigger(llm_policy_path, args.lhi_trigger),
     )
     report["recent_evaluation_history"] = compact_evaluation_history(evaluation_logs, limit=4)
     decision = run_evaluation_agent(
@@ -1144,7 +1155,10 @@ def maybe_update_llm_policy_tool(
     ):
         return None
     policy_path = online_model_dir / "llm_policy_tool.json"
-    current_policy = load_policy(policy_path) or initial_policy(theta_conf=args.risk_theta_conf)
+    current_policy = load_policy(policy_path) or initial_policy(
+        theta_conf=args.risk_theta_conf,
+        peak_threshold=args.lhi_trigger,
+    )
     tool = LLMPolicyUpdateTool(policy_path=policy_path)
     result = tool.predict(
         current_policy=current_policy,

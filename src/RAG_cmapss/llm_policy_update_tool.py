@@ -8,13 +8,11 @@ from .lightgbm_features import read_reflection_training_rows
 from .llm_policy_risk_tool import initial_policy, load_policy, validate_policy
 from .ollama_client import extract_json, ollama_chat
 
+UPDATE_STRENGTH_DELTAS = {"none": 0.0, "small": 0.05, "medium": 0.15, "large": 0.30}
+
 
 class LLMPolicyUpdateTool:
-    """Update action and timing policy from experiment-local feedback.
-
-    Score-threshold adaptation intentionally does not live here. The upstream
-    LHI trigger is the experiment's only score gate.
-    """
+    """LLM updater for the experiment-local LHI activation threshold."""
 
     def __init__(self, policy_path: str | Path):
         self.policy_path = Path(policy_path)
@@ -38,8 +36,9 @@ class LLMPolicyUpdateTool:
     ) -> dict[str, Any]:
         policy = validate_policy(current_policy or load_policy(self.policy_path) or initial_policy())
         label = str(feedback.get("feedback_label", ""))
-        missed_cause = str(feedback.get("missed_maintenance_cause") or "")
         peak = _case_peak_score(case)
+        previous_threshold = float(policy.get("peak_threshold", 0.25))
+        missed_cause = str(feedback.get("missed_maintenance_cause") or "")
         fallback = _policy_update_result(
             policy=policy,
             label=label,
@@ -58,14 +57,13 @@ class LLMPolicyUpdateTool:
             return _persist_and_return(self.policy_path, fallback)
 
         payload = {
-            "task": (
-                "Update only maintenance action-escalation and timing policy. "
-                "There is no peak-score threshold; the upstream LHI trigger is the only score gate."
-            ),
+            "task": "Update the LHI activation threshold after non-correct maintenance feedback.",
             "current_case": {
                 "case_id": case.get("case_id"),
                 "dataset_subset": case.get("dataset_subset"),
                 "peak_lhi": peak,
+                "previous_peak_threshold": previous_threshold,
+                "threshold_was_crossed": bool(peak > previous_threshold),
                 "peak_lhi_cycle": _risk_value(case, "peak_score_cycle"),
                 "dominant_component": _risk_value(case, "dominant_component"),
             },
@@ -78,41 +76,29 @@ class LLMPolicyUpdateTool:
             "feedback": feedback,
             "current_policy": {
                 "policy_type": policy.get("policy_type"),
-                "action_escalation_policy": policy.get("action_escalation_policy"),
-                "maintenance_timing_policy": policy.get("maintenance_timing_policy"),
+                "peak_threshold": previous_threshold,
                 "missed_cause_counts": policy.get("missed_cause_counts"),
             },
             "online_feedback_statistics": _feedback_history(reflection_rules_path),
             "update_guidance": [
-                "Do not propose or discuss a peak threshold. It has been removed.",
-                "Use missed_maintenance_cause as the primary causal diagnosis.",
-                (
-                    "For monitoring_without_maintenance or "
-                    "continued_operation_without_maintenance, use "
-                    "action_policy_update='escalate_when_component_supported'."
-                ),
-                (
-                    "For maintenance_scheduled_at_or_after_failure, use "
-                    "timing_policy_update='use_peak_score_cycle'."
-                ),
-                (
-                    "For lhi_gate_not_triggered_before_failure, leave both policies unchanged; "
-                    "this updater does not alter the upstream LHI trigger."
-                ),
-                "For too_early, do not suppress LLM activation; timing must still be grounded in the forecast peak.",
+                "Update only peak_threshold; choose lower/higher/unchanged and none/small/medium/large.",
+                "For missed maintenance caused by the LHI gate, lower the threshold when the peak did not cross it.",
+                "For too_early or over_maintenance, consider raising the threshold when the gate was crossed at a low peak.",
+                "If the current case already crossed the threshold, keep it unchanged unless history supports a separate threshold problem.",
+                "Do not update after correct_maintenance; this tool is called only for non-correct feedback.",
             ],
             "required_output": {
                 "update_policy": "bool",
-                "action_policy_update": "unchanged/escalate_when_component_supported",
-                "timing_policy_update": "unchanged/use_peak_score_cycle",
+                "threshold_update": "lower/higher/unchanged",
+                "update_strength": "none/small/medium/large",
+                "threshold_causality": "blocked_by_threshold/over_activated_by_threshold/action_reasoning_or_component_or_timing/uncertain",
                 "reason": "short string",
                 "confidence": "float 0..1",
             },
         }
         prompt = (
-            "You are the reflection policy controller for a zero-shot predictive-maintenance experiment.\n"
-            "The upstream LHI trigger is the only score gate. Peak threshold has been removed.\n"
-            "Update only action escalation and maintenance timing. Return only valid JSON.\n\n"
+            "You are the LLM policy update controller for a zero-shot predictive-maintenance experiment.\n"
+            "Update the experiment-local LHI activation threshold using the supplied feedback. Return only valid JSON.\n\n"
             + json.dumps(payload, indent=2, ensure_ascii=False, default=str)
         )
         try:
@@ -158,30 +144,31 @@ def _policy_update_result(
     source: str,
     reason: str,
 ) -> dict[str, Any]:
-    action_update = str(parsed.get("action_policy_update", "unchanged"))
-    timing_update = str(parsed.get("timing_policy_update", "unchanged"))
-    if action_update not in {"unchanged", "escalate_when_component_supported"}:
-        action_update = "unchanged"
-    if timing_update not in {"unchanged", "use_peak_score_cycle"}:
-        timing_update = "unchanged"
-
-    # Deterministic causal constraints take precedence over LLM wording.
-    if missed_cause in {"monitoring_without_maintenance", "continued_operation_without_maintenance"}:
-        action_update = "escalate_when_component_supported"
-    if missed_cause == "maintenance_scheduled_at_or_after_failure":
-        timing_update = "use_peak_score_cycle"
-    if missed_cause == "lhi_gate_not_triggered_before_failure":
-        action_update = "unchanged"
-        timing_update = "unchanged"
-
+    threshold_update = str(parsed.get("threshold_update", "unchanged"))
+    strength = str(parsed.get("update_strength", "none"))
+    if threshold_update not in {"lower", "higher", "unchanged"}:
+        threshold_update = "unchanged"
+    if strength not in UPDATE_STRENGTH_DELTAS:
+        strength = "none"
+    previous = float(policy.get("peak_threshold", 0.25))
+    crossed = peak > previous
+    causality = str(parsed.get("threshold_causality", "uncertain"))[:120]
+    is_missed = label.startswith("missed_")
+    is_early = label in {"too_early", "over_maintenance"}
+    if is_missed and (crossed or causality == "action_reasoning_or_component_or_timing"):
+        threshold_update, strength = "unchanged", "none"
+    if is_early and threshold_update == "lower":
+        threshold_update, strength = "unchanged", "none"
+    if strength == "none" or threshold_update == "unchanged":
+        proposed = previous
+        threshold_update, strength = "unchanged", "none"
+    elif threshold_update == "lower":
+        proposed = max(1e-6, previous - UPDATE_STRENGTH_DELTAS[strength])
+    else:
+        proposed = previous + UPDATE_STRENGTH_DELTAS[strength]
     updated = dict(policy)
     _record_feedback(updated, label, peak, missed_cause)
-    if action_update == "escalate_when_component_supported":
-        updated["action_escalation_policy"] = (
-            "maintenance_when_risk_activated_and_component_supported"
-        )
-    if timing_update == "use_peak_score_cycle":
-        updated["maintenance_timing_policy"] = "peak_score_cycle"
+    updated["peak_threshold"] = round(proposed, 6)
     updated["source"] = source
     updated["updates"] = list(updated.get("updates", [])) + [
         {
@@ -189,22 +176,28 @@ def _policy_update_result(
             "feedback_label": label,
             "missed_maintenance_cause": missed_cause or None,
             "peak_lhi": round(float(peak), 6),
-            "action_policy_update": action_update,
-            "timing_policy_update": timing_update,
+            "previous_peak_threshold": round(previous, 6),
+            "updated_peak_threshold": round(proposed, 6),
+            "threshold_update": threshold_update,
+            "update_strength": strength,
             "source": source,
         }
     ]
     updated = validate_policy(updated)
-    changed = action_update != "unchanged" or timing_update != "unchanged"
     return {
         "tool_name": "LLMPolicyUpdateTool",
-        "update_policy": changed,
+        "update_policy": proposed != previous,
+        "update_threshold": proposed != previous,
         "updated_policy": updated,
         "reason": reason,
         "confidence": _bounded(parsed.get("confidence"), 0.0, 0.0, 1.0),
         "missed_maintenance_cause": missed_cause or None,
-        "action_policy_update": action_update,
-        "timing_policy_update": timing_update,
+        "threshold_update": threshold_update,
+        "update_strength": strength,
+        "threshold_delta": round(proposed - previous, 6),
+        "previous_peak_threshold": round(previous, 6),
+        "updated_peak_threshold": round(proposed, 6),
+        "threshold_causality": causality,
         "source": source,
     }
 

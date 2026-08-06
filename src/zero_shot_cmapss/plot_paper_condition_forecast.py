@@ -133,7 +133,7 @@ def save_plot(
         ax.plot(
             cycles,
             occ_pred,
-            label="OCC-ZSF",
+            label="OCD-ZSF" if condition_idx == len(axes) else "_nolegend_",
             color="#ff7f0e",
             linewidth=1.3,
             marker=".",
@@ -141,7 +141,8 @@ def save_plot(
         )
         ax.set_ylabel(f"condition {condition_idx}")
         ax.grid(True, alpha=0.3)
-        ax.legend(loc="best", fontsize=8)
+        if condition_idx == len(axes):
+            ax.legend(loc="best", fontsize=8)
     axes[-1].set_xlabel("cycle")
     fig.supylabel("sensor reading")
     fig.tight_layout()

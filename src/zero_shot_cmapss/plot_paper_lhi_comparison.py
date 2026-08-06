@@ -198,7 +198,7 @@ def save_lhi_plot(
     ax.plot(
         [x for x, _ in occ_series],
         [y for _, y in occ_series],
-        label="OCC-ZSF",
+        label="OCD-ZSF",
         color="#ff7f0e",
         linewidth=1.3,
     )
