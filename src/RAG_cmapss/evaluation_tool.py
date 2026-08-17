@@ -233,10 +233,14 @@ def compact_evaluation_history(
 
 def _outcome_stats(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     labels = Counter(str(row.get("feedback_label", "unknown")) for row in rows)
+    timing_labels = Counter(
+        str(row.get("timing_feedback_label") or row.get("feedback_label", "unknown"))
+        for row in rows
+    )
     total = len(rows)
     correct = labels.get("correct_maintenance", 0)
-    early = labels.get("too_early", 0) + labels.get("over_maintenance", 0)
-    missed = sum(value for label, value in labels.items() if label.startswith("missed_"))
+    early = timing_labels.get("too_early", 0) + timing_labels.get("over_maintenance", 0)
+    missed = sum(value for label, value in timing_labels.items() if label.startswith("missed_"))
     causes = Counter(
         str(row.get("missed_maintenance_cause"))
         for row in rows
@@ -251,8 +255,10 @@ def _outcome_stats(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "too_early": early,
         "missed_maintenance": missed,
         "correct_maintenance_rate": rate,
+        "wrong_component": labels.get("wrong_component", 0),
         "correct_rate_wilson_95": {"low": low, "high": high},
         "label_counts": dict(labels),
+        "timing_label_counts": dict(timing_labels),
         "missed_cause_counts": dict(causes),
     }
 
@@ -276,7 +282,8 @@ def _timing_stats(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
         for row in rows
     )
     too_early = sum(
-        str(row.get("feedback_label", "")) in {"too_early", "over_maintenance"}
+        str(row.get("timing_feedback_label") or row.get("feedback_label", ""))
+        in {"too_early", "over_maintenance"}
         for row in rows
     )
     return {

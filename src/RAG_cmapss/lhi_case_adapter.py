@@ -597,7 +597,13 @@ def _relative_cycle(abs_cycle: int, cutoff_cycle: int) -> str:
 
 
 def _parse_sensor_list(value: str) -> list[str]:
-    return [s.strip().upper() for s in value.split(",") if s.strip()]
+    text = str(value).strip()
+    # Mixed LHI sources may introduce a column that is absent from the legacy
+    # source.  Pandas represents those cells as NaN; NaN is missing data, not
+    # a sensor named "NAN".
+    if text.lower() in {"", "nan", "none", "null"}:
+        return []
+    return [s.strip().upper() for s in text.split(",") if s.strip()]
 
 
 def _parse_sensor_value_map(value: str) -> dict[str, float]:

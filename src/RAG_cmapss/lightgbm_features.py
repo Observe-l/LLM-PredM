@@ -43,11 +43,6 @@ NUMERIC_FEATURES = [
     "fan_sensor_presence_ratio",
     "conflict_sensor_presence_ratio",
     "sensor_pattern_stability",
-    "hpc_path_score",
-    "fan_path_score",
-    "uncertain_path_score",
-    "component_conflict_score",
-    "dominance_margin",
     "action_to_peak_gap",
     "action_to_warning_gap",
     "action_to_persistence_gap",
@@ -62,14 +57,12 @@ NUMERIC_FEATURES = [
     "reflection_warns_too_early",
     "risk_gate_statistical_candidate",
     "risk_gate_maintenance_candidate",
-    "component_gate_supported",
 ]
 
 CATEGORICAL_FEATURES = [
     "dataset_subset_code",
     "candidate_action_code",
     "previous_action_type_code",
-    "dominant_component_code",
     "d_rmse_lhi_consistency_code",
     "feedback_label_code",
 ]
@@ -94,13 +87,6 @@ ACTION_CODES = {
     "schedule_monitoring": 2,
     "schedule_HPC_maintenance": 3,
     "schedule_fan_maintenance": 4,
-}
-COMPONENT_CODES = {
-    "": 0,
-    "none": 0,
-    "HPC_related_degradation": 1,
-    "Fan_related_degradation": 2,
-    "uncertain_component_degradation": 3,
 }
 CONSISTENCY_CODES = {
     "": 0,
@@ -134,9 +120,7 @@ def extract_lightgbm_features(
     trend = case.get("trend_statistics", {})
     multi = case.get("multi_score_statistics", {})
     sensor = case.get("sensor_evidence_statistics", {})
-    component_stats = context.get("component_evidence_statistics") or case.get("component_evidence_statistics", {})
     risk_gate = context.get("risk_gate", {})
-    component_gate = context.get("component_gate", {})
     reflection_stats = summarize_reflection_rules(context.get("reflection_rules", []))
 
     lhi_name = case.get("score_source", {}).get("lhi_name", "lhi_rmse_roll_mean")
@@ -147,7 +131,6 @@ def extract_lightgbm_features(
     candidate_action = str(context.get("candidate_action") or "")
     previous_action = str((action or {}).get("action_type") or "")
     feedback_label = str((feedback or {}).get("feedback_label") or "")
-    dominant_component = str(component_stats.get("dominant_component") or "")
     consistency = str(multi.get("d_rmse_lhi_consistency") or "")
 
     features: dict[str, float | int] = {
@@ -174,21 +157,14 @@ def extract_lightgbm_features(
         "fan_sensor_presence_ratio": _num(sensor.get("fan_sensor_presence_ratio")),
         "conflict_sensor_presence_ratio": _num(sensor.get("conflict_sensor_presence_ratio")),
         "sensor_pattern_stability": _num(sensor.get("sensor_pattern_stability")),
-        "hpc_path_score": _num(component_stats.get("hpc_path_score")),
-        "fan_path_score": _num(component_stats.get("fan_path_score")),
-        "uncertain_path_score": _num(component_stats.get("uncertain_path_score")),
-        "component_conflict_score": _num(component_stats.get("component_conflict_score")),
-        "dominance_margin": _num(component_stats.get("dominance_margin")),
         "action_to_peak_gap": _num(_cycle_gap((action or {}).get("action_time"), summary.get("peak_score_cycle"))),
         "action_to_warning_gap": _num(_cycle_gap((action or {}).get("action_time"), summary.get("first_warning_crossing_cycle"))),
         "action_to_persistence_gap": _num(_cycle_gap((action or {}).get("action_time"), summary.get("first_persistent_pattern_cycle"))),
         "risk_gate_statistical_candidate": float(bool(risk_gate.get("statistical_candidate"))),
         "risk_gate_maintenance_candidate": float(bool(risk_gate.get("maintenance_candidate"))),
-        "component_gate_supported": float(bool(component_gate.get("component_supported"))),
         "dataset_subset_code": _dataset_code(case.get("dataset_subset")),
         "candidate_action_code": ACTION_CODES.get(candidate_action, 0),
         "previous_action_type_code": ACTION_CODES.get(previous_action, 0),
-        "dominant_component_code": COMPONENT_CODES.get(dominant_component, 0),
         "d_rmse_lhi_consistency_code": CONSISTENCY_CODES.get(consistency, 0),
         "feedback_label_code": FEEDBACK_CODES.get(feedback_label, 0),
         **reflection_stats,
@@ -288,7 +264,6 @@ def top_feature_names(features: dict[str, Any], limit: int = 5) -> list[str]:
 def _features_from_reflection_row(row: dict[str, Any]) -> dict[str, Any]:
     feedback_label = str(row.get("feedback_label", ""))
     previous_action = str(row.get("previous_action_type", ""))
-    dominant_component = str(row.get("dominant_component", ""))
     consistency = str(row.get("d_rmse_lhi_consistency", ""))
     base = {name: _num(row.get(name)) for name in NUMERIC_FEATURES}
     base.update(
@@ -296,7 +271,6 @@ def _features_from_reflection_row(row: dict[str, Any]) -> dict[str, Any]:
             "dataset_subset_code": _dataset_code(row.get("applies_to_dataset")),
             "candidate_action_code": ACTION_CODES.get(previous_action, 0),
             "previous_action_type_code": ACTION_CODES.get(previous_action, 0),
-            "dominant_component_code": COMPONENT_CODES.get(dominant_component, 0),
             "d_rmse_lhi_consistency_code": CONSISTENCY_CODES.get(consistency, 0),
             "feedback_label_code": FEEDBACK_CODES.get(feedback_label, 0),
         }

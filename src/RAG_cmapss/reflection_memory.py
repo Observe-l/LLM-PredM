@@ -17,8 +17,15 @@ REFLECTION_COLUMNS = [
     "previous_action_type",
     "previous_action_time",
     "feedback_label",
+    "timing_feedback_label",
+    "accuracy_feedback_label",
     "feedback_type",
+    "component_feedback",
+    "expected_component",
+    "selected_component",
+    "wrong_component",
     "missed_maintenance_cause",
+    "monitoring_block_reason",
     "maintenance_timing_status",
     "action_abs_cycle",
     "failure_cycle",
@@ -63,12 +70,6 @@ REFLECTION_COLUMNS = [
     "fan_sensor_presence_ratio",
     "conflict_sensor_presence_ratio",
     "component_evidence_strength",
-    "hpc_path_score",
-    "fan_path_score",
-    "uncertain_path_score",
-    "component_conflict_score",
-    "dominant_component",
-    "dominance_margin",
     "then_revise_action_type",
     "recommended_time_rule",
     "then_adjust_threshold",
@@ -85,7 +86,10 @@ def infer_forecast_pattern(forecast_summary: dict[str, Any]) -> str:
     if len(sensors) >= 2 and sensors[0] == "S8" and sensors[1] == "S13":
         return "Pattern_S8_S13_persistent_high_drift" if persistent else "Pattern_S8_S13_high_drift"
     if any(s in {"S4", "S12", "S20", "S21"} for s in sensors[:3]):
-        return "Pattern_score_increasing_sensor_evidence_conflict"
+        trend = str(forecast_summary.get("score_trend") or "").lower()
+        if trend not in {"increasing", "decreasing", "stable"}:
+            trend = "unknown_trend"
+        return f"Pattern_sensor_evidence_conflict_{trend}"
     if forecast_summary.get("peak_score", 0) and not persistent:
         return "Pattern_high_score_without_persistent_top_sensor_pattern"
     sensor_part = "_".join(sensors[:3]) if sensors else "unknown"
@@ -163,8 +167,15 @@ def feedback_to_rule(
         "if_pattern": pattern,
         "previous_action_type": previous_action,
         "feedback_label": label,
+        "timing_feedback_label": feedback.get("timing_feedback_label", label),
+        "accuracy_feedback_label": feedback.get("accuracy_feedback_label", label),
         "feedback_type": feedback.get("feedback_type", ""),
+        "component_feedback": feedback.get("component_feedback", ""),
+        "expected_component": feedback.get("expected_component", ""),
+        "selected_component": feedback.get("selected_component", ""),
+        "wrong_component": feedback.get("wrong_component", False),
         "missed_maintenance_cause": feedback.get("missed_maintenance_cause", ""),
+        "monitoring_block_reason": feedback.get("monitoring_block_reason", ""),
         "maintenance_timing_status": feedback.get("maintenance_timing_status", ""),
         "action_abs_cycle": feedback.get("action_abs_cycle", ""),
         "failure_cycle": feedback.get("failure_cycle", ""),
@@ -311,11 +322,6 @@ def reflection_features(
         if component_aware
         else "not_available"
     )
-    component_stats = (
-        component_stats or case.get("component_evidence_statistics", {})
-        if component_aware
-        else {}
-    )
     lhi_stats = multi.get("lhi_rmse_roll_mean") or multi.get(case.get("score_source", {}).get("lhi_name", ""), {})
     d_stats = multi.get("d_rmse") or multi.get(case.get("score_source", {}).get("raw_score_name", ""), {})
     return {
@@ -357,12 +363,6 @@ def reflection_features(
         "fan_sensor_presence_ratio": _csv_value(sensor.get("fan_sensor_presence_ratio")) if component_aware else "",
         "conflict_sensor_presence_ratio": _csv_value(sensor.get("conflict_sensor_presence_ratio")) if component_aware else "",
         "component_evidence_strength": component_evidence,
-        "hpc_path_score": _csv_value(component_stats.get("hpc_path_score")),
-        "fan_path_score": _csv_value(component_stats.get("fan_path_score")),
-        "uncertain_path_score": _csv_value(component_stats.get("uncertain_path_score")),
-        "component_conflict_score": _csv_value(component_stats.get("component_conflict_score")),
-        "dominant_component": _csv_value(component_stats.get("dominant_component")),
-        "dominance_margin": _csv_value(component_stats.get("dominance_margin")),
     }
 
 
@@ -435,6 +435,11 @@ def _feedback_reason(
     component_feedback: str,
     missed_cause: str,
 ) -> str:
+    if label == "wrong_component":
+        return (
+            "wrong maintenance component: component selection is incorrect for this FD; "
+            "preserve the timing label for theta/evaluator updates"
+        )
     if label == "too_early":
         if component_feedback.lower() == "correct" and _maintenance_still_supported(features, previous_action):
             return "maintenance direction may be plausible, but timing should move closer to persistent/peak risk"
@@ -497,7 +502,6 @@ def build_reflection_feature(
     trend = case.get("trend_statistics", {})
     multi = case.get("multi_score_statistics", {})
     sensor = case.get("sensor_evidence_statistics", {})
-    component_stats = component_stats or case.get("component_evidence_statistics", {})
     lhi_stats = multi.get("lhi_rmse_roll_mean") or multi.get(case.get("score_source", {}).get("lhi_name", ""), {})
     d_stats = multi.get("d_rmse") or multi.get(case.get("score_source", {}).get("raw_score_name", ""), {})
     return {
@@ -527,12 +531,6 @@ def build_reflection_feature(
         "hpc_sensor_presence_ratio": _to_float(sensor.get("hpc_sensor_presence_ratio")),
         "fan_sensor_presence_ratio": _to_float(sensor.get("fan_sensor_presence_ratio")),
         "conflict_sensor_presence_ratio": _to_float(sensor.get("conflict_sensor_presence_ratio")),
-        "hpc_path_score": _to_float(component_stats.get("hpc_path_score")),
-        "fan_path_score": _to_float(component_stats.get("fan_path_score")),
-        "uncertain_path_score": _to_float(component_stats.get("uncertain_path_score")),
-        "component_conflict_score": _to_float(component_stats.get("component_conflict_score")),
-        "dominant_component": component_stats.get("dominant_component"),
-        "dominance_margin": _to_float(component_stats.get("dominance_margin")),
         "action_to_peak_gap": None,
         "action_to_persistence_gap": None,
         "action_to_warning_gap": None,
@@ -574,12 +572,6 @@ def _feature_vector_from_row(row: dict[str, Any]) -> dict[str, float | None]:
         "hpc_sensor_presence_ratio": _to_float(row.get("hpc_sensor_presence_ratio")),
         "fan_sensor_presence_ratio": _to_float(row.get("fan_sensor_presence_ratio")),
         "conflict_sensor_presence_ratio": _to_float(row.get("conflict_sensor_presence_ratio")),
-        "hpc_path_score": _to_float(row.get("hpc_path_score")),
-        "fan_path_score": _to_float(row.get("fan_path_score")),
-        "uncertain_path_score": _to_float(row.get("uncertain_path_score")),
-        "component_conflict_score": _to_float(row.get("component_conflict_score")),
-        "dominant_component": row.get("dominant_component"),
-        "dominance_margin": _to_float(row.get("dominance_margin")),
         "action_to_peak_gap": _to_float(row.get("action_to_peak_gap")),
         "action_to_persistence_gap": _to_float(row.get("action_to_persistence_gap")),
         "action_to_warning_gap": _to_float(row.get("action_to_warning_gap")),
@@ -679,15 +671,18 @@ def _sensor_similarity(query: dict[str, Any], memory: dict[str, Any]) -> float:
 
 
 def _component_similarity(query: dict[str, Any], memory: dict[str, Any]) -> float:
-    dominant_match = 1.0 if query.get("dominant_component") and query.get("dominant_component") == memory.get("dominant_component") else 0.0
+    evidence_match = (
+        1.0
+        if query.get("component_evidence_strength")
+        and query.get("component_evidence_strength") == memory.get("component_evidence_strength")
+        else 0.0
+    )
     return _mean(
         [
-            _numeric_sim(query.get("hpc_path_score"), memory.get("hpc_path_score"), 0.4),
-            _numeric_sim(query.get("fan_path_score"), memory.get("fan_path_score"), 0.4),
-            _numeric_sim(query.get("uncertain_path_score"), memory.get("uncertain_path_score"), 0.4),
-            _numeric_sim(query.get("component_conflict_score"), memory.get("component_conflict_score"), 0.5),
-            _numeric_sim(query.get("dominance_margin"), memory.get("dominance_margin"), 0.4),
-            dominant_match,
+            _numeric_sim(query.get("hpc_sensor_presence_ratio"), memory.get("hpc_sensor_presence_ratio"), 0.5),
+            _numeric_sim(query.get("fan_sensor_presence_ratio"), memory.get("fan_sensor_presence_ratio"), 0.5),
+            _numeric_sim(query.get("conflict_sensor_presence_ratio"), memory.get("conflict_sensor_presence_ratio"), 0.5),
+            evidence_match,
         ]
     )
 
@@ -718,8 +713,6 @@ def _mean(values: list[float]) -> float:
 def _helpfulness_bonus(query: dict[str, Any], memory: dict[str, Any], compact: dict[str, Any]) -> float:
     bonus = 0.0
     if query.get("candidate_action") and compact.get("then_revise_action_type") == query.get("candidate_action"):
-        bonus += 0.05
-    if query.get("dominant_component") and query.get("dominant_component") == memory.get("dominant_component"):
         bonus += 0.05
     if compact.get("feedback_label") in {"correct_maintenance", "missed_HPC_maintenance", "missed_fan_maintenance"}:
         bonus += 0.05
@@ -767,8 +760,15 @@ def _compact_reflection_row(row: dict[str, Any]) -> dict[str, Any]:
         "previous_action_type",
         "previous_action_time",
         "feedback_label",
+        "timing_feedback_label",
+        "accuracy_feedback_label",
         "feedback_type",
+        "component_feedback",
+        "expected_component",
+        "selected_component",
+        "wrong_component",
         "missed_maintenance_cause",
+        "monitoring_block_reason",
         "maintenance_timing_status",
         "action_abs_cycle",
         "failure_cycle",
@@ -813,12 +813,6 @@ def _compact_reflection_row(row: dict[str, Any]) -> dict[str, Any]:
         "fan_sensor_presence_ratio",
         "conflict_sensor_presence_ratio",
         "component_evidence_strength",
-        "hpc_path_score",
-        "fan_path_score",
-        "uncertain_path_score",
-        "component_conflict_score",
-        "dominant_component",
-        "dominance_margin",
         "then_revise_action_type",
         "recommended_time_rule",
         "then_adjust_threshold",
@@ -857,11 +851,6 @@ def _parse_compact_value(key: str, value: Any) -> Any:
         "hpc_sensor_presence_ratio",
         "fan_sensor_presence_ratio",
         "conflict_sensor_presence_ratio",
-        "hpc_path_score",
-        "fan_path_score",
-        "uncertain_path_score",
-        "component_conflict_score",
-        "dominance_margin",
     }:
         return _to_float(value)
     if key == "persistent_high_risk_duration":

@@ -53,12 +53,13 @@ class LLMPolicyRiskTool:
         peak_score = _case_peak_score(case, context)
         score = min(max(float(peak_score), 0.0), 0.98)
         confidence = round(2.0 * abs(score - 0.5), 4)
+        # Confidence controls activation only. It must not turn every
+        # confident case into a late_or_missed case.
+        stage = risk_stage(score)
         if confidence < float(policy.get("theta_conf", self.default_theta_conf)):
             decision = "activate_llm_agent_uncertain"
-            stage = risk_stage(score)
         else:
             decision = "activate_llm_agent"
-            stage = "late_or_missed"
         return {
             "tool_name": "LLMPolicyRiskTool",
             "model_path": str(self.policy_path),

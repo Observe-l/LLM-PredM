@@ -153,13 +153,28 @@ def parse_args() -> argparse.Namespace:
         help="Run periodic completed-engine evaluation every W engines. Default: 10.",
     )
     parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help=(
+            "Number of engines whose feedback is accumulated before policy/theta updates. "
+            "Used in batch mode; defaults to evaluation_window so that n=w (default 10)."
+        ),
+    )
+    parser.add_argument(
+        "--processing_mode",
+        choices=["sequential", "batch"],
+        default="sequential",
+        help=(
+            "Engine processing mode. sequential preserves the original per-engine policy/theta "
+            "updates; batch defers them until n=w engines complete."
+        ),
+    )
+    parser.add_argument(
         "--evaluation_minimum_support",
         type=int,
-        default=3,
-        help=(
-            "Deprecated compatibility option. The evaluation agent now decides policy "
-            "updates without a deterministic minimum-support gate."
-        ),
+        default=10,
+        help="Minimum number of completed engines before evaluator policy updates are allowed.",
     )
     parser.add_argument(
         "--disable_periodic_evaluation",
@@ -183,6 +198,11 @@ def main() -> None:
     args = parse_args()
     if args.evaluation_window < 1:
         raise SystemExit("--evaluation_window must be >= 1")
+    batch_size = int(args.batch_size or args.evaluation_window)
+    if batch_size < 1:
+        raise SystemExit("--batch_size must be >= 1")
+    if args.processing_mode == "batch" and args.batch_size is not None and batch_size != int(args.evaluation_window):
+        raise SystemExit("--batch_size must equal --evaluation_window; batch design requires n=w")
     if args.evaluation_minimum_support < 1:
         raise SystemExit("--evaluation_minimum_support must be >= 1")
     if args.risk_model_path is not None:
@@ -235,6 +255,7 @@ def main() -> None:
     evaluation_logs: list[dict[str, Any]] = []
     zero_shot_score_logs: list[dict[str, Any]] = []
     forecast_cases: list[dict[str, Any]] = []
+    pending_adaptations: list[dict[str, Any]] = []
     persist_progress(
         feedback_log_path=feedback_log_path,
         feedback_logs=feedback_logs,
@@ -379,24 +400,17 @@ def main() -> None:
                     ),
                     component_aware=args.prompt_variant != "no_kg_evidence",
                 )
-                new_model_path = maybe_run_update_tool(
-                    args=args,
-                    feedback=feedback,
-                    case=case,
-                    action=action,
-                    result=result,
-                    reflection_rule=reflection_rule,
-                    lightgbm_update_logs=lightgbm_update_logs,
-                    llm_policy_update_logs=llm_policy_update_logs,
-                    output_dir=args.output_dir,
-                    experiment_kg_dir=experiment_kg_dir,
-                    online_model_dir=online_model_dir,
-                    active_risk_model_path=active_risk_model_path,
-                    engine_index=engine_count,
+                pending_adaptations.append(
+                    {
+                        "feedback": feedback,
+                        "case": case,
+                        "action": action,
+                        "result": result,
+                        "reflection_rule": reflection_rule,
+                        "fd_name": str(fd_name),
+                        "engine_index": engine_count,
+                    }
                 )
-                if new_model_path is not None:
-                    active_risk_model_path = new_model_path
-                apply_latest_threshold_operation(lightgbm_update_logs, adaptive_risk_thresholds, str(fd_name))
                 write_json(feedback_log_path, feedback_logs)
                 terminal_reason = "maintenance_action"
                 break
@@ -443,24 +457,17 @@ def main() -> None:
                 component_stats=last_component_stats,
                 component_aware=args.prompt_variant != "no_kg_evidence",
             )
-            new_model_path = maybe_run_update_tool(
-                args=args,
-                feedback=feedback,
-                case=last_case,
-                action=last_action,
-                result={"context": last_context or {"component_evidence_statistics": last_component_stats or {}}},
-                reflection_rule=reflection_rule,
-                lightgbm_update_logs=lightgbm_update_logs,
-                llm_policy_update_logs=llm_policy_update_logs,
-                output_dir=args.output_dir,
-                experiment_kg_dir=experiment_kg_dir,
-                online_model_dir=online_model_dir,
-                active_risk_model_path=active_risk_model_path,
-                engine_index=engine_count,
+            pending_adaptations.append(
+                {
+                    "feedback": feedback,
+                    "case": last_case,
+                    "action": last_action,
+                    "result": {"context": last_context or {"component_evidence_statistics": last_component_stats or {}}},
+                    "reflection_rule": reflection_rule,
+                    "fd_name": str(last_case.get("dataset_subset")),
+                    "engine_index": engine_count,
+                }
             )
-            if new_model_path is not None:
-                active_risk_model_path = new_model_path
-            apply_latest_threshold_operation(lightgbm_update_logs, adaptive_risk_thresholds, str(last_case.get("dataset_subset")))
             write_json(feedback_log_path, feedback_logs)
 
         engine_summaries.append(
@@ -478,20 +485,86 @@ def main() -> None:
         )
         write_json(engine_summary_path, engine_summaries)
         write_csv(engine_summary_csv_path, engine_summaries)
-        if (
-            not args.disable_periodic_evaluation
-            and len(engine_summaries) % int(args.evaluation_window) == 0
-        ):
-            evaluation_record = run_periodic_evaluation(
+        if args.processing_mode == "sequential":
+            # Backward-compatible mode: apply the queued adaptation immediately
+            # after this engine, exactly as in the original experiment design.
+            active_risk_model_path = flush_batch_adaptations(
                 args=args,
-                fd_name=str(fd_name),
-                feedback_logs=feedback_logs,
-                action_hypotheses=action_hypotheses,
-                evaluation_logs=evaluation_logs,
-                llm_policy_path=llm_policy_path,
+                pending_adaptations=pending_adaptations,
+                lightgbm_update_logs=lightgbm_update_logs,
+                llm_policy_update_logs=llm_policy_update_logs,
+                output_dir=args.output_dir,
+                experiment_kg_dir=experiment_kg_dir,
+                online_model_dir=online_model_dir,
+                active_risk_model_path=active_risk_model_path,
+                adaptive_risk_thresholds=adaptive_risk_thresholds,
             )
-            evaluation_logs.append(evaluation_record)
-            write_json(evaluation_log_path, evaluation_logs)
+            write_json(feedback_log_path, feedback_logs)
+            if args.risk_policy_mode == "hybrid":
+                write_json(lightgbm_update_log_path, lightgbm_update_logs)
+            write_json(llm_policy_update_log_path, llm_policy_update_logs)
+            if (
+                not args.disable_periodic_evaluation
+                and len(engine_summaries) % int(args.evaluation_window) == 0
+                and len(engine_summaries) >= args.evaluation_minimum_support
+            ):
+                evaluation_record = run_periodic_evaluation(
+                    args=args,
+                    fd_name=str(fd_name),
+                    feedback_logs=feedback_logs,
+                    action_hypotheses=action_hypotheses,
+                    evaluation_logs=evaluation_logs,
+                    llm_policy_path=llm_policy_path,
+                )
+                evaluation_logs.append(evaluation_record)
+                write_json(evaluation_log_path, evaluation_logs)
+        elif len(engine_summaries) % batch_size == 0:
+            active_risk_model_path = flush_batch_adaptations(
+                args=args,
+                pending_adaptations=pending_adaptations,
+                lightgbm_update_logs=lightgbm_update_logs,
+                llm_policy_update_logs=llm_policy_update_logs,
+                output_dir=args.output_dir,
+                experiment_kg_dir=experiment_kg_dir,
+                online_model_dir=online_model_dir,
+                active_risk_model_path=active_risk_model_path,
+                adaptive_risk_thresholds=adaptive_risk_thresholds,
+            )
+            write_json(feedback_log_path, feedback_logs)
+            if args.risk_policy_mode == "hybrid":
+                write_json(lightgbm_update_log_path, lightgbm_update_logs)
+            write_json(llm_policy_update_log_path, llm_policy_update_logs)
+            if (
+                not args.disable_periodic_evaluation
+                and len(engine_summaries) >= args.evaluation_minimum_support
+            ):
+                evaluation_record = run_periodic_evaluation(
+                    args=args,
+                    fd_name=str(fd_name),
+                    feedback_logs=feedback_logs,
+                    action_hypotheses=action_hypotheses,
+                    evaluation_logs=evaluation_logs,
+                    llm_policy_path=llm_policy_path,
+                )
+                evaluation_logs.append(evaluation_record)
+                write_json(evaluation_log_path, evaluation_logs)
+
+    # Flush a final partial batch when max_engines or the dataset boundary leaves
+    # fewer than n engines in the last batch.  It is intentionally not evaluated
+    # unless it is a complete n=w batch.
+    partial_final_batch_flushed = bool(pending_adaptations) and args.processing_mode == "batch"
+    if pending_adaptations:
+        active_risk_model_path = flush_batch_adaptations(
+            args=args,
+            pending_adaptations=pending_adaptations,
+            lightgbm_update_logs=lightgbm_update_logs,
+            llm_policy_update_logs=llm_policy_update_logs,
+            output_dir=args.output_dir,
+            experiment_kg_dir=experiment_kg_dir,
+            online_model_dir=online_model_dir,
+            active_risk_model_path=active_risk_model_path,
+            adaptive_risk_thresholds=adaptive_risk_thresholds,
+        )
 
     summary = {
         "lhi_dir": str(args.lhi_dir),
@@ -515,16 +588,32 @@ def main() -> None:
         "periodic_evaluation": {
             "enabled": not args.disable_periodic_evaluation,
             "window": args.evaluation_window,
+            "batch_size": batch_size,
+            "processing_mode": args.processing_mode,
+            "update_order": (
+                "engines -> reflection_memory -> batch_policy_theta_update -> evaluator"
+                if args.processing_mode == "batch"
+                else "engine -> reflection_memory -> policy_theta_update -> evaluator_at_W"
+            ),
             "decision_authority": "evaluation_agent",
             "validator_mode": "structural_only_no_transition_or_cooldown",
             "policy_schema_version": 6,
             "checkpoint_count": len(evaluation_logs),
         },
+        "batch_processing": {
+            "enabled": args.processing_mode == "batch",
+            "n": batch_size,
+            "n_equals_w": batch_size == int(args.evaluation_window),
+            "partial_final_batch_flushed": partial_final_batch_flushed,
+        },
+        "batch_policy_update": {
+            "enabled": bool(args.processing_mode == "batch" and not args.disable_per_feedback_policy_update),
+            "applied_after_each_batch": args.processing_mode == "batch",
+            "reflection_recording": "immediate_per_engine",
+        },
         "per_feedback_policy_update": {
-            "enabled": bool(
-                args.disable_periodic_evaluation
-                and not args.disable_per_feedback_policy_update
-            ),
+            "enabled": bool(args.processing_mode == "sequential" and not args.disable_per_feedback_policy_update),
+            "legacy_behavior": "preserved_by_processing_mode_sequential",
         },
         "outputs": {
             "action_hypotheses": str(action_log_path),
@@ -759,13 +848,21 @@ def maintenance_feedback(
         )
     missed_due_to_timing = action_abs_cycle >= int(failure_cycle)
     is_reasonable = not missed_due_to_timing and normalized_remaining_rul < float(rul_threshold)
-    feedback_label = (
+    timing_feedback_label = (
         _missed_maintenance_label(case, action, component_aware=component_aware)
         if missed_due_to_timing
         else "correct_maintenance"
         if is_reasonable
         else "too_early"
     )
+    selected_component = component_from_action(action)
+    expected_component = expected_component_for_accuracy(case) if component_aware else None
+    wrong_component = bool(
+        expected_component
+        and selected_component
+        and selected_component != expected_component
+    )
+    feedback_label = "wrong_component" if wrong_component else timing_feedback_label
     timing_status = (
         "after_failure"
         if action_abs_cycle > int(failure_cycle)
@@ -781,15 +878,24 @@ def maintenance_feedback(
     return {
         "feedback_id": f"Feedback_{case['case_id']}_maintenance",
         "feedback_type": "maintenance_execution",
+        "dataset_subset": fd_name,
+        "unit_id": unit_id,
         "case_id": case["case_id"],
         "action_id": f"ActionHypothesis_{case['case_id']}",
         "feedback_label": feedback_label,
+        "timing_feedback_label": timing_feedback_label,
+        "accuracy_feedback_label": feedback_label,
         "maintenance_needed": bool(is_reasonable or missed_due_to_timing),
         "component_feedback": (
-            "not_evaluated"
+            "wrong_component"
+            if wrong_component
+            else "not_evaluated"
             if action.get("action_type") == "schedule_maintenance"
             else "correct" if is_reasonable else "unknown"
         ),
+        "expected_component": expected_component,
+        "selected_component": selected_component,
+        "wrong_component": wrong_component,
         "feedback_time": action.get("action_time"),
         "action_abs_cycle": action_abs_cycle,
         "failure_cycle": failure_cycle,
@@ -812,6 +918,7 @@ def breakdown_feedback(
     failure_cycle: int,
     component_aware: bool = True,
     action_history: list[dict[str, Any]] | None = None,
+    decision_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     likely_component = likely_component_from_case(case) if component_aware else None
     fd_name = str(case["dataset_subset"])
@@ -842,12 +949,26 @@ def breakdown_feedback(
     prior_monitoring_count = sum(
         str(item.get("action_type")) == "schedule_monitoring" for item in (action_history or [])
     )
+    context = decision_context or {}
+    risk_gate = context.get("risk_gate") or {}
+    if selection_source == "policy_gate":
+        monitoring_block_reason = "policy_gate"
+    elif risk_gate.get("statistical_candidate") and not risk_gate.get("reflection_allows", True):
+        monitoring_block_reason = "reflection_gate"
+    elif str(risk_gate.get("risk_level", "")) in {"transient_warning", "low"}:
+        monitoring_block_reason = "risk_not_persistent"
+    else:
+        monitoring_block_reason = "llm_selected_monitoring"
     return {
         "feedback_id": f"Feedback_{case['case_id']}_breakdown",
         "feedback_type": "breakdown",
+        "dataset_subset": fd_name,
+        "unit_id": unit_id,
         "case_id": case["case_id"],
         "action_id": f"ActionHypothesis_{case['case_id']}",
         "feedback_label": label,
+        "timing_feedback_label": label,
+        "accuracy_feedback_label": label,
         "breakdown_time": f"cycle_{int(failure_cycle)}",
         "failure_cycle": int(failure_cycle),
         "scheduled_action_time": action.get("action_time"),
@@ -857,7 +978,11 @@ def breakdown_feedback(
         "prior_action_type": previous_action_type,
         "prior_action_selection_source": selection_source or None,
         "prior_monitoring_count": prior_monitoring_count,
+        "monitoring_block_reason": monitoring_block_reason,
         "likely_component": likely_component,
+        "expected_component": expected_component_for_accuracy(case) if component_aware else None,
+        "selected_component": component_from_action(action),
+        "wrong_component": False,
     }
 
 
@@ -866,7 +991,9 @@ def _missed_maintenance_label(
     action: dict[str, Any],
     component_aware: bool,
 ) -> str:
-    component = likely_component_from_case(case) if component_aware else "unknown"
+    component = expected_component_for_accuracy(case) if component_aware else "unknown"
+    if component is None:
+        component = likely_component_from_case(case)
     if component == "unknown":
         component = {
             "schedule_HPC_maintenance": "HPC",
@@ -881,18 +1008,26 @@ def _missed_maintenance_label(
 def summarize_feedback(feedback_logs: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(feedback_logs)
     labels = count_values(str(item.get("feedback_label", "unknown")) for item in feedback_logs)
+    timing_labels = count_values(
+        str(item.get("timing_feedback_label") or item.get("feedback_label", "unknown"))
+        for item in feedback_logs
+    )
     causes = count_values(
         str(item.get("missed_maintenance_cause"))
         for item in feedback_logs
         if item.get("missed_maintenance_cause")
     )
-    missed_total = sum(count for label, count in labels.items() if label.startswith("missed_"))
+    missed_total = sum(count for label, count in timing_labels.items() if label.startswith("missed_"))
     return {
         "total_engines_with_feedback": total,
         "feedback_label_counts": labels,
         "feedback_label_rates": {
             label: count / total if total else 0.0 for label, count in labels.items()
         },
+        "timing_feedback_label_counts": timing_labels,
+        "wrong_component_total": labels.get("wrong_component", 0),
+        "correct_maintenance_count": labels.get("correct_maintenance", 0),
+        "correct_maintenance_rate": labels.get("correct_maintenance", 0) / total if total else 0.0,
         "missed_maintenance_total": missed_total,
         "missed_maintenance_cause_counts": causes,
         "missed_maintenance_cause_rates_among_missed": {
@@ -938,6 +1073,7 @@ def maybe_run_update_tool(
     online_model_dir: Path,
     active_risk_model_path: Path | None,
     engine_index: int,
+    reflection_rows: list[dict[str, Any]] | None = None,
 ) -> Path | None:
     context = result.get("context", {})
     handoff_training_result = None
@@ -994,12 +1130,19 @@ def maybe_run_update_tool(
             reflection_rule=reflection_rule,
             experiment_kg_dir=experiment_kg_dir,
             online_model_dir=online_model_dir,
+            reflection_rows=reflection_rows,
         )
         llm_policy_update_logs.append(
             {
                 "case_id": case.get("case_id"),
                 "feedback_label": feedback.get("feedback_label"),
                 "llm_policy_update_result": llm_policy_update_result,
+                "reflection_scope": (
+                    "current_batch_plus_full_reflection_history"
+                    if reflection_rows is not None
+                    else "full_reflection_memory"
+                ),
+                "new_reflection_count": len(reflection_rows) if reflection_rows is not None else None,
                 "validation": {"valid": True, "violations": []},
             }
         )
@@ -1024,6 +1167,7 @@ def maybe_run_update_tool(
         reflection_rule=reflection_rule,
         experiment_kg_dir=experiment_kg_dir,
         online_model_dir=online_model_dir,
+        reflection_rows=reflection_rows,
     )
     if llm_policy_update_result is not None:
         llm_policy_update_logs.append(
@@ -1031,6 +1175,12 @@ def maybe_run_update_tool(
                 "case_id": case.get("case_id"),
                 "feedback_label": feedback.get("feedback_label"),
                 "llm_policy_update_result": llm_policy_update_result,
+                "reflection_scope": (
+                    "current_batch_plus_full_reflection_history"
+                    if reflection_rows is not None
+                    else "full_reflection_memory"
+                ),
+                "new_reflection_count": len(reflection_rows) if reflection_rows is not None else None,
             }
         )
         write_json(output_dir / "llm_policy_update_logs.json", llm_policy_update_logs)
@@ -1146,6 +1296,7 @@ def maybe_update_llm_policy_tool(
     reflection_rule: dict[str, Any] | None,
     experiment_kg_dir: Path,
     online_model_dir: Path,
+    reflection_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     if args.risk_policy_mode not in {"llm_only", "hybrid"}:
         return None
@@ -1166,6 +1317,7 @@ def maybe_update_llm_policy_tool(
         case=case,
         action=action,
         reflection_rules_path=experiment_kg_dir / "reflection_rules.csv",
+        reflection_rows=reflection_rows,
         model=args.model,
         ollama_url=args.ollama_url,
         temperature=args.temperature,
@@ -1206,6 +1358,106 @@ def _has_update_models(model_dir: Path) -> bool:
     return (model_dir / "lightgbm_update_threshold.pkl").exists() or (
         model_dir / "lightgbm_update_timing.pkl"
     ).exists()
+
+
+def flush_batch_adaptations(
+    *,
+    args: argparse.Namespace,
+    pending_adaptations: list[dict[str, Any]],
+    lightgbm_update_logs: list[dict[str, Any]],
+    llm_policy_update_logs: list[dict[str, Any]],
+    output_dir: Path,
+    experiment_kg_dir: Path,
+    online_model_dir: Path,
+    active_risk_model_path: Path | None,
+    adaptive_risk_thresholds: dict[str, dict[str, float]],
+) -> Path | None:
+    """Apply queued feedback adaptations only after all engines in a batch finish.
+
+    Reflection rules are appended immediately when each engine terminates.  The
+    policy/theta adaptation stage is deliberately deferred here, so every engine
+    in the current batch observes the same policy state.  The evaluator is called
+    by the caller after this function returns.
+    """
+    if not pending_adaptations:
+        return active_risk_model_path
+    queued = list(pending_adaptations)
+    pending_adaptations.clear()
+    # Snapshot only the reflections created by this batch.  Every queued
+    # threshold update sees this same snapshot; older reflection memory is not
+    # used for the batch theta decision.
+    batch_reflection_rows = [
+        item.get("reflection_rule")
+        or {
+            **dict(item.get("feedback") or {}),
+            "previous_action_type": (item.get("action") or {}).get("action_type"),
+            "previous_action_time": (item.get("action") or {}).get("action_time"),
+        }
+        for item in queued
+    ]
+    if (
+        args.processing_mode == "batch"
+        and args.risk_policy_mode == "llm_only"
+        and not args.disable_per_feedback_policy_update
+    ):
+        policy_path = online_model_dir / "llm_policy_tool.json"
+        current_policy = load_policy(policy_path) or initial_policy(
+            theta_conf=args.risk_theta_conf,
+            peak_threshold=args.lhi_trigger,
+        )
+        tool = LLMPolicyUpdateTool(policy_path=policy_path)
+        batch_result = tool.predict_batch(
+            batch_items=queued,
+            current_policy=current_policy,
+            reflection_rules_path=experiment_kg_dir / "reflection_rules.csv",
+            reflection_rows=batch_reflection_rows,
+            model=args.model,
+            ollama_url=args.ollama_url,
+            temperature=args.temperature,
+            timeout=args.timeout,
+            num_predict=args.ollama_num_predict,
+            format_json=not args.disable_ollama_json_format,
+            dry_run=args.dry_run,
+            disable_llm=args.disable_update_review_llm,
+        )
+        llm_policy_update_logs.append(
+            {
+                "batch_update": True,
+                "batch_size": len(queued),
+                "case_ids": [item["case"].get("case_id") for item in queued],
+                "reflection_scope": "current_batch_plus_full_reflection_history",
+                "new_reflection_count": len(batch_reflection_rows),
+                "llm_policy_update_result": batch_result,
+                "validation": {"valid": True, "violations": []},
+            }
+        )
+        write_json(output_dir / "llm_policy_update_logs.json", llm_policy_update_logs)
+        return active_risk_model_path
+    for item in queued:
+        new_model_path = maybe_run_update_tool(
+            args=args,
+            feedback=item["feedback"],
+            case=item["case"],
+            action=item["action"],
+            result=item["result"],
+            reflection_rule=item.get("reflection_rule"),
+            lightgbm_update_logs=lightgbm_update_logs,
+            llm_policy_update_logs=llm_policy_update_logs,
+            output_dir=output_dir,
+            experiment_kg_dir=experiment_kg_dir,
+            online_model_dir=online_model_dir,
+            active_risk_model_path=active_risk_model_path,
+            engine_index=int(item["engine_index"]),
+            reflection_rows=batch_reflection_rows if args.processing_mode == "batch" else None,
+        )
+        if new_model_path is not None:
+            active_risk_model_path = new_model_path
+        apply_latest_threshold_operation(
+            lightgbm_update_logs,
+            adaptive_risk_thresholds,
+            str(item["fd_name"]),
+        )
+    return active_risk_model_path
 
 
 def apply_latest_threshold_operation(
@@ -1292,6 +1544,26 @@ def likely_component_from_case(case: dict[str, Any]) -> str:
     if any(s in {"S8", "S13", "S15"} for s in sensors):
         return "FAN"
     return "unknown"
+
+
+def component_from_action(action: dict[str, Any]) -> str | None:
+    return {
+        "schedule_HPC_maintenance": "HPC",
+        "schedule_fan_maintenance": "FAN",
+    }.get(str(action.get("action_type", "")))
+
+
+def expected_component_for_accuracy(case: dict[str, Any]) -> str | None:
+    """Known component ground truth for the single-mode FD001/FD002 subsets.
+
+    FD003/FD004 contain both degradation modes at dataset level, so this
+    mixed-fleet experiment does not assign a dataset-level component label to
+    those engines; their action component must instead be supported by the
+    per-engine evidence gate.
+    """
+    if str(case.get("dataset_subset")) in {"FD001", "FD002"}:
+        return "HPC"
+    return None
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:

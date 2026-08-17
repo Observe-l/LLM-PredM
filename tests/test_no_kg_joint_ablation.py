@@ -61,10 +61,9 @@ def test_no_kg_reflection_neutralizes_component_fields() -> None:
             "action_type": "schedule_maintenance",
             "action_time": "t+20",
         },
-        component_stats={"hpc_path_score": 0.99, "dominant_component": "HPC"},
         component_aware=False,
     )
     assert features["component_evidence_strength"] == "not_available"
-    assert features["hpc_path_score"] == ""
-    assert features["dominant_component"] == ""
+    assert "hpc_path_score" not in features
+    assert "dominant_component" not in features
     assert features["hpc_sensor_presence_ratio"] == ""

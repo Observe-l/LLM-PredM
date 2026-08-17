@@ -4,7 +4,6 @@ import json
 from typing import Any
 
 from .action_validator import validate_action
-from .action_validator import STRONG_FAN_SENSORS, STRONG_HPC_SENSORS
 from .graph_retriever import (
     build_component_evidence_statistics,
     get_dataset_rules,
@@ -12,7 +11,9 @@ from .graph_retriever import (
     retrieve_action_paths,
     retrieve_sensor_paths,
 )
-from .evidence_gates import build_component_gate, build_risk_gate
+from .evidence_gates import (
+    build_risk_gate,
+)
 from .kg_store import KGStore
 from .lightgbm_risk_tool import LightGBMRiskTool
 from .llm_policy_risk_tool import LLMPolicyRiskTool
@@ -48,13 +49,16 @@ def prepare_context(
     kg_store: KGStore,
     risk_threshold_overrides: dict[str, Any] | None = None,
     llm_policy: dict[str, Any] | None = None,
+    mixed_fleet: bool = False,
+    component_consensus: dict[str, Any] | None = None,
+    prior_monitoring_count: int = 0,
 ) -> dict[str, Any]:
     case = normalize_case(case)
     dataset_subset = str(case["dataset_subset"])
     forecast_summary = case["forecast_summary"]
     sensors = [str(s) for s in forecast_summary.get("dominant_top_sensors", [])]
 
-    dataset_rules = get_dataset_rules(kg_store, dataset_subset)
+    dataset_rules = get_dataset_rules(kg_store, dataset_subset, mixed_fleet=mixed_fleet)
     sensor_paths = retrieve_sensor_paths(
         kg_store,
         sensors,
@@ -70,7 +74,10 @@ def prepare_context(
     candidate_action = infer_candidate_action(dataset_rules, sensor_paths, forecast_summary)
     reflection_rules: list[dict[str, Any]] = []
     risk_gate = build_risk_gate(case, reflection_rules=[], threshold_overrides=risk_threshold_overrides)
-    component_gate = build_component_gate(component_evidence_statistics, dataset_rules)
+    component_gate = {
+        "decision_authority": "llm_evidence_only",
+        "component_gate_applied": False,
+    }
     context = {
         "case": case,
         "dataset_rules": dataset_rules,
@@ -83,6 +90,7 @@ def prepare_context(
         "component_gate": component_gate,
         "reflection_memory_usage": "training_only",
         "risk_threshold_overrides": risk_threshold_overrides or {},
+        "prior_monitoring_count": int(prior_monitoring_count or 0),
     }
     if llm_policy:
         context["llm_policy"] = llm_policy
@@ -93,6 +101,9 @@ def prepare_no_kg_context(
     case: dict[str, Any],
     risk_threshold_overrides: dict[str, Any] | None = None,
     llm_policy: dict[str, Any] | None = None,
+    mixed_fleet: bool = False,
+    component_consensus: dict[str, Any] | None = None,
+    prior_monitoring_count: int = 0,
 ) -> dict[str, Any]:
     case = normalize_case(case)
     risk_gate = build_risk_gate(case, reflection_rules=[], threshold_overrides=risk_threshold_overrides)
@@ -110,6 +121,7 @@ def prepare_no_kg_context(
                 "schedule_fan_maintenance",
                 "schedule_HPC_maintenance",
             ],
+            "mixed_fleet": mixed_fleet,
         },
         "sensor_paths": [],
         "action_paths": [],
@@ -120,6 +132,7 @@ def prepare_no_kg_context(
         "component_gate": {},
         "reflection_memory_usage": "training_only_non_component",
         "risk_threshold_overrides": risk_threshold_overrides or {},
+        "prior_monitoring_count": int(prior_monitoring_count or 0),
     }
     if llm_policy:
         context["llm_policy"] = llm_policy
@@ -145,6 +158,9 @@ def run_agent(
     llm_policy_tool_path: str | None = None,
     llm_policy: dict[str, Any] | None = None,
     prompt_variant: str = "kg",
+    mixed_fleet: bool = False,
+    component_consensus: dict[str, Any] | None = None,
+    prior_monitoring_count: int = 0,
 ) -> dict[str, Any]:
     if prompt_variant not in {"kg", "no_kg_evidence"}:
         raise ValueError(f"Unknown prompt_variant: {prompt_variant}")
@@ -153,6 +169,9 @@ def run_agent(
             case,
             risk_threshold_overrides=risk_threshold_overrides,
             llm_policy=llm_policy,
+            mixed_fleet=mixed_fleet,
+            component_consensus=component_consensus,
+            prior_monitoring_count=prior_monitoring_count,
         )
     else:
         context = prepare_context(
@@ -161,6 +180,9 @@ def run_agent(
             kg_store,
             risk_threshold_overrides=risk_threshold_overrides,
             llm_policy=llm_policy,
+            mixed_fleet=mixed_fleet,
+            component_consensus=component_consensus,
+            prior_monitoring_count=prior_monitoring_count,
         )
     risk_policy_mode = str(risk_policy_mode or "hybrid")
     controller_raw_outputs = []
@@ -320,6 +342,9 @@ Mandatory output rules:
   {recommended_maintenance_time(context["case"], context.get("llm_policy"))} as action_time.
 - If choosing schedule_monitoring, set action_time to
   {recommended_monitoring_time(context["case"], context.get("llm_policy"))}.
+- Choose the maintenance component only from the supplied KG evidence paths.
+- Do not use a numeric component ranking, component gate, FD identity, or fallback
+  component rule. If the evidence is ambiguous, choose schedule_monitoring.
 Return only valid JSON.
 """
         try:
@@ -413,6 +438,7 @@ Return only valid JSON.
                 context["case"], context.get("llm_policy")
             ),
             "lightgbm_risk": context["lightgbm_risk"],
+            "prior_monitoring_count": context.get("prior_monitoring_count", 0),
         },
         "llm_calls": llm_calls,
         "raw_outputs": raw_outputs,
@@ -534,26 +560,6 @@ def _local_validation_repair(
         repaired["reason"] = "Filled missing monitoring time from KG rule fallback."
         return repaired
 
-    escalation_errors = [
-        item for item in violations
-        if item.startswith("adaptive escalation policy requires ")
-    ]
-    if escalation_errors:
-        suggested = str(context.get("component_gate", {}).get("suggested_component_action", ""))
-        if suggested in {"schedule_HPC_maintenance", "schedule_fan_maintenance"}:
-            repaired = dict(action)
-            repaired["action_type"] = suggested
-            repaired["action_time"] = _maintenance_action_time(context)
-            repaired["degradation_hypothesis"] = (
-                "HPC_related_degradation"
-                if suggested == "schedule_HPC_maintenance"
-                else "Fan_related_degradation"
-            )
-            repaired["reason"] = (
-                "Applied validated adaptive escalation policy to strong component evidence."
-            )
-            return repaired
-
     return None
 
 
@@ -623,7 +629,6 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     path_hypotheses = {p["hypothesis"] for p in sensor_paths}
     disallowed = set(dataset_rules.get("disallowed_actions", []))
     risk_gate = context.get("risk_gate", {})
-    component_gate = context.get("component_gate", {})
     learned_risk = context.get("lightgbm_risk", {})
 
     if summary.get("first_critical_crossing_cycle"):
@@ -635,25 +640,14 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
 
     action_type = "continue_normal_operation"
     degradation = "low_risk_hypothesis"
-    strong_hpc = _has_strong_evidence(sensor_paths, "HPC_related_degradation", STRONG_HPC_SENSORS)
-    strong_fan = _has_strong_evidence(sensor_paths, "Fan_related_degradation", STRONG_FAN_SENSORS)
-
     learned_support = _learned_risk_supports_maintenance(learned_risk) and _risk_evidence_allows_learned_support(risk_gate)
-    if not learned_support and not risk_gate.get("maintenance_candidate", False):
+    if not (learned_support or risk_gate.get("maintenance_candidate", False)):
         action_type = "schedule_monitoring"
         degradation = "uncertain_component_degradation"
-    elif component_gate.get("component_supported", False):
-        suggested = component_gate.get("suggested_component_action")
-        if suggested == "schedule_HPC_maintenance" and strong_hpc and suggested not in disallowed:
-            action_type = "schedule_HPC_maintenance"
-            degradation = "HPC_related_degradation"
-        elif suggested == "schedule_fan_maintenance" and strong_fan and suggested not in disallowed:
-            action_type = "schedule_fan_maintenance"
-            degradation = "Fan_related_degradation"
-        else:
-            action_type = "schedule_monitoring"
-            degradation = "uncertain_component_degradation"
-    elif risk != "low_risk_hypothesis" or "uncertain_component_degradation" in path_hypotheses:
+    else:
+        # This is only a safe fallback when Ollama is unavailable. It must not
+        # invent a component decision from path metadata; the normal path is
+        # the LLM choosing from the evidence shown in the prompt.
         action_type = "schedule_monitoring"
         degradation = "uncertain_component_degradation"
 
@@ -719,10 +713,10 @@ def low_risk_action(context: dict[str, Any], prompt_variant: str = "kg") -> dict
 
 
 def _confidence(sensor_paths: list[dict[str, Any]], hypothesis: str) -> float:
-    scores = [float(p.get("score", 0.0)) for p in sensor_paths if p.get("hypothesis") == hypothesis]
-    if not scores:
+    evidence_count = sum(1 for p in sensor_paths if p.get("hypothesis") == hypothesis)
+    if not evidence_count:
         return 0.5
-    return round(min(max(sum(scores[:3]) / min(len(scores), 3), 0.0), 1.0), 3)
+    return round(min(0.5 + 0.1 * min(evidence_count, 5), 1.0), 3)
 
 
 def _maintenance_action_time(context: dict[str, Any]) -> str:

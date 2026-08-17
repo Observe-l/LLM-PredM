@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 from typing import Any
 
 from .kg_store import KGStore
@@ -9,7 +8,12 @@ from .kg_store import KGStore
 COMPONENT_HYPOTHESES = {"HPC_related_degradation", "Fan_related_degradation"}
 
 
-def get_dataset_rules(kg: KGStore, dataset_subset: str) -> dict[str, Any]:
+def get_dataset_rules(
+    kg: KGStore,
+    dataset_subset: str,
+    *,
+    mixed_fleet: bool = False,
+) -> dict[str, Any]:
     allowed_hypotheses = [e["tail"] for e in kg.outgoing(dataset_subset, "allows_hypothesis")]
     threshold_hypotheses = [e["tail"] for e in kg.outgoing(dataset_subset, "has_threshold_hypothesis")]
     policies = [e["tail"] for e in kg.outgoing(dataset_subset, "has_action_policy")]
@@ -20,7 +24,7 @@ def get_dataset_rules(kg: KGStore, dataset_subset: str) -> dict[str, Any]:
         allowed_actions.extend(e["tail"] for e in kg.outgoing(policy, "allows_action_type"))
         disallowed_actions.extend(e["tail"] for e in kg.outgoing(policy, "disallows_action_type"))
 
-    return {
+    rules = {
         "dataset_subset": dataset_subset,
         "allowed_hypotheses": sorted(set(allowed_hypotheses)),
         "threshold_hypotheses": sorted(set(threshold_hypotheses)),
@@ -28,6 +32,32 @@ def get_dataset_rules(kg: KGStore, dataset_subset: str) -> dict[str, Any]:
         "disallowed_actions": sorted(set(disallowed_actions)),
         "policies": sorted(set(policies)),
     }
+    if mixed_fleet:
+        # In a mixed fleet, FD-level action policies must not suppress a
+        # component before the per-engine evidence paths are inspected.  The
+        # known FD component composition remains an evaluation constraint
+        # (see joint_simulation.py), not an action-selection shortcut.
+        rules.update(
+            {
+                "mixed_fleet": True,
+                "action_constraint_scope": "per_engine_component_evidence",
+                "allowed_hypotheses": sorted(
+                    {
+                        "HPC_related_degradation",
+                        "Fan_related_degradation",
+                        "uncertain_component_degradation",
+                    }
+                ),
+                "allowed_actions": [
+                    "continue_normal_operation",
+                    "schedule_monitoring",
+                    "schedule_HPC_maintenance",
+                    "schedule_fan_maintenance",
+                ],
+                "disallowed_actions": [],
+            }
+        )
+    return rules
 
 
 def retrieve_sensor_paths(
@@ -38,8 +68,6 @@ def retrieve_sensor_paths(
     max_paths: int = 24,
 ) -> list[dict[str, Any]]:
     paths: list[dict[str, Any]] = []
-    contribution = _sensor_contribution_scores(sensor_ids)
-    persistence_score = _persistence_score(forecast_summary or {})
     allowed_hypotheses = set((dataset_rules or {}).get("allowed_hypotheses", []))
 
     for sensor in sensor_ids:
@@ -57,8 +85,6 @@ def retrieve_sensor_paths(
                             component=component,
                             edges=[e1, e2, e3],
                             path=base_path + ["associated_with", component, "supports_hypothesis", e3["tail"]],
-                            contribution_score=contribution.get(sensor, 0.5),
-                            persistence_score=persistence_score,
                             allowed_hypotheses=allowed_hypotheses,
                         )
                     )
@@ -86,8 +112,6 @@ def retrieve_sensor_paths(
                                         "supports_hypothesis",
                                         e5["tail"],
                                     ],
-                                    contribution_score=contribution.get(sensor, 0.5),
-                                    persistence_score=persistence_score,
                                     allowed_hypotheses=allowed_hypotheses,
                                 )
                             )
@@ -100,8 +124,6 @@ def retrieve_sensor_paths(
                         component=None,
                         edges=[e2],
                         path=[sensor, "supports_hypothesis", e2["tail"]],
-                        contribution_score=contribution.get(sensor, 0.5),
-                        persistence_score=persistence_score,
                         allowed_hypotheses=allowed_hypotheses,
                     )
                 )
@@ -109,9 +131,12 @@ def retrieve_sensor_paths(
     unique: dict[str, dict[str, Any]] = {}
     for path in paths:
         key = path["path_text"]
-        if key not in unique or path["score"] > unique[key]["score"]:
+        if key not in unique:
             unique[key] = path
-    return sorted(unique.values(), key=lambda x: x["score"], reverse=True)[:max_paths]
+    # Preserve the forecast sensor order and KG traversal order.  Evidence is
+    # presented to the LLM as paths; no numeric component ranking is used to
+    # select a component.
+    return list(unique.values())[:max_paths]
 
 
 def retrieve_action_paths(kg: KGStore, hypotheses: list[str]) -> list[dict[str, Any]]:
@@ -145,60 +170,24 @@ def build_component_evidence_statistics(
             "uncertain_component_degradation",
         }:
             continue
-        item = grouped.setdefault(hypothesis, {"scores": [], "sensors": set(), "presence": []})
-        item["scores"].append(float(path.get("score", 0.0)))
+        item = grouped.setdefault(hypothesis, {"paths": [], "sensors": set()})
+        item["paths"].append(str(path.get("path_text", "")))
         sensor = str(path.get("sensor", ""))
         if sensor:
             item["sensors"].add(sensor)
-            item["presence"].append(float(sensor_presence.get(sensor, 0.0)))
 
     result: dict[str, Any] = {}
     for hypothesis, item in grouped.items():
-        scores = item["scores"]
-        presence = item["presence"]
         result[hypothesis] = {
-            "path_score": round(max(scores) if scores else 0.0, 4),
-            "mean_path_score": round(sum(scores) / len(scores), 4) if scores else 0.0,
+            "evidence_count": len(item["paths"]),
             "supporting_sensors": sorted(item["sensors"]),
-            "presence_ratio": round(max(presence) if presence else 0.0, 4),
-            "evidence_strength": _component_strength(hypothesis, max(scores) if scores else 0.0, max(presence) if presence else 0.0),
+            "evidence_paths": item["paths"][:12],
         }
-
-    hpc = result.get("HPC_related_degradation", {}).get("path_score", 0.0)
-    fan = result.get("Fan_related_degradation", {}).get("path_score", 0.0)
-    uncertain = result.get("uncertain_component_degradation", {}).get("path_score", 0.0)
-    scores = {
-        "HPC_related_degradation": hpc,
-        "Fan_related_degradation": fan,
-        "uncertain_component_degradation": uncertain,
-    }
-    dominant, dominant_score = max(scores.items(), key=lambda item: item[1])
-    second_score = sorted(scores.values(), reverse=True)[1]
-    result.update(
-        {
-            "hpc_path_score": hpc,
-            "fan_path_score": fan,
-            "uncertain_path_score": uncertain,
-            "component_conflict_score": round(min(hpc, fan) + 0.5 * uncertain, 4),
-            "dominant_component": dominant if dominant_score > 0 else None,
-            "dominance_margin": round(dominant_score - second_score, 4),
-        }
+    result["evidence_only"] = True
+    result["component_hypotheses_present"] = sorted(
+        hypothesis for hypothesis in result if hypothesis.endswith("_degradation")
     )
     return result
-
-
-def _component_strength(hypothesis: str, path_score: float, presence_ratio: float) -> str:
-    if path_score >= 0.75 and presence_ratio >= 0.5:
-        prefix = "strong"
-    elif path_score >= 0.6 or presence_ratio >= 0.3:
-        prefix = "moderate"
-    else:
-        prefix = "weak"
-    if hypothesis == "HPC_related_degradation":
-        return f"{prefix}_HPC"
-    if hypothesis == "Fan_related_degradation":
-        return f"{prefix}_FAN"
-    return f"{prefix}_uncertain"
 
 
 def infer_candidate_action(
@@ -206,18 +195,9 @@ def infer_candidate_action(
     sensor_paths: list[dict[str, Any]],
     forecast_summary: dict[str, Any],
 ) -> str:
-    disallowed = set(dataset_rules.get("disallowed_actions", []))
-    dominant = forecast_summary.get("dominant_component_hypothesis")
-    hypotheses = [p["hypothesis"] for p in sensor_paths]
-    counts = Counter(h for h in hypotheses if h in COMPONENT_HYPOTHESES)
-
-    if dominant == "HPC_related_degradation" or counts.get("HPC_related_degradation", 0) > 0:
-        action = "schedule_HPC_maintenance"
-    elif dominant == "Fan_related_degradation" or counts.get("Fan_related_degradation", 0) > 0:
-        action = "schedule_fan_maintenance"
-    else:
-        action = "schedule_monitoring"
-    return "schedule_monitoring" if action in disallowed else action
+    # Candidate actions are deliberately not inferred from path presence.
+    # The LLM must compare the supplied evidence paths and choose the action.
+    return "llm_evidence_decision"
 
 
 def _make_sensor_path(
@@ -226,37 +206,12 @@ def _make_sensor_path(
     component: str | None,
     edges: list[dict[str, Any]],
     path: list[str],
-    contribution_score: float,
-    persistence_score: float,
     allowed_hypotheses: set[str],
 ) -> dict[str, Any]:
-    edge_weight_mean = sum(float(e["weight"]) for e in edges) / max(len(edges), 1)
-    dataset_policy_score = 1.0 if not allowed_hypotheses or hypothesis in allowed_hypotheses else -1.0
-    score = (
-        0.35 * contribution_score
-        + 0.25 * edge_weight_mean
-        + 0.20 * persistence_score
-        + 0.20 * dataset_policy_score
-    )
     return {
         "sensor": sensor,
         "hypothesis": hypothesis,
         "component": component,
         "path": path,
         "path_text": " -> ".join(path),
-        "edge_weight_mean": round(edge_weight_mean, 4),
-        "score": round(score, 4),
     }
-
-
-def _sensor_contribution_scores(sensor_ids: list[str]) -> dict[str, float]:
-    n = max(len(sensor_ids), 1)
-    return {sensor: 1.0 - (rank / max(n, 1)) * 0.35 for rank, sensor in enumerate(sensor_ids)}
-
-
-def _persistence_score(forecast_summary: dict[str, Any]) -> float:
-    if forecast_summary.get("first_persistent_pattern_cycle") is not None:
-        return 1.0
-    if forecast_summary.get("score_trend") == "increasing":
-        return 0.5
-    return 0.2

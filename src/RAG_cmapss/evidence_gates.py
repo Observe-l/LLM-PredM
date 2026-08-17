@@ -92,7 +92,10 @@ def build_risk_gate(
         "high_persistent_uncalibrated",
     }
     reflection_allows = calibration["decision"] == "supports_maintenance"
-    maintenance_candidate = bool(statistical_candidate and reflection_allows)
+    # Reflection memory is an auxiliary calibration signal. It must not
+    # suppress a statistically persistent risk during cold start; otherwise
+    # high-persistent cases are forced into monitoring until failure.
+    maintenance_candidate = bool(statistical_candidate)
 
     return {
         "risk_level": level,
@@ -106,6 +109,7 @@ def build_risk_gate(
         "slope": slope,
         "d_rmse_lhi_consistency": consistency,
         "statistical_candidate": statistical_candidate,
+        "reflection_allows": reflection_allows,
         "reflection_peak_calibration": calibration,
         "reflection_q95_gap_calibration": q95_gap_calibration,
         "reflection_q99_gap_calibration": q99_gap_calibration,
@@ -347,42 +351,46 @@ def _quantile(values: list[float], q: float) -> float:
 
 
 def build_component_gate(component_stats: dict[str, Any], dataset_rules: dict[str, Any]) -> dict[str, Any]:
-    dominant = component_stats.get("dominant_component")
-    margin = _to_float(component_stats.get("dominance_margin")) or 0.0
-    conflict = _to_float(component_stats.get("component_conflict_score")) or 0.0
-    allowed_hypotheses = set(dataset_rules.get("allowed_hypotheses", []))
-    hpc_score = _to_float(component_stats.get("hpc_path_score")) or 0.0
-    fan_score = _to_float(component_stats.get("fan_path_score")) or 0.0
-    explicit_components = {"HPC_related_degradation", "Fan_related_degradation"}
-    dominant_score = hpc_score if dominant == "HPC_related_degradation" else fan_score
-    competing_score = fan_score if dominant == "HPC_related_degradation" else hpc_score
-    component_supported = bool(
-        dominant in explicit_components
-        and dominant in allowed_hypotheses
-        and dominant_score >= 0.9
-        and competing_score <= 0.65
-        and (margin >= 0.02 or conflict < 0.75)
-    )
-    if dominant == "HPC_related_degradation":
-        action = "schedule_HPC_maintenance"
-    elif dominant == "Fan_related_degradation":
-        action = "schedule_fan_maintenance"
-    else:
-        action = "schedule_monitoring"
-    if action in set(dataset_rules.get("disallowed_actions", [])):
-        action = "schedule_monitoring"
-        component_supported = False
+    # Component selection belongs to the LLM.  This compatibility object is
+    # intentionally metadata only; it contains no score, recommendation, or
+    # veto that could replace the evidence-based model decision.
     return {
-        "dominant_component": dominant,
-        "component_supported": component_supported,
-        "component_conflict_score": conflict,
-        "dominance_margin": margin,
-        "suggested_component_action": action,
-        "hpc_path_score": hpc_score,
-        "fan_path_score": fan_score,
-        "uncertain_path_score": component_stats.get("uncertain_path_score"),
-        "recommendation": "component_supported" if component_supported else "monitor_due_to_component_uncertainty",
+        "decision_authority": "llm_evidence_only",
+        "component_gate_applied": False,
+        "evidence_hypotheses": list((component_stats or {}).get("component_hypotheses_present", [])),
     }
+
+
+def apply_engine_escalation(
+    component_gate: dict[str, Any],
+    component_stats: dict[str, Any],
+    risk_gate: dict[str, Any],
+    dataset_rules: dict[str, Any],
+    prior_monitoring_count: int = 0,
+) -> dict[str, Any]:
+    """Compatibility no-op: escalation must not select a component."""
+    return dict(component_gate or {})
+
+
+def update_component_consensus(
+    consensus_state: dict[str, Any] | None,
+    component_stats: dict[str, Any] | None,
+    component_gate: dict[str, Any] | None = None,
+    *,
+    max_history: int = 20,
+) -> dict[str, Any]:
+    # Consensus can remain in the engine state for API compatibility, but it
+    # must not synthesize a component or override the next LLM decision.
+    return dict(consensus_state or {})
+
+
+def apply_component_consensus(
+    component_gate: dict[str, Any],
+    component_stats: dict[str, Any],
+    dataset_rules: dict[str, Any],
+    consensus_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return dict(component_gate or {})
 
 
 def build_reflection_gate(reflection_rules: list[dict[str, Any]]) -> dict[str, Any]:

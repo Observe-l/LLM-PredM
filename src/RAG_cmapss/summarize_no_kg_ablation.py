@@ -149,12 +149,6 @@ def _reflection_is_clean(fd_dir: Path) -> bool:
         "hpc_sensor_presence_ratio",
         "fan_sensor_presence_ratio",
         "conflict_sensor_presence_ratio",
-        "hpc_path_score",
-        "fan_path_score",
-        "uncertain_path_score",
-        "component_conflict_score",
-        "dominant_component",
-        "dominance_margin",
     ]
     return all(
         row.get("component_evidence_strength") == "not_available"
