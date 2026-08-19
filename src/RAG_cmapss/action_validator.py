@@ -38,6 +38,7 @@ def validate_action(
     lightgbm_risk: dict[str, Any] | None = None,
     component_gate: dict[str, Any] | None = None,
     llm_policy: dict[str, Any] | None = None,
+    current_lhi_only: bool = False,
 ) -> dict[str, Any]:
     action_type = action.get("action_type")
     action_time = action.get("action_time")
@@ -67,7 +68,14 @@ def validate_action(
             except ValueError as exc:
                 violations.append(str(exc))
 
-    if action_type == "schedule_monitoring" and action_time is not None:
+    if current_lhi_only and action_type == "schedule_monitoring" and action_time is not None:
+        try:
+            t = parse_t_plus(action_time)
+            if t is None or not (1 <= t <= 20):
+                violations.append("current-only schedule_monitoring action_time must be in t+1..t+20")
+        except ValueError as exc:
+            violations.append(str(exc))
+    elif action_type == "schedule_monitoring" and action_time is not None:
         recommended_monitoring = recommended_monitoring_time(case, llm_policy)
         if action_time != recommended_monitoring:
             violations.append(
@@ -75,7 +83,14 @@ def validate_action(
                 f"recommended_monitoring_time={recommended_monitoring}"
             )
 
-    if action_type in {
+    if current_lhi_only and action_type in {
+        "schedule_maintenance",
+        "schedule_HPC_maintenance",
+        "schedule_fan_maintenance",
+    } and action_time is not None:
+        if action_time != "t+1":
+            violations.append("current-only maintenance action_time must equal t+1")
+    elif action_type in {
         "schedule_maintenance",
         "schedule_HPC_maintenance",
         "schedule_fan_maintenance",

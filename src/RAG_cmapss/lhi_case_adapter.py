@@ -231,6 +231,161 @@ def build_forecast_case(
     }
 
 
+def build_current_lhi_case(
+    *,
+    window: pd.DataFrame,
+    top_drift: pd.DataFrame,
+    score_col: str,
+    raw_score_col: str,
+    lhi_col: str,
+    threshold_config: dict[str, dict[str, float | None]],
+    current_cycle: int,
+    engine_history: pd.DataFrame | None = None,
+    window_detail_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Build a case containing only the current LHI observation.
+
+    This is deliberately separate from ``build_forecast_case`` so the normal
+    forecast experiment remains unchanged.  The caller supplies the current
+    cutoff cycle; the row is recovered from previously observed LHI windows,
+    not from the future rows in the current forecast window.
+    """
+    if window.empty:
+        raise ValueError("Cannot build a current-LHI case from an empty window.")
+    source = engine_history if engine_history is not None else pd.DataFrame()
+    candidates = source[source["cycle"].astype(int) == int(current_cycle)].copy() if not source.empty and "cycle" in source else pd.DataFrame()
+    if candidates.empty:
+        candidates = window[window["cycle"].astype(int) == int(current_cycle)].copy()
+    if candidates.empty:
+        raise ValueError(
+            f"No observed LHI row found for current_cycle={current_cycle}; "
+            "current-only decisions cannot use a future forecast row."
+        )
+    current = candidates.sort_values(["cutoff_cycle", "forecast_start_cycle"]).iloc[-1]
+    fd_name = str(current["fd"])
+    unit_id = int(current["unit_id"])
+    # The source row normally belongs to the preceding forecast window
+    # (e.g. observed cycle 121 is stored in the cutoff-120 window).  For a
+    # current-only decision, the decision clock is the observed cycle itself.
+    cutoff_cycle = int(current_cycle)
+    current_lhi = _finite_float(current.get(lhi_col))
+    current_raw = _finite_float(current.get(raw_score_col))
+    current_mae = _finite_float(current.get("d_mae"))
+    top_rows = _window_top_rows(top_drift, current)
+    top_sensor_rows = _top_rows_for_cycle(top_rows, int(current_cycle))
+    if not top_sensor_rows:
+        rmse_values = _parse_sensor_value_map(str(current.get("top_drift_sensor_rmse_values", "")))
+        mae_values = _parse_sensor_value_map(str(current.get("top_drift_sensor_mae_values", "")))
+        top_sensor_rows = [
+            {
+                "sensor": sensor,
+                "sensor_d_rmse": rmse_values.get(sensor),
+                "sensor_d_mae": mae_values.get(sensor, rmse_values.get(sensor)),
+            }
+            for sensor in rmse_values
+        ]
+    top_sensor_rows = top_sensor_rows[:8]
+    dominant_sensors = [str(item.get("sensor")) for item in top_sensor_rows if item.get("sensor")]
+    sensor_presence = {sensor: 1.0 for sensor in dominant_sensors}
+    detail = {
+        "case_id": f"CurrentLHICase_{fd_name}_Engine{unit_id}_Cycle{current_cycle}",
+        "current_observation": {
+            "cycle": int(current_cycle),
+            "lhi": current_lhi,
+            "d_rmse": current_raw,
+            "d_mae": current_mae,
+            "sensor_contribution_ranking": top_sensor_rows,
+        },
+    }
+    detail_path = None
+    if window_detail_dir is not None:
+        detail_path = Path(window_detail_dir) / f"{detail['case_id']}_current.json"
+        detail_path.parent.mkdir(parents=True, exist_ok=True)
+        detail_path.write_text(json.dumps(detail, indent=2))
+
+    thresholds = threshold_config.get(fd_name, {})
+    return {
+        "case_id": detail["case_id"],
+        "dataset_subset": fd_name,
+        "unit_id": unit_id,
+        "cutoff_cycle": cutoff_cycle,
+        "covariate_mode": str(current.get("covariate_mode", "unknown")),
+        "forecast_start_cycle": None,
+        "forecast_horizon": {
+            "start": 1,
+            "end": 20,
+            "text": "t+1 to t+20 action-time range only; no future sensor or LHI values are provided",
+        },
+        "information_mode": "current_lhi_only",
+        "score_source": {
+            "score_name": score_col,
+            "raw_score_name": raw_score_col,
+            "lhi_name": lhi_col,
+            "warning_score": thresholds.get("warning_score"),
+            "critical_score": thresholds.get("critical_score"),
+        },
+        "current_observation": detail["current_observation"],
+        "forecast_summary": {
+            "summary_id": f"CurrentLHISummary_{fd_name}_Engine{unit_id}_Cycle{current_cycle}",
+            "current_score": current_lhi,
+            "peak_score": current_lhi,
+            "peak_score_cycle": None,
+            "peak_score_abs_cycle": int(current_cycle),
+            "score_trend": "current_only",
+            "first_warning_crossing_cycle": None,
+            "first_critical_crossing_cycle": None,
+            "persistent_high_risk_duration": None,
+            "dominant_top_sensors": dominant_sensors,
+            "top_sensor_at_peak_cycle": dominant_sensors,
+            "final_cycle_score": current_lhi,
+        },
+        "risk_statistics": {
+            "score_col": score_col,
+            "current_score": current_lhi,
+            "peak_score": current_lhi,
+            "peak_score_cycle": None,
+            "final_score": current_lhi,
+            "current_d_rmse": current_raw,
+            "peak_d_rmse": current_raw,
+            "final_d_rmse": current_raw,
+            "unit_past_count": 0,
+            "unit_past_context_reliable": False,
+            "unit_past_q95": None,
+            "unit_past_q99": None,
+            "peak_minus_unit_q95": None,
+            "peak_minus_unit_q99": None,
+        },
+        "trend_statistics": {"mode": "current_only"},
+        "multi_score_statistics": {
+            "d_rmse_lhi_consistency": "not_computed_current_only",
+        },
+        "sensor_evidence_statistics": {
+            "mode": "current_cycle_only",
+            "dominant_top_sensors": dominant_sensors,
+            "top_sensor_at_peak_cycle": dominant_sensors,
+            "sensor_presence_ratio": sensor_presence,
+            "sensor_mean_rank": {sensor: idx + 1 for idx, sensor in enumerate(dominant_sensors)},
+            "sensor_pattern_stability": None,
+            "current_sensor_contribution_ranking": top_sensor_rows,
+        },
+        "key_cycles": [{
+            "cycle": int(current_cycle),
+            "relative_cycle": "current",
+            "score": current_lhi,
+            "raw_score": current_raw,
+            "lhi_score": current_lhi,
+            "d_rmse": current_raw,
+            "d_mae": current_mae,
+            "top_drift_sensors": dominant_sensors,
+            "top_drift_sensor_rmse_values": {
+                str(item.get("sensor")): item.get("sensor_d_rmse") for item in top_sensor_rows
+            },
+        }],
+        "forecast_window_detail_path": str(detail_path) if detail_path else None,
+        "prediction_length": 0,
+    }
+
+
 def _unit_past_statistics(engine_history: pd.DataFrame | None, score_col: str, cutoff_cycle: int) -> dict[str, Any]:
     base = {
         "unit_past_count": 0,

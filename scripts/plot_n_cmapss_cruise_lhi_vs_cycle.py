@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Plot mean cruise-stage LHI versus cycle for one N-CMAPSS unit.
+"""Plot cruise-stage LHI summaries versus cycle for one N-CMAPSS unit.
 
 The reference is pooled across operating conditions: all accepted cruise rows
 from cycles 1..N are used together to build one sensor mean, one sensor range,
-and one drift baseline.  Each accepted cruise cycle is then summarized by the
-mean of its sample-level LHI_RMSE values.
+and one drift baseline.  Each accepted cruise cycle is summarized by its
+sample-level LHI_RMSE mean and maximum.
 """
 
 from __future__ import annotations
@@ -92,6 +92,7 @@ def main() -> None:
         cruise_samples=("row_index", "size"),
         valid_samples=("valid_lhi", "sum"),
         mean_lhi_rmse=("lhi_rmse", "mean"),
+        max_lhi_rmse=("lhi_rmse", "max"),
         median_lhi_rmse=("lhi_rmse", "median"),
         std_lhi_rmse=("lhi_rmse", lambda x: x.std(ddof=0)),
         mean_d_rmse=("d_rmse", "mean"),
@@ -101,6 +102,41 @@ def main() -> None:
     if summary.empty:
         raise ValueError(f"No cycles found at or after --report-start-cycle={args.report_start_cycle}")
     summary.to_csv(args.output_dir / "cruise_cycle_mean_lhi.csv", index=False)
+    summary.to_csv(args.output_dir / "cruise_cycle_lhi_summary.csv", index=False)
+
+    # Save the operating-condition composition used by the LHI calculation.
+    # Include zero-count clusters so every cycle has the same columns.
+    cluster_long = scores.groupby(["cycle", "operating_condition_cluster"], sort=True).agg(
+        cruise_samples=("row_index", "size"),
+        valid_lhi_samples=("valid_lhi", "sum"),
+    )
+    all_pairs = pd.MultiIndex.from_product(
+        [sorted(scores["cycle"].unique()), range(n_clusters)],
+        names=["cycle", "operating_condition_cluster"],
+    )
+    cluster_long = cluster_long.reindex(all_pairs, fill_value=0).reset_index()
+    cycle_totals = cluster_long.groupby("cycle", as_index=False)["cruise_samples"].sum().rename(
+        columns={"cruise_samples": "cycle_cruise_samples"}
+    )
+    cluster_long = cluster_long.merge(cycle_totals, on="cycle", how="left")
+    cluster_long["fraction"] = cluster_long["cruise_samples"] / cluster_long["cycle_cruise_samples"]
+    cluster_long.to_csv(args.output_dir / "cruise_cluster_counts_long.csv", index=False)
+
+    count_wide = cluster_long.pivot(index="cycle", columns="operating_condition_cluster", values="cruise_samples").fillna(0).astype(int)
+    count_wide.columns = [f"cluster_{int(value)}_samples" for value in count_wide.columns]
+    fraction_wide = cluster_long.pivot(index="cycle", columns="operating_condition_cluster", values="fraction").fillna(0.0)
+    fraction_wide.columns = [f"cluster_{int(value)}_fraction" for value in fraction_wide.columns]
+    cycle_cluster_summary = pd.concat([count_wide, fraction_wide], axis=1).reset_index()
+    cycle_cluster_summary.insert(1, "cruise_samples", cycle_cluster_summary.filter(like="_samples").sum(axis=1))
+    cycle_cluster_summary.to_csv(args.output_dir / "cruise_cluster_counts_by_cycle.csv", index=False)
+
+    overall_cluster = scores.groupby("operating_condition_cluster", sort=True).agg(
+        cruise_samples=("row_index", "size"),
+        valid_lhi_samples=("valid_lhi", "sum"),
+    ).reindex(range(n_clusters), fill_value=0).reset_index()
+    overall_cluster["fraction"] = overall_cluster["cruise_samples"] / len(scores)
+    overall_cluster["valid_lhi_fraction"] = overall_cluster["valid_lhi_samples"] / overall_cluster["cruise_samples"].replace(0, np.nan)
+    overall_cluster.to_csv(args.output_dir / "cruise_cluster_overall_summary.csv", index=False)
 
     plt.style.use("seaborn-v0_8-whitegrid")
     fig, ax = plt.subplots(figsize=(13, 5.8), dpi=180)
@@ -127,6 +163,29 @@ def main() -> None:
     fig.savefig(args.output_dir / "cruise_mean_lhi_vs_cycle.png", bbox_inches="tight")
     plt.close(fig)
 
+    fig, ax = plt.subplots(figsize=(13, 5.8), dpi=180)
+    if summary["cycle"].min() <= args.reference_end_cycle:
+        ax.axvspan(summary["cycle"].min() - 0.5, args.reference_end_cycle + 0.5, color="#dbeafe", alpha=0.8, label=f"health reference: cycles 1–{args.reference_end_cycle}")
+    else:
+        ax.axvline(args.report_start_cycle - 0.5, color="#6b7280", linestyle="--", linewidth=1.0, label=f"test start: cycle {args.report_start_cycle}")
+    ax.axhline(0.0, color="#4b5563", linewidth=1.0)
+    ax.plot(summary["cycle"], summary["max_lhi_rmse"], color="#7a3e9d", marker="o", markersize=3.5, linewidth=1.4, label="maximum LHI_RMSE per cycle")
+    if args.ignore_operating_condition:
+        title = "N-CMAPSS unit 5: cruise-only pooled maximum LHI versus cycle"
+        footer = "Maximum is taken over valid cruise time samples; reference pools all operating conditions."
+    else:
+        title = f"N-CMAPSS unit 5: cruise-only K={n_clusters} condition-matched maximum LHI versus cycle"
+        footer = "Maximum is taken over valid cruise time samples and the K-means condition-specific reference."
+    ax.set_title(title)
+    ax.set_xlabel("cycle")
+    ax.set_ylabel("maximum LHI_RMSE within cruise cycle")
+    ax.legend(loc="best")
+    ax.grid(alpha=0.3)
+    fig.text(0.01, 0.01, footer, fontsize=8.5)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    fig.savefig(args.output_dir / "cruise_max_lhi_vs_cycle.png", bbox_inches="tight")
+    plt.close(fig)
+
     metadata.update({
         "data_file": str(args.data_file),
         "split": args.split,
@@ -141,6 +200,7 @@ def main() -> None:
         "reported_cycles": [int(v) for v in summary["cycle"]],
         "n_cruise_rows": int(len(scores)),
         "summary_definition": "mean sample-level LHI_RMSE within each accepted cruise cycle",
+        "maximum_summary_definition": "maximum valid sample-level LHI_RMSE within each accepted cruise cycle",
     })
     (args.output_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
     print(summary.to_string(index=False))

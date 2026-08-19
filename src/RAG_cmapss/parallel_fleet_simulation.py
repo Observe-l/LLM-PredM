@@ -38,6 +38,7 @@ from .joint_simulation import (
 from .kg_store import KGStore
 from .lhi_case_adapter import (
     build_forecast_case,
+    build_current_lhi_case,
     case_peak_lhi,
     load_lhi_frames,
     load_threshold_config,
@@ -118,6 +119,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--ollama_num_predict", type=int, default=512)
     parser.add_argument("--prompt_variant", choices=["kg", "no_kg_evidence"], default="kg")
+    parser.add_argument(
+        "--decision_mode",
+        choices=["forecast_window", "current_lhi_only"],
+        default="forecast_window",
+        help="Use the existing forecast-window prompt or a current-LHI-only prompt with no future values.",
+    )
     parser.add_argument("--disable_ollama_json_format", action="store_true")
     parser.add_argument("--disable_update_review_llm", action="store_true")
     parser.add_argument("--disable_periodic_evaluation", action="store_true")
@@ -368,23 +375,55 @@ def main() -> None:
             if cutoff is None:
                 continue
             window = engine.windows[cutoff]
-            case = build_forecast_case(
-                window=window,
-                top_drift=top_drift,
-                score_col=args.score_col,
-                raw_score_col=args.raw_score_col,
-                lhi_col=args.lhi_col,
-                threshold_config=threshold_config,
-                window_detail_dir=case_dir,
-                engine_history=engine_history_frame(list(engine.windows.values()), cutoff),
-            )
             engine.next_observation_cutoff = cutoff + 1
-            peak_lhi = case_peak_lhi(window, args.lhi_col)
             trigger = current_lhi_trigger(policy_path, args.lhi_trigger)
             engine.last_decision_threshold = float(trigger)
-            if not pd.notna(peak_lhi) or peak_lhi <= trigger:
-                engine.last_case = case
-                continue
+            if args.decision_mode == "current_lhi_only":
+                # The current observed cycle is normally stored in the
+                # immediately preceding forecast window. Read only that one
+                # small frame for the gate; build a full case only after the
+                # current LHI crosses the gate.
+                previous_cutoffs = [value for value in engine.ordered_cutoffs if value < cutoff]
+                observed_window = engine.windows.get(cutoff - 1)
+                if observed_window is None and previous_cutoffs:
+                    observed_window = engine.windows[max(previous_cutoffs)]
+                current_rows = (
+                    observed_window[observed_window["cycle"].astype(int) == int(cutoff)]
+                    if observed_window is not None
+                    else pd.DataFrame()
+                )
+                if current_rows.empty or args.lhi_col not in current_rows:
+                    engine.last_case = None
+                    continue
+                current_lhi = pd.to_numeric(current_rows[args.lhi_col], errors="coerce").dropna()
+                peak_lhi = float(current_lhi.iloc[-1]) if not current_lhi.empty else float("nan")
+                if not pd.notna(peak_lhi) or peak_lhi <= trigger:
+                    engine.last_case = None
+                    continue
+                case = build_current_lhi_case(
+                    window=window,
+                    top_drift=top_drift,
+                    score_col=args.score_col,
+                    raw_score_col=args.raw_score_col,
+                    lhi_col=args.lhi_col,
+                    threshold_config=threshold_config,
+                    current_cycle=cutoff,
+                    window_detail_dir=case_dir,
+                    engine_history=observed_window,
+                )
+            else:
+                history = engine_history_frame(list(engine.windows.values()), cutoff)
+                case = build_forecast_case(
+                    window=window,
+                    top_drift=top_drift,
+                    score_col=args.score_col,
+                    raw_score_col=args.raw_score_col,
+                    lhi_col=args.lhi_col,
+                    threshold_config=threshold_config,
+                    window_detail_dir=case_dir,
+                    engine_history=history,
+                )
+                peak_lhi = case_peak_lhi(window, args.lhi_col)
             if args.max_llm_calls is not None and llm_calls >= args.max_llm_calls:
                 continue
             result = run_agent(
@@ -412,6 +451,7 @@ def main() -> None:
                     str(item.get("action_type")) == "schedule_monitoring"
                     for item in engine.action_history
                 ),
+                decision_mode=args.decision_mode,
             )
             llm_calls += int(result.get("llm_calls", 0)) if not args.dry_run else 1
             result["lhi_gate"] = {"column": args.lhi_col, "peak_lhi": peak_lhi, "trigger": trigger}
@@ -467,6 +507,7 @@ def main() -> None:
     pd.DataFrame(engine_summaries).to_csv(paths["summary_csv"], index=False)
     summary = {
         "simulation_mode": "parallel_fleet",
+        "decision_mode": args.decision_mode,
         "fds": args.fds,
         "global_cycle_start": global_start,
         "health_reference_cycles": args.health_reference_cycles,
@@ -585,6 +626,19 @@ def select_cutoff(engine: FleetEngine, global_cycle: int) -> int | None:
 
 def build_last_case(engine: FleetEngine, top_drift: pd.DataFrame, args: argparse.Namespace, case_dir: Path, threshold_config: dict[str, Any]) -> dict[str, Any]:
     cutoff = engine.ordered_cutoffs[-1]
+    history = engine_history_frame(list(engine.windows.values()), cutoff)
+    if args.decision_mode == "current_lhi_only":
+        return build_current_lhi_case(
+            window=engine.windows[cutoff],
+            top_drift=top_drift,
+            score_col=args.score_col,
+            raw_score_col=args.raw_score_col,
+            lhi_col=args.lhi_col,
+            threshold_config=threshold_config,
+            current_cycle=cutoff,
+            window_detail_dir=case_dir,
+            engine_history=history,
+        )
     return build_forecast_case(
         window=engine.windows[cutoff],
         top_drift=top_drift,
@@ -593,7 +647,7 @@ def build_last_case(engine: FleetEngine, top_drift: pd.DataFrame, args: argparse
         lhi_col=args.lhi_col,
         threshold_config=threshold_config,
         window_detail_dir=case_dir,
-        engine_history=engine_history_frame(list(engine.windows.values()), cutoff),
+        engine_history=history,
     )
 
 

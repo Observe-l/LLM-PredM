@@ -19,7 +19,12 @@ from .lightgbm_risk_tool import LightGBMRiskTool
 from .llm_policy_risk_tool import LLMPolicyRiskTool
 from .ollama_client import extract_json, ollama_chat
 from .kg_prompt_ablation import NO_KG_SYSTEM_PROMPT, build_no_kg_prompt
-from .prompt_builder import SYSTEM_PROMPT, build_prompt
+from .prompt_builder import (
+    CURRENT_LHI_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_current_lhi_prompt,
+    build_prompt,
+)
 from .timing_policy import (
     maintenance_timing_profile,
     recommended_maintenance_time,
@@ -161,9 +166,12 @@ def run_agent(
     mixed_fleet: bool = False,
     component_consensus: dict[str, Any] | None = None,
     prior_monitoring_count: int = 0,
+    decision_mode: str = "forecast_window",
 ) -> dict[str, Any]:
     if prompt_variant not in {"kg", "no_kg_evidence"}:
         raise ValueError(f"Unknown prompt_variant: {prompt_variant}")
+    if decision_mode not in {"forecast_window", "current_lhi_only"}:
+        raise ValueError(f"Unknown decision_mode: {decision_mode}")
     if prompt_variant == "no_kg_evidence":
         context = prepare_no_kg_context(
             case,
@@ -216,16 +224,28 @@ def run_agent(
     llm_fallback_used = False
     llm_errors: list[str] = []
     if dry_run:
-        action = _fallback_action(context, prompt_variant)
+        action = _fallback_action(context, prompt_variant, decision_mode)
         raw_outputs: list[dict[str, Any] | str] = [
             *controller_raw_outputs,
             f"<dry_run {prompt_variant} fallback_action>",
         ]
     elif not _should_activate_llm(context):
-        action = low_risk_action(context, prompt_variant=prompt_variant)
+        action = low_risk_action(context, prompt_variant=prompt_variant, decision_mode=decision_mode)
         raw_outputs = [*controller_raw_outputs, "<lightgbm_low_risk_monitoring>"]
     else:
-        if prompt_variant == "no_kg_evidence":
+        if decision_mode == "current_lhi_only" and prompt_variant == "kg":
+            prompt = build_current_lhi_prompt(
+                case=context["case"],
+                dataset_rules=context["dataset_rules"],
+                sensor_paths=context["sensor_paths"],
+                action_paths=context["action_paths"],
+                component_evidence_statistics=context["component_evidence_statistics"],
+                risk_gate=context["risk_gate"],
+                lightgbm_risk=context["lightgbm_risk"],
+                llm_policy=context.get("llm_policy"),
+            )
+            system_prompt = CURRENT_LHI_SYSTEM_PROMPT
+        elif prompt_variant == "no_kg_evidence":
             prompt = build_no_kg_prompt(
                 case=context["case"],
                 risk_gate=context["risk_gate"],
@@ -255,6 +275,7 @@ def run_agent(
             format_json=format_json,
             system_prompt=system_prompt,
             prompt_variant=prompt_variant,
+            decision_mode=decision_mode,
         ):
             try:
                 raw = ollama_chat(
@@ -304,26 +325,37 @@ def run_agent(
 
         if action is None:
             llm_fallback_used = True
-            action = _fallback_action(context, prompt_variant)
+            action = _fallback_action(context, prompt_variant, decision_mode)
             action["reason"] = (
                 f"LLM did not return parseable JSON after retry; used {prompt_variant} fallback. "
                 + action.get("reason", "")
             )
 
-    validation = _validate_action_for_variant(action, context, prompt_variant)
+    validation = _validate_action_for_variant(action, context, prompt_variant, decision_mode)
 
     if not validation["valid"] and not dry_run and not llm_fallback_used:
-        local_action = _local_validation_repair(action, validation, context)
+        local_action = _local_validation_repair(action, validation, context, decision_mode)
         if local_action is not None:
             action = local_action
             action["local_validation_repair_used"] = True
-            validation = _validate_action_for_variant(action, context, prompt_variant)
+            validation = _validate_action_for_variant(action, context, prompt_variant, decision_mode)
 
     if not validation["valid"] and not dry_run and not llm_fallback_used:
         evidence_instruction = (
             "Revise the action using only the same forecast, raw sensor-error, and risk-tool evidence."
             if prompt_variant == "no_kg_evidence"
             else "Revise the action using the same forecast case, dataset rules, and graph evidence."
+        )
+        if decision_mode == "current_lhi_only":
+            evidence_instruction = "Revise the action using only the current LHI, current sensor contribution ranking, and supplied KG evidence. Do not introduce future values."
+        timing_instruction = (
+            "- For schedule_monitoring, action_time may be any t+1 through t+20.\n"
+            "- For maintenance, action_time must be t+1."
+            if decision_mode == "current_lhi_only"
+            else (
+                "- schedule_monitoring must use the adaptive recommended_monitoring_time.\n"
+                f"- maintenance must use {recommended_maintenance_time(context['case'], context.get('llm_policy'))}."
+            )
         )
         repair_prompt = f"""The previous action is invalid.
 
@@ -337,11 +369,7 @@ Validation errors:
 Return exactly one JSON object.
 Mandatory output rules:
 - continue_normal_operation must use "action_time": null.
-- schedule_monitoring must use the adaptive recommended_monitoring_time.
-- schedule_maintenance, schedule_HPC_maintenance, and schedule_fan_maintenance must use
-  {recommended_maintenance_time(context["case"], context.get("llm_policy"))} as action_time.
-- If choosing schedule_monitoring, set action_time to
-  {recommended_monitoring_time(context["case"], context.get("llm_policy"))}.
+{timing_instruction}
 - Choose the maintenance component only from the supplied KG evidence paths.
 - Do not use a numeric component ranking, component gate, FD identity, or fallback
   component rule. If the evidence is ambiguous, choose schedule_monitoring.
@@ -373,43 +401,43 @@ Return only valid JSON.
                 repaired_action = extract_json(raw2)
                 repair_entry["parse_ok"] = True
                 action = repaired_action
-                validation = _validate_action_for_variant(action, context, prompt_variant)
+                validation = _validate_action_for_variant(action, context, prompt_variant, decision_mode)
                 if not validation["valid"]:
-                    local_action = _local_validation_repair(action, validation, context)
+                    local_action = _local_validation_repair(action, validation, context, decision_mode)
                     if local_action is not None:
                         action = local_action
                         action["local_validation_repair_used"] = True
-                        validation = _validate_action_for_variant(action, context, prompt_variant)
+                        validation = _validate_action_for_variant(action, context, prompt_variant, decision_mode)
                     if not validation["valid"]:
                         repair_entry["post_repair_validation"] = validation
                         llm_errors.append(f"repair_invalid: {validation['violations']}")
                         llm_fallback_used = True
-                        action = _fallback_action(context, prompt_variant)
+                        action = _fallback_action(context, prompt_variant, decision_mode)
                         action["reason"] = f"Repair output was still invalid; used {prompt_variant} fallback."
-                        validation = _validate_action_for_variant(action, context, prompt_variant)
+                        validation = _validate_action_for_variant(action, context, prompt_variant, decision_mode)
             except Exception as exc:
                 repair_entry["parse_ok"] = False
                 repair_entry["error"] = str(exc)
                 llm_errors.append(f"repair: {exc}")
                 llm_fallback_used = True
-                action = _fallback_action(context, prompt_variant)
+                action = _fallback_action(context, prompt_variant, decision_mode)
                 action["reason"] = f"Repair output was not parseable; used {prompt_variant} fallback."
-                validation = _validate_action_for_variant(action, context, prompt_variant)
+                validation = _validate_action_for_variant(action, context, prompt_variant, decision_mode)
             raw_outputs.append(repair_entry)
         except Exception as exc:
             llm_errors.append(f"repair: {exc}")
             raw_outputs.append({"stage": "repair", "raw_output": "", "parse_ok": False, "error": str(exc)})
             llm_fallback_used = True
-            action = _fallback_action(context, prompt_variant)
+            action = _fallback_action(context, prompt_variant, decision_mode)
             action["reason"] = f"Repair call failed; used {prompt_variant} fallback."
-            validation = _validate_action_for_variant(action, context, prompt_variant)
+            validation = _validate_action_for_variant(action, context, prompt_variant, decision_mode)
 
     if not validation["valid"]:
         llm_errors.append(f"final_invalid: {validation['violations']}")
         llm_fallback_used = True
-        action = _fallback_action(context, prompt_variant)
+        action = _fallback_action(context, prompt_variant, decision_mode)
         action["reason"] = f"Final action was invalid; used {prompt_variant} fallback."
-        validation = _validate_action_for_variant(action, context, prompt_variant)
+        validation = _validate_action_for_variant(action, context, prompt_variant, decision_mode)
 
     action["validation"] = validation
     action["validation_status"] = "valid" if validation["valid"] else "invalid"
@@ -421,6 +449,7 @@ Return only valid JSON.
         "case_id": context["case"].get("case_id"),
         "action": action,
         "prompt_variant": prompt_variant,
+        "decision_mode": decision_mode,
         "context": {
             "dataset_rules": context["dataset_rules"],
             "candidate_action": context["candidate_action"],
@@ -439,6 +468,7 @@ Return only valid JSON.
             ),
             "lightgbm_risk": context["lightgbm_risk"],
             "prior_monitoring_count": context.get("prior_monitoring_count", 0),
+            "decision_mode": decision_mode,
         },
         "llm_calls": llm_calls,
         "raw_outputs": raw_outputs,
@@ -452,17 +482,30 @@ def _llm_attempts(
     format_json: bool,
     system_prompt: str = SYSTEM_PROMPT,
     prompt_variant: str = "kg",
+    decision_mode: str = "forecast_window",
 ) -> list[dict[str, Any]]:
-    retry_prompt = (
-        build_no_kg_prompt(
+    if decision_mode == "current_lhi_only" and prompt_variant == "kg":
+        retry_prompt = build_current_lhi_prompt(
             case=context["case"],
+            dataset_rules=context["dataset_rules"],
+            sensor_paths=context["sensor_paths"],
+            action_paths=context["action_paths"],
+            component_evidence_statistics=context["component_evidence_statistics"],
             risk_gate=context["risk_gate"],
             lightgbm_risk=context.get("lightgbm_risk"),
             llm_policy=context.get("llm_policy"),
         )
-        if prompt_variant == "no_kg_evidence"
-        else _minimal_json_prompt(context)
-    )
+    else:
+        retry_prompt = (
+            build_no_kg_prompt(
+            case=context["case"],
+            risk_gate=context["risk_gate"],
+            lightgbm_risk=context.get("lightgbm_risk"),
+            llm_policy=context.get("llm_policy"),
+            )
+            if prompt_variant == "no_kg_evidence"
+            else _minimal_json_prompt(context)
+        )
     return [
         {
             "stage": "initial",
@@ -520,6 +563,7 @@ def _local_validation_repair(
     action: dict[str, Any],
     validation: dict[str, Any],
     context: dict[str, Any],
+    decision_mode: str = "forecast_window",
 ) -> dict[str, Any] | None:
     violations = list(validation.get("violations", []))
     if action.get("action_type") in {
@@ -540,10 +584,16 @@ def _local_validation_repair(
                 "schedule_monitoring action_time must equal recommended_monitoring_time="
                 f"{recommended_monitoring_time(context['case'], context.get('llm_policy'))}"
             ),
+            "current-only schedule_monitoring action_time must be in t+1..t+20",
+            "current-only maintenance action_time must equal t+1",
         ]
     ):
         repaired = dict(action)
-        if action.get("action_type") == "schedule_monitoring":
+        if decision_mode == "current_lhi_only":
+            repaired["action_time"] = (
+                "t+20" if action.get("action_type") == "schedule_monitoring" else "t+1"
+            )
+        elif action.get("action_type") == "schedule_monitoring":
             repaired["action_time"] = recommended_monitoring_time(
                 context["case"], context.get("llm_policy")
             )
@@ -567,6 +617,7 @@ def _validate_action_for_variant(
     action: dict[str, Any],
     context: dict[str, Any],
     prompt_variant: str,
+    decision_mode: str = "forecast_window",
 ) -> dict[str, Any]:
     return validate_action(
         action,
@@ -577,6 +628,7 @@ def _validate_action_for_variant(
         lightgbm_risk=context["lightgbm_risk"],
         component_gate=context.get("component_gate"),
         llm_policy=context.get("llm_policy"),
+        current_lhi_only=decision_mode == "current_lhi_only",
     )
 
 
@@ -621,7 +673,7 @@ def _minimal_json_prompt(context: dict[str, Any]) -> str:
     )
 
 
-def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
+def rule_based_action(context: dict[str, Any], decision_mode: str = "forecast_window") -> dict[str, Any]:
     case = context["case"]
     summary = case["forecast_summary"]
     dataset_rules = context["dataset_rules"]
@@ -654,9 +706,9 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     if action_type == "continue_normal_operation":
         action_time = None
     elif action_type == "schedule_monitoring":
-        action_time = recommended_monitoring_time(case, context.get("llm_policy"))
+        action_time = "t+20" if decision_mode == "current_lhi_only" else recommended_monitoring_time(case, context.get("llm_policy"))
     else:
-        action_time = _maintenance_action_time(context)
+        action_time = "t+1" if decision_mode == "current_lhi_only" else _maintenance_action_time(context)
 
     return {
         "action_type": action_type,
@@ -670,12 +722,12 @@ def rule_based_action(context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def no_kg_fallback_action(context: dict[str, Any]) -> dict[str, Any]:
+def no_kg_fallback_action(context: dict[str, Any], decision_mode: str = "forecast_window") -> dict[str, Any]:
     case = context["case"]
     risk = context.get("lightgbm_risk", {})
     return {
         "action_type": "schedule_monitoring",
-        "action_time": recommended_monitoring_time(case, context.get("llm_policy")),
+        "action_time": "t+20" if decision_mode == "current_lhi_only" else recommended_monitoring_time(case, context.get("llm_policy")),
         "risk_hypothesis": risk.get("predicted_risk_stage", "uncertain_risk"),
         "degradation_hypothesis": "unspecified_component_degradation",
         "confidence": float(risk.get("confidence", 0.5)),
@@ -685,25 +737,35 @@ def no_kg_fallback_action(context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _fallback_action(context: dict[str, Any], prompt_variant: str) -> dict[str, Any]:
+def _fallback_action(
+    context: dict[str, Any],
+    prompt_variant: str,
+    decision_mode: str = "forecast_window",
+) -> dict[str, Any]:
     if prompt_variant == "no_kg_evidence":
-        return no_kg_fallback_action(context)
-    return rule_based_action(context)
+        return no_kg_fallback_action(context, decision_mode)
+    return rule_based_action(context, decision_mode)
 
 
-def low_risk_action(context: dict[str, Any], prompt_variant: str = "kg") -> dict[str, Any]:
+def low_risk_action(
+    context: dict[str, Any],
+    prompt_variant: str = "kg",
+    decision_mode: str = "forecast_window",
+) -> dict[str, Any]:
     if prompt_variant == "no_kg_evidence":
-        action = no_kg_fallback_action(context)
+        action = no_kg_fallback_action(context, decision_mode)
         action["reason"] = (
             "Active risk tool judged this case below the maintenance-reasoning activation threshold."
         )
         return action
-    action = rule_based_action(context)
+    action = rule_based_action(context, decision_mode)
     if action["action_type"] in {"schedule_HPC_maintenance", "schedule_fan_maintenance"}:
         action["action_type"] = "schedule_monitoring"
         action["degradation_hypothesis"] = "uncertain_component_degradation"
-        action["action_time"] = recommended_monitoring_time(
-            context["case"], context.get("llm_policy")
+        action["action_time"] = (
+            "t+20" if decision_mode == "current_lhi_only" else recommended_monitoring_time(
+                context["case"], context.get("llm_policy")
+            )
         )
         action["risk_tool_low_risk_gate_used"] = True
     action["reason"] = (

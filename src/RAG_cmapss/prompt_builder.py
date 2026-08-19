@@ -33,6 +33,33 @@ Hard constraints:
 """
 
 
+CURRENT_LHI_SYSTEM_PROMPT = """You are a KG-grounded maintenance decision agent for zero-shot C-MAPSS predictive maintenance.
+
+This is a current-observation-only experiment. You receive only the LHI value at the current cycle,
+its sensor contribution ranking, and KG evidence paths. No future LHI, future sensor readings,
+forecast trajectory, future risk crossing, or hidden RUL is available.
+
+Choose exactly one action:
+1. continue_normal_operation
+2. schedule_monitoring
+3. schedule_fan_maintenance
+4. schedule_HPC_maintenance
+
+Hard constraints:
+- Base the decision only on the current observation and supplied KG evidence.
+- continue_normal_operation must have action_time = null.
+- schedule_monitoring must use any action_time from t+1 through t+20, chosen freely.
+- Maintenance is an immediate current decision and must use action_time = t+1.
+- Maintenance component selection must be justified by the supplied KG evidence paths.
+- Do not use FD identity or a numeric component preference as a component decision rule.
+- If the evidence does not support one component clearly, choose schedule_monitoring.
+- Reflection memory is not action evidence. It is used only to train/update shared policy after feedback.
+- In evidence_paths, return only evidence IDs such as ["E1", "E3"], not full path text.
+- Keep reason under 30 words.
+- Return only valid JSON. Do not output markdown.
+"""
+
+
 def build_prompt(
     case: dict[str, Any],
     dataset_rules: dict[str, Any],
@@ -51,6 +78,8 @@ def build_prompt(
             "hypothesis": p.get("hypothesis"),
             "component": p.get("component"),
             "path": p.get("path_text"),
+            "edge_weight_mean": p.get("edge_weight_mean"),
+            "score": p.get("score"),
         }
         for idx, p in enumerate(sensor_paths[:8], start=1)
     ]
@@ -140,6 +169,94 @@ Important:
 - Use risk_gate only for timing/risk context; reflection memory and component metadata are not action gates.
 - Do not use reflection anchors, historical feedback, or hidden RUL in action reasoning.
 - Maintenance timing is forecast-grounded, not freely chosen: use {timing_profile["recommended_maintenance_time"]}.
+"""
+
+
+def build_current_lhi_prompt(
+    case: dict[str, Any],
+    dataset_rules: dict[str, Any],
+    sensor_paths: list[dict[str, Any]],
+    action_paths: list[dict[str, Any]],
+    component_evidence_statistics: dict[str, Any],
+    risk_gate: dict[str, Any],
+    lightgbm_risk: dict[str, Any] | None = None,
+    llm_policy: dict[str, Any] | None = None,
+) -> str:
+    """Prompt for the no-future-information current-LHI experiment."""
+    top_sensor_paths = [
+        {
+            "id": f"E{idx}",
+            "sensor": p.get("sensor"),
+            "hypothesis": p.get("hypothesis"),
+            "component": p.get("component"),
+            "path": p.get("path_text"),
+        }
+        for idx, p in enumerate(sensor_paths[:8], start=1)
+    ]
+    action_path_texts = [
+        {
+            "id": f"A{idx}",
+            "hypothesis": p.get("hypothesis"),
+            "action_type": p.get("action_type"),
+            "weight": p.get("weight"),
+            "path": p.get("path_text"),
+        }
+        for idx, p in enumerate(action_paths[:6], start=1)
+    ]
+    current_observation = case.get("current_observation", {})
+    current_evidence = case.get("sensor_evidence_statistics", {})
+    return f"""Current observation:
+{json.dumps({
+    "case_id": case.get("case_id"),
+    "dataset_subset": case.get("dataset_subset"),
+    "unit_id": case.get("unit_id"),
+    "cycle": case.get("cutoff_cycle"),
+    "lhi": current_observation.get("lhi"),
+    "d_rmse": current_observation.get("d_rmse"),
+    "d_mae": current_observation.get("d_mae"),
+    "sensor_contribution_ranking": current_observation.get("sensor_contribution_ranking"),
+}, indent=2)}
+
+Current-cycle sensor evidence and component-consensus summary:
+{json.dumps(current_evidence, indent=2)}
+
+Dataset rules:
+{json.dumps(dataset_rules, indent=2)}
+
+Current risk gate:
+{json.dumps(compact_risk_gate(risk_gate), indent=2)}
+
+Active risk-tool evidence:
+{json.dumps(lightgbm_risk or {}, indent=2)}
+
+Shared policy metadata:
+{json.dumps(compact_llm_policy(llm_policy), indent=2)}
+
+Top graph evidence paths:
+{json.dumps(top_sensor_paths, indent=2)}
+
+Retrieved action paths:
+{json.dumps(action_path_texts, indent=2)}
+
+No-future-information rule:
+- The input contains no future LHI or sensor values.
+- Do not infer a trend, future crossing, forecast peak, or RUL.
+- Use the current LHI and current sensor contribution ranking only.
+- KG path scores are evidence-strength metadata, not future information; use them to compare the current component hypotheses.
+- If choosing schedule_monitoring, choose any action_time in [t+1, t+20].
+- If choosing maintenance, use action_time=t+1.
+
+Return exactly one JSON object:
+{{
+  "action_type": "...",
+  "action_time": "t+N or null",
+  "risk_hypothesis": "...",
+  "degradation_hypothesis": "...",
+  "confidence": 0.0,
+  "evidence_paths": ["E1", "E2"],
+  "reason": "under 30 words",
+  "validation_status": "valid"
+}}
 """
 
 

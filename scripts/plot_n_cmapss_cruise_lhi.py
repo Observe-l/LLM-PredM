@@ -3,9 +3,10 @@
 
 This reuses the LHI aggregation from ``plot_n_cmapss_sample_lhi.py`` but
 restricts both the health reference and target cycles to the accepted cruise
-intervals in ``cruise_cycle_statistics.csv``.  K-means centers are fitted on
-cruise W=(alt, Mach, TRA, T2) and are stored in raw units; the corresponding
-cruise standardization is applied before nearest-center assignment.
+intervals in ``cruise_cycle_statistics.csv``. K-means centers are stored in
+raw units; the feature columns in the center file determine which W variables
+are used for nearest-center assignment. This supports both the earlier
+four-feature model and the current altitude-excluded (Mach, TRA, T2) model.
 """
 
 from __future__ import annotations
@@ -70,11 +71,17 @@ def load_unit(path: Path, split: str, unit_id: int) -> tuple[np.ndarray, np.ndar
 
 def assign_cruise_clusters(w: np.ndarray, w_names: list[str], centers_path: Path, standardization_path: Path) -> tuple[np.ndarray, int]:
     centers_df = pd.read_csv(centers_path).sort_values("cluster")
-    centers_raw = centers_df.loc[:, CONDITION_NAMES].to_numpy(dtype=float)
-    scaling = pd.read_csv(standardization_path).set_index("feature").loc[CONDITION_NAMES]
+    feature_names = [name for name in centers_df.columns if name != "cluster"]
+    if not feature_names:
+        raise ValueError(f"No clustering feature columns found in {centers_path}")
+    missing_w = sorted(set(feature_names) - set(w_names))
+    if missing_w:
+        raise ValueError(f"Center features missing from W variables: {missing_w}")
+    centers_raw = centers_df.loc[:, feature_names].to_numpy(dtype=float)
+    scaling = pd.read_csv(standardization_path).set_index("feature").loc[feature_names]
     mean = scaling["mean"].to_numpy(dtype=float)
     scale = scaling["scale"].to_numpy(dtype=float)
-    columns = [w_names.index(name) for name in CONDITION_NAMES]
+    columns = [w_names.index(name) for name in feature_names]
     x = (w[:, columns] - mean) / scale
     centers = (centers_raw - mean) / scale
     distances = ((x[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
