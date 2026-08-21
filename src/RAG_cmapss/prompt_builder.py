@@ -19,13 +19,15 @@ Hard constraints:
 - continue_normal_operation must have action_time = null.
 - schedule_monitoring must use the supplied recommended_monitoring_time.
 - schedule_fan_maintenance and schedule_HPC_maintenance must set action_time exactly to the supplied recommended_maintenance_time.
-- Maintenance component selection must be justified by the supplied KG evidence paths.
+- schedule_fan_maintenance requires retrieved evidence supporting Fan_related_degradation.
+- schedule_HPC_maintenance requires retrieved evidence supporting HPC_related_degradation.
 - The active risk tool is named in the provided evidence. Use that actual tool_name/model_source as the risk perception source.
 - Do not choose a maintenance action that is disallowed by the dataset policy.
-    - Do not use a numeric component ranking, component gate, FD identity, or deterministic component preference. Compare the evidence paths themselves.
-- If the evidence paths do not support one component clearly, choose schedule_monitoring.
+- A high or critical score alone is insufficient to choose the component; use graph/component evidence to select the maintainable component.
+- Component_gate is diagnostic, not a hard veto. If risk-tool evidence indicates maintenance_window or late_or_missed and a dataset-allowed component has strong graph evidence, you may choose that maintenance action even when uncertain_component_degradation is also strong.
+- In late_or_missed cases, strong graph evidence for a dataset-allowed maintainable component should outweigh uncertain_component_degradation unless there is stronger conflicting maintainable-component evidence.
 - Reflection memory is not action evidence. It is used only to train/update LightGBM tools after feedback.
-- Maintenance requires an appropriate risk stage and evidence paths supporting the selected component.
+- Maintenance requires active risk-tool support and graph evidence for a dataset-allowed component.
 - Historical feedback contains forecast-state features only; do not infer or mention hidden RUL.
 - In evidence_paths, return only evidence IDs such as ["E1", "E3"], not full path text.
 - Keep reason under 30 words.
@@ -122,11 +124,11 @@ Maintenance timing policy:
 Dataset rules:
 {json.dumps(dataset_rules, indent=2)}
 
-Component evidence inventory (descriptive only; no numeric ranking):
+Component evidence profile:
 {json.dumps(component_evidence_statistics, indent=2)}
 
-Risk gate:
-{json.dumps(compact_risk_gate(risk_gate), indent=2)}
+Decision gates:
+{json.dumps({"risk_gate": compact_risk_gate(risk_gate), "component_gate": component_gate}, indent=2)}
 
 Active risk-tool evidence from {risk_tool_name} / {risk_model_source}:
 {json.dumps(lightgbm_risk or {}, indent=2)}
@@ -159,14 +161,15 @@ Important:
 - For schedule_monitoring, action_time must equal {timing_profile["recommended_monitoring_time"]}.
 - For schedule_fan_maintenance or schedule_HPC_maintenance, action_time must equal {timing_profile["recommended_maintenance_time"]}; do not default to the horizon end.
 - The action_type must agree with the reason: if the reason says maintenance is required, choose the corresponding maintenance action rather than schedule_monitoring.
-- Use the Graph RAG paths to choose one explicit degradation component. This is an LLM judgment from evidence, not a numeric gate.
+- Use Graph RAG paths and component_gate to choose the degradation hypothesis.
 - Use {risk_tool_name} / {risk_model_source} as the primary risk-stage evidence. Do not cite a different risk tool.
-- If risk_level is high_persistent, persistent_warning, or high_persistent_uncalibrated, weigh maintenance more strongly when the evidence paths support a component.
+- If LLM policy action_escalation_policy is maintenance_when_risk_activated_and_component_supported, do not repeat monitoring when the risk tool activated reasoning and strong graph evidence supports an allowed component; choose that maintenance action.
 - The supplied maintenance_timing_policy determines recommended_maintenance_time and is mandatory.
-- risk_decision only describes LLM activation and predicted_risk_stage is advisory. Do not infer late_or_missed from activation alone; use risk_gate for timing.
-- Do not use FD001/FD002/FD003/FD004 names as component restrictions in mixed-fleet mode.
+- If the risk tool says maintenance_window or late_or_missed, prefer a dataset-allowed maintenance action when graph evidence strongly supports a maintainable component.
+- Do not let uncertain_component_degradation alone override strong evidence for a dataset-allowed maintainable component in a late_or_missed case.
+- In mixed-fleet mode, do not use FD identity as a component restriction; use the per-engine evidence paths and the shared component gate.
 - If choosing schedule_monitoring, set action_time to {timing_profile["recommended_monitoring_time"]}.
-- Use risk_gate only for timing/risk context; reflection memory and component metadata are not action gates.
+- Use risk_gate only as a transparent statistical diagnostic, not as reflection memory.
 - Do not use reflection anchors, historical feedback, or hidden RUL in action reasoning.
 - Maintenance timing is forecast-grounded, not freely chosen: use {timing_profile["recommended_maintenance_time"]}.
 """

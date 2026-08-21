@@ -106,9 +106,30 @@ def validate_action(
     if action_type not in set(dataset_rules.get("allowed_actions", [])) and action_type in ALLOWED_ACTIONS:
         violations.append(f"{action_type} is not allowed by dataset policy")
 
-    # Component selection is intentionally left to the LLM's interpretation
-    # of the supplied evidence paths.  The validator checks action schema,
-    # timing, and dataset action permissions only; it must not reproduce a
-    # numeric component gate.
+    # The historical forecast-window path used the policy/evidence gate to
+    # repair an action that ignored strong component evidence.  Keep this
+    # disabled for current_lhi_only, whose component choice remains an LLM
+    # decision from the current observation and supplied paths.
+    if not current_lhi_only:
+        escalation_active = (
+            llm_policy.get("action_escalation_policy")
+            == "maintenance_when_risk_activated_and_component_supported"
+        )
+        risk_activated = str((lightgbm_risk or {}).get("risk_decision", "")) in {
+            "activate_llm_agent",
+            "activate_llm_agent_uncertain",
+        }
+        suggested = str(component_gate.get("suggested_component_action", ""))
+        suggested_allowed = suggested in set(dataset_rules.get("allowed_actions", []))
+        if (
+            escalation_active
+            and risk_activated
+            and component_gate.get("component_supported", False)
+            and suggested_allowed
+            and action_type != suggested
+        ):
+            violations.append(
+                f"adaptive escalation policy requires {suggested} when component support is strong"
+            )
 
     return {"valid": len(violations) == 0, "violations": violations, "warnings": warnings}

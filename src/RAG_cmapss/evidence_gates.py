@@ -92,9 +92,10 @@ def build_risk_gate(
         "high_persistent_uncalibrated",
     }
     reflection_allows = calibration["decision"] == "supports_maintenance"
-    # Reflection memory is an auxiliary calibration signal. It must not
-    # suppress a statistically persistent risk during cold start; otherwise
-    # high-persistent cases are forced into monitoring until failure.
+    # Reflection memory is auxiliary calibration. It must not suppress a
+    # statistically persistent case during cold start; this is the behavior
+    # recorded by the historical consensus_v2 output and also used by the
+    # current-LHI path.
     maintenance_candidate = bool(statistical_candidate)
 
     return {
@@ -351,13 +352,53 @@ def _quantile(values: list[float], q: float) -> float:
 
 
 def build_component_gate(component_stats: dict[str, Any], dataset_rules: dict[str, Any]) -> dict[str, Any]:
-    # Component selection belongs to the LLM.  This compatibility object is
-    # intentionally metadata only; it contains no score, recommendation, or
-    # veto that could replace the evidence-based model decision.
+    """Build the scored component gate used by the legacy forecast path.
+
+    This is deliberately not called by the current-LHI path.  It preserves
+    the component evidence contract recorded in the consensus_v2 artifacts:
+    scores are derived from KG paths, while FD-specific action restrictions
+    are already removed by ``get_dataset_rules(..., mixed_fleet=True)``.
+    """
+    dominant = component_stats.get("dominant_component")
+    margin = _to_float(component_stats.get("dominance_margin")) or 0.0
+    conflict = _to_float(component_stats.get("component_conflict_score")) or 0.0
+    allowed_hypotheses = set(dataset_rules.get("allowed_hypotheses", []))
+    hpc_score = _to_float(component_stats.get("hpc_path_score")) or 0.0
+    fan_score = _to_float(component_stats.get("fan_path_score")) or 0.0
+    explicit_components = {"HPC_related_degradation", "Fan_related_degradation"}
+    dominant_score = hpc_score if dominant == "HPC_related_degradation" else fan_score
+    competing_score = fan_score if dominant == "HPC_related_degradation" else hpc_score
+    component_supported = bool(
+        dominant in explicit_components
+        and dominant in allowed_hypotheses
+        and dominant_score >= 0.9
+        and competing_score <= 0.65
+        and (margin >= 0.02 or conflict < 0.75)
+    )
+    if dominant == "HPC_related_degradation":
+        action = "schedule_HPC_maintenance"
+    elif dominant == "Fan_related_degradation":
+        action = "schedule_fan_maintenance"
+    else:
+        action = "schedule_monitoring"
+    if action in set(dataset_rules.get("disallowed_actions", [])):
+        action = "schedule_monitoring"
+        component_supported = False
     return {
-        "decision_authority": "llm_evidence_only",
-        "component_gate_applied": False,
-        "evidence_hypotheses": list((component_stats or {}).get("component_hypotheses_present", [])),
+        "dominant_component": dominant,
+        "explicit_component": dominant,
+        "explicit_component_score": dominant_score,
+        "explicit_competing_score": competing_score,
+        "explicit_component_margin": round(dominant_score - competing_score, 4),
+        "uncertain_is_non_veto": True,
+        "component_supported": component_supported,
+        "component_conflict_score": conflict,
+        "dominance_margin": margin,
+        "suggested_component_action": action,
+        "hpc_path_score": hpc_score,
+        "fan_path_score": fan_score,
+        "uncertain_path_score": component_stats.get("uncertain_path_score"),
+        "recommendation": "component_supported" if component_supported else "monitor_due_to_component_uncertainty",
     }
 
 
@@ -379,8 +420,9 @@ def update_component_consensus(
     *,
     max_history: int = 20,
 ) -> dict[str, Any]:
-    # Consensus can remain in the engine state for API compatibility, but it
-    # must not synthesize a component or override the next LLM decision.
+    # consensus_v2 recorded the state in the context but did not feed a
+    # synthetic component vote back into the next LLM decision. Keep this
+    # compatibility no-op for exact behavioral separation from current-LHI.
     return dict(consensus_state or {})
 
 

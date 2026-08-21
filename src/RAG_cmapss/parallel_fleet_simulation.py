@@ -21,6 +21,7 @@ import pandas as pd
 from .config import DEFAULT_KG_DIR, DEFAULT_MODEL_NAME, DEFAULT_OLLAMA_URL
 from .evaluation_agent import run_evaluation_agent
 from .evaluation_tool import EvaluationTool, compact_evaluation_history
+from .evidence_gates import update_component_consensus
 from .joint_simulation import (
     MAINTENANCE_ACTIONS,
     action_relative_cycle,
@@ -412,6 +413,9 @@ def main() -> None:
                     engine_history=observed_window,
                 )
             else:
+                # Preserve the legacy forecast path: construct and persist
+                # the case first, then apply the forecast-window gate.  This
+                # is the ordering used by the historical consensus_v2 run.
                 history = engine_history_frame(list(engine.windows.values()), cutoff)
                 case = build_forecast_case(
                     window=window,
@@ -424,6 +428,9 @@ def main() -> None:
                     engine_history=history,
                 )
                 peak_lhi = case_peak_lhi(window, args.lhi_col)
+                if not pd.notna(peak_lhi) or peak_lhi <= trigger:
+                    engine.last_case = case
+                    continue
             if args.max_llm_calls is not None and llm_calls >= args.max_llm_calls:
                 continue
             result = run_agent(
@@ -474,6 +481,12 @@ def main() -> None:
             engine.last_case = case
             engine.last_action = result["action"]
             engine.last_context = result.get("context", {})
+            if args.prompt_variant != "no_kg_evidence":
+                engine.component_consensus = update_component_consensus(
+                    engine.component_consensus,
+                    engine.last_context.get("component_evidence_statistics"),
+                    engine.last_context.get("component_gate"),
+                )
             action_type = str(result["action"].get("action_type", ""))
             engine.action_history.append(
                 {

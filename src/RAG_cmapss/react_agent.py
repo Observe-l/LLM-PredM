@@ -12,6 +12,7 @@ from .graph_retriever import (
     retrieve_sensor_paths,
 )
 from .evidence_gates import (
+    build_component_gate,
     build_risk_gate,
 )
 from .kg_store import KGStore
@@ -57,6 +58,7 @@ def prepare_context(
     mixed_fleet: bool = False,
     component_consensus: dict[str, Any] | None = None,
     prior_monitoring_count: int = 0,
+    legacy_forecast: bool = False,
 ) -> dict[str, Any]:
     case = normalize_case(case)
     dataset_subset = str(case["dataset_subset"])
@@ -78,11 +80,31 @@ def prepare_context(
     action_paths = retrieve_action_paths(kg_store, hypotheses)
     candidate_action = infer_candidate_action(dataset_rules, sensor_paths, forecast_summary)
     reflection_rules: list[dict[str, Any]] = []
-    risk_gate = build_risk_gate(case, reflection_rules=[], threshold_overrides=risk_threshold_overrides)
-    component_gate = {
-        "decision_authority": "llm_evidence_only",
-        "component_gate_applied": False,
-    }
+    risk_gate = build_risk_gate(
+        case,
+        reflection_rules=[],
+        threshold_overrides=risk_threshold_overrides,
+    )
+    if legacy_forecast:
+        component_gate = build_component_gate(component_evidence_statistics, dataset_rules)
+        component_gate.update(
+            {
+                "engine_component_consensus": component_consensus
+                or {
+                    "status": "pending",
+                    "observation_count": 0,
+                    "vote_counts": {},
+                    "stable_component": None,
+                    "override_current_component": False,
+                },
+                "consensus_component_supported": False,
+            }
+        )
+    else:
+        component_gate = {
+            "decision_authority": "llm_evidence_only",
+            "component_gate_applied": False,
+        }
     context = {
         "case": case,
         "dataset_rules": dataset_rules,
@@ -109,9 +131,14 @@ def prepare_no_kg_context(
     mixed_fleet: bool = False,
     component_consensus: dict[str, Any] | None = None,
     prior_monitoring_count: int = 0,
+    legacy_forecast: bool = False,
 ) -> dict[str, Any]:
     case = normalize_case(case)
-    risk_gate = build_risk_gate(case, reflection_rules=[], threshold_overrides=risk_threshold_overrides)
+    risk_gate = build_risk_gate(
+        case,
+        reflection_rules=[],
+        threshold_overrides=risk_threshold_overrides,
+    )
     context = {
         "case": case,
         "dataset_rules": {
@@ -180,6 +207,7 @@ def run_agent(
             mixed_fleet=mixed_fleet,
             component_consensus=component_consensus,
             prior_monitoring_count=prior_monitoring_count,
+            legacy_forecast=decision_mode == "forecast_window",
         )
     else:
         context = prepare_context(
@@ -191,6 +219,7 @@ def run_agent(
             mixed_fleet=mixed_fleet,
             component_consensus=component_consensus,
             prior_monitoring_count=prior_monitoring_count,
+            legacy_forecast=decision_mode == "forecast_window",
         )
     risk_policy_mode = str(risk_policy_mode or "hybrid")
     controller_raw_outputs = []
@@ -357,6 +386,16 @@ def run_agent(
                 f"- maintenance must use {recommended_maintenance_time(context['case'], context.get('llm_policy'))}."
             )
         )
+        component_instruction = (
+            "- Choose the maintenance component only from the supplied KG evidence paths.\n"
+            "- Do not use a numeric component ranking, component gate, FD identity, or fallback\n"
+            "  component rule. If the evidence is ambiguous, choose schedule_monitoring."
+            if decision_mode == "current_lhi_only"
+            else (
+                "- Choose a dataset-allowed maintenance component supported by the KG paths and component gate.\n"
+                "- If the active risk policy requires escalation and the component gate is supported, use the suggested component."
+            )
+        )
         repair_prompt = f"""The previous action is invalid.
 
 Previous action:
@@ -370,9 +409,7 @@ Return exactly one JSON object.
 Mandatory output rules:
 - continue_normal_operation must use "action_time": null.
 {timing_instruction}
-- Choose the maintenance component only from the supplied KG evidence paths.
-- Do not use a numeric component ranking, component gate, FD identity, or fallback
-  component rule. If the evidence is ambiguous, choose schedule_monitoring.
+{component_instruction}
 Return only valid JSON.
 """
         try:
@@ -610,6 +647,27 @@ def _local_validation_repair(
         repaired["reason"] = "Filled missing monitoring time from KG rule fallback."
         return repaired
 
+    if decision_mode == "forecast_window":
+        escalation_errors = [
+            item for item in violations
+            if item.startswith("adaptive escalation policy requires ")
+        ]
+        if escalation_errors:
+            suggested = str(context.get("component_gate", {}).get("suggested_component_action", ""))
+            if suggested in {"schedule_HPC_maintenance", "schedule_fan_maintenance"}:
+                repaired = dict(action)
+                repaired["action_type"] = suggested
+                repaired["action_time"] = _maintenance_action_time(context)
+                repaired["degradation_hypothesis"] = (
+                    "HPC_related_degradation"
+                    if suggested == "schedule_HPC_maintenance"
+                    else "Fan_related_degradation"
+                )
+                repaired["reason"] = (
+                    "Applied validated adaptive escalation policy to strong component evidence."
+                )
+                return repaired
+
     return None
 
 
@@ -696,6 +754,21 @@ def rule_based_action(context: dict[str, Any], decision_mode: str = "forecast_wi
     if not (learned_support or risk_gate.get("maintenance_candidate", False)):
         action_type = "schedule_monitoring"
         degradation = "uncertain_component_degradation"
+    elif decision_mode == "forecast_window":
+        component_gate = context.get("component_gate", {})
+        suggested = str(component_gate.get("suggested_component_action", ""))
+        if component_gate.get("component_supported", False) and suggested not in disallowed:
+            action_type = suggested
+            degradation = (
+                "HPC_related_degradation"
+                if suggested == "schedule_HPC_maintenance"
+                else "Fan_related_degradation"
+                if suggested == "schedule_fan_maintenance"
+                else "uncertain_component_degradation"
+            )
+        else:
+            action_type = "schedule_monitoring"
+            degradation = "uncertain_component_degradation"
     else:
         # This is only a safe fallback when Ollama is unavailable. It must not
         # invent a component decision from path metadata; the normal path is

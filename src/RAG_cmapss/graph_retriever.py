@@ -34,10 +34,6 @@ def get_dataset_rules(
         "policies": sorted(set(policies)),
     }
     if mixed_fleet:
-        # In a mixed fleet, FD-level action policies must not suppress a
-        # component before the per-engine evidence paths are inspected.  The
-        # known FD component composition remains an evaluation constraint
-        # (see joint_simulation.py), not an action-selection shortcut.
         rules.update(
             {
                 "mixed_fleet": True,
